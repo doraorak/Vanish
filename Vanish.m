@@ -399,6 +399,15 @@ static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
     return false;
 }
 
+static void vn_delayed_clone_release(void *ctx, double when) {
+    (void)when;
+    CGXWindow *clone = (CGXWindow *)ctx;
+    if (clone && vn_system_window_release) {
+        VN_LOG("delayed_release: freeing clone win=%p", clone);
+        vn_system_window_release(clone);
+    }
+}
+
 static void vn_finish_animation_for_id(uint64_t anim_id) {
     uint32_t wid = 0;
     CGXWindow *win = NULL;
@@ -440,16 +449,20 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
         }
     }
 
-    // A clone is ours: destroy it rather than ordering anything out. The real
-    // window was already ordered out when the animation began, hidden behind it.
+    // A clone is ours: order it out using its own connection, and defer destruction by
+    // 100ms to allow the display compositor to flush the orderOut while warped to size 0.
     if (is_clone) {
-        VN_LOG("finish: releasing clone wid=%u win=%p", wid, win);
-        if (conn && wid != 0) {
+        VN_LOG("finish: ordering out clone wid=%u win=%p (release deferred 100ms)", wid, win);
+        CGXConnection *order_conn = vn_window_connection(win);
+        if (!order_conn) order_conn = conn;
+        if (order_conn && wid != 0) {
             CGSOrderOp op = kVNOrderOut;
             uint32_t rel = 0;
-            vn_orig_order(conn, &wid, &op, &rel, 1, false);
+            vn_orig_order(order_conn, &wid, &op, &rel, 1, false);
         }
-        if (vn_system_window_release && win) {
+        if (vn_schedule_callback && win) {
+            vn_schedule_callback(vn_delayed_clone_release, win, SLSCurrentRealTime() + 0.1);
+        } else if (vn_system_window_release && win) {
             vn_system_window_release(win);
         }
         return;
@@ -704,10 +717,11 @@ static void vn_anim_tick(void *ctx, double when) {
 
         (void)aid;
         if (p >= 1.0) {
+            p = 1.0;
             finished[finished_count++] = gActiveAnims[i].anim_id;
-            continue;
+        } else {
+            more = true;
         }
-        more = true;
 
         CGXWindow *win = gActiveAnims[i].win;
         CGXConnection *conn = gActiveAnims[i].conn;
@@ -751,6 +765,17 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
             frame = p;
         } else if (vn_screen_rect_from_rect) {
             frame = vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0));
+        }
+    }
+
+    // Ensure clone is ordered on top so it animates cleanly above any underlying windows
+    if (is_clone && wid != 0) {
+        CGXConnection *c = vn_window_connection(win);
+        if (!c) c = conn;
+        if (c) {
+            CGSOrderOp op = kVNOrderAbove;
+            uint32_t rel = 0;
+            vn_orig_order(c, &wid, &op, &rel, 1, false);
         }
     }
 
@@ -836,13 +861,16 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
     if (clone_to_release) {
         VN_LOG("Target window wid=%u ordered back in while clone wid=%u was animating; ordering out and destroying clone",
                wid, clone_wid);
-        CGXConnection *order_conn = clone_conn ? clone_conn : conn;
+        CGXConnection *order_conn = vn_window_connection(clone_to_release);
+        if (!order_conn) order_conn = clone_conn ? clone_conn : conn;
         if (order_conn && clone_wid != 0) {
             CGSOrderOp op = kVNOrderOut;
             uint32_t rel = 0;
             vn_orig_order(order_conn, &clone_wid, &op, &rel, 1, false);
         }
-        if (vn_system_window_release) {
+        if (vn_schedule_callback) {
+            vn_schedule_callback(vn_delayed_clone_release, clone_to_release, SLSCurrentRealTime() + 0.1);
+        } else if (vn_system_window_release) {
             vn_system_window_release(clone_to_release);
         }
     } else if (orig_win && orig_conn) {
@@ -1117,7 +1145,16 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
         pid_t win_pid = 0;
         vn_get_window_app_name(win, app_name, sizeof(app_name), &win_pid);
 
-        if ((now_ms - cmdw_time) < 1200 && (cmdw_wid == rel_wid || (win_pid > 0 && cmdw_pid == win_pid))) {
+        bool is_valid_doc = false;
+        CGRect probe = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
+        if (probe.size.width < 1.0 || probe.size.height < 1.0) {
+            if (vn_clipped_frame_bounds) probe = vn_clipped_frame_bounds(win);
+        }
+        if (probe.size.width >= 200.0 && probe.size.height >= 150.0 && vn_window_level(win) == 0) {
+            is_valid_doc = true;
+        }
+
+        if (is_valid_doc && (now_ms - cmdw_time) < 400 && (cmdw_wid == rel_wid || (win_pid > 0 && cmdw_pid == win_pid))) {
             VN_LOG(">>> Cmd+W confirmed at release_window for '%s' wid=%u (pid=%d) -- cloning on the fly",
                    app_name, rel_wid, win_pid);
             atomic_store_explicit(&gCmdWRequestTimeMs, 0, memory_order_relaxed);
@@ -1201,28 +1238,20 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 bool is_yellow_or_green = false;
 
                 // Hit-test traffic lights:
-                // Standard titlebar windows (e.g. VanishTest, TweakInject, WhatsApp, simple apps):
+                // Standard titlebar windows (e.g. VanishTest, TweakInject, simple apps):
                 //   y is in [4.0, 18.0). Red center ~17pt, Yellow center ~38pt, Green center ~58pt.
-                // Unified toolbar windows (e.g. Mail, Messages, Notes, Calculator, Safari):
-                //   y is in [18.0, 39.0]. Red center ~26pt, Yellow center ~49pt, Green center ~72pt.
-                // Tall toolbars (e.g. System Settings, SwiftUI forms):
-                //   y is in (39.0, 55.0]. Red center ~26pt, Yellow center ~49pt, Green center ~72pt.
+                // Unified toolbar windows (e.g. Mail, Messages, Notes, Calculator, Safari, Antigravity):
+                //   y is in [18.0, 36.0]. Red center ~26pt, Yellow center ~49pt, Green center ~72pt.
                 if (ly >= 4.0 && ly < 18.0) {
                     if (lx >= 3.0 && lx <= 28.0) {
                         is_red = true;
                     } else if (lx >= 29.0 && lx <= 80.0) {
                         is_yellow_or_green = true;
                     }
-                } else if (ly >= 18.0 && ly <= 39.0) {
-                    if (lx >= 8.0 && lx <= 38.0) {
+                } else if (ly >= 18.0 && ly <= 36.0) {
+                    if (lx >= 8.0 && lx <= 36.0) {
                         is_red = true;
-                    } else if (lx >= 39.0 && lx <= 88.0) {
-                        is_yellow_or_green = true;
-                    }
-                } else if (ly > 39.0 && ly <= 55.0) {
-                    if (lx >= 8.0 && lx <= 38.0) {
-                        is_red = true;
-                    } else if (lx >= 39.0 && lx <= 88.0) {
+                    } else if (lx >= 37.0 && lx <= 88.0) {
                         is_yellow_or_green = true;
                     }
                 }
@@ -1230,7 +1259,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 // Every corner click on a target window, classified or not. This
                 // is the only way to find out where an app actually puts its
                 // lights: click the red button once and read the point back.
-                if (lx <= 150.0 && ly <= 90.0) {
+                if (lx <= 150.0 && ly <= 60.0) {
                     char hit_app[256] = {0};
                     pid_t hit_pid = 0;
                     vn_get_window_app_name(win, hit_app, sizeof(hit_app), &hit_pid);
@@ -1282,7 +1311,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     vn_preclone_discard();
                     atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
                     atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
-                } else if (lx > 100.0 || ly > 60.0) {
+                } else if (lx > 88.0 || ly > 36.0) {
                     // Clicked clearly elsewhere on the window: discard any pending pre-clone
                     vn_preclone_discard();
                 }
@@ -1360,7 +1389,16 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         pid_t cmdw_pid = atomic_load_explicit(&gCmdWTargetPID, memory_order_relaxed);
                         uint32_t cmdw_wid = atomic_load_explicit(&gCmdWTargetWID, memory_order_relaxed);
 
-                        if ((now_ms - cmdw_time) < 1200 && (cmdw_wid == wid || cmdw_pid == pid)) {
+                        bool is_valid_doc = false;
+                        CGRect probe = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
+                        if (probe.size.width < 1.0 || probe.size.height < 1.0) {
+                            if (vn_clipped_frame_bounds) probe = vn_clipped_frame_bounds(win);
+                        }
+                        if (probe.size.width >= 200.0 && probe.size.height >= 150.0 && vn_window_level(win) == 0) {
+                            is_valid_doc = true;
+                        }
+
+                        if (is_valid_doc && (now_ms - cmdw_time) < 400 && (cmdw_wid == wid || cmdw_pid == pid)) {
                             VN_LOG(">>> Cmd+W close confirmed for wid=%u (pid=%d, time delta %llu ms) -- cloning on the fly",
                                    wid, pid, (now_ms - cmdw_time));
                             atomic_store_explicit(&gCmdWRequestTimeMs, 0, memory_order_relaxed);
@@ -1476,7 +1514,16 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         pid_t cmdw_pid = atomic_load_explicit(&gCmdWTargetPID, memory_order_relaxed);
                         uint32_t cmdw_wid = atomic_load_explicit(&gCmdWTargetWID, memory_order_relaxed);
 
-                        if ((now_ms - cmdw_time) < 1200 && (cmdw_wid == wid || cmdw_pid == pid)) {
+                        bool is_valid_doc = false;
+                        CGRect probe = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
+                        if (probe.size.width < 1.0 || probe.size.height < 1.0) {
+                            if (vn_clipped_frame_bounds) probe = vn_clipped_frame_bounds(win);
+                        }
+                        if (probe.size.width >= 200.0 && probe.size.height >= 150.0 && vn_window_level(win) == 0) {
+                            is_valid_doc = true;
+                        }
+
+                        if (is_valid_doc && (now_ms - cmdw_time) < 400 && (cmdw_wid == wid || cmdw_pid == pid)) {
                             VN_LOG(">>> Cmd+W multi-close confirmed for wid=%u (pid=%d) -- cloning on the fly", wid, pid);
                             atomic_store_explicit(&gCmdWRequestTimeMs, 0, memory_order_relaxed);
                             clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderAbove);
