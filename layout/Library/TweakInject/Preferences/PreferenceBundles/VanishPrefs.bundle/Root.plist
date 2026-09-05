@@ -52,6 +52,38 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
+			<string>Refresh Rate</string>
+			<key>footerText</key>
+			<string>Animation frame rate. 120 Hz provides ultra-smooth animations on ProMotion displays; 60 Hz conserves power. 'Auto' dynamically syncs with the display's native refresh rate.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSegmentCell</string>
+			<key>default</key>
+			<string>auto</string>
+			<key>key</key>
+			<string>refreshRate</string>
+			<key>label</key>
+			<string>Refresh Rate</string>
+			<key>validTitles</key>
+			<array>
+				<string>Auto</string>
+				<string>120 Hz</string>
+				<string>60 Hz</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<string>auto</string>
+				<string>120</string>
+				<string>60</string>
+			</array>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
 			<string>Animation Duration</string>
 			<key>footerText</key>
 			<string>Duration of the close animation in seconds (default: 0.25s).</string>

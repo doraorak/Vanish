@@ -161,11 +161,12 @@ static VNSLSSetWindowShadowParametersFn   vn_set_window_shadow_parameters;
 typedef struct {
     bool  enabled;
     bool  shadows;
+    int   refreshRate; // 0 = auto/ProMotion, 120 = 120Hz, 60 = 60Hz
     float duration;
     char  targetApp[256];
 } VNPreferences;
 
-static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .duration = 0.25f, .targetApp = "all" };
+static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .refreshRate = 0, .duration = 0.25f, .targetApp = "all" };
 static os_unfair_lock gPrefsLock = OS_UNFAIR_LOCK_INIT;
 static struct timespec gPrefsMtime = {0};
 static bool           gPrefsValid = false;
@@ -173,6 +174,7 @@ static bool           gPrefsValid = false;
 static void vn_reload_prefs_locked(void) {
     gPrefs.enabled = true;
     gPrefs.shadows = true;
+    gPrefs.refreshRate = 0;
     gPrefs.duration = 0.25f;
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
 
@@ -190,6 +192,25 @@ static void vn_reload_prefs_locked(void) {
             }
             if (dict[@"shadows"] != nil) {
                 gPrefs.shadows = [dict[@"shadows"] boolValue];
+            }
+            if (dict[@"refreshRate"] != nil) {
+                id rr = dict[@"refreshRate"];
+                if ([rr isKindOfClass:[NSString class]]) {
+                    if ([rr isEqualToString:@"60"]) {
+                        gPrefs.refreshRate = 60;
+                    } else if ([rr isEqualToString:@"120"]) {
+                        gPrefs.refreshRate = 120;
+                    } else {
+                        gPrefs.refreshRate = 0; // auto
+                    }
+                } else if ([rr respondsToSelector:@selector(intValue)]) {
+                    int r = [rr intValue];
+                    if (r == 60 || r == 120) {
+                        gPrefs.refreshRate = r;
+                    } else {
+                        gPrefs.refreshRate = 0;
+                    }
+                }
             }
             if (dict[@"duration"] != nil) {
                 float dur = [dict[@"duration"] floatValue];
@@ -248,21 +269,37 @@ static void vn_reload_prefs_locked(void) {
         }
         fclose(f_shd);
     }
+
+    // /tmp/vanish_refresh_rate overrides refreshRate (60, 120, auto)
+    FILE *f_hz = fopen("/tmp/vanish_refresh_rate", "r");
+    if (f_hz) {
+        char buf[16] = {0};
+        if (fgets(buf, sizeof(buf), f_hz)) {
+            int val = atoi(buf);
+            if (val == 60 || val == 120) {
+                gPrefs.refreshRate = val;
+            } else if (strncmp(buf, "auto", 4) == 0) {
+                gPrefs.refreshRate = 0;
+            }
+        }
+        fclose(f_hz);
+    }
 }
 
 static VNPreferences vn_get_prefs(void) {
     struct stat st;
     bool have_stat = (stat("/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist", &st) == 0);
-    struct stat st_tmp_dur, st_tmp_tgt, st_tmp_shd;
+    struct stat st_tmp_dur, st_tmp_tgt, st_tmp_shd, st_tmp_hz;
     bool have_tmp_dur = (stat("/tmp/vanish_duration", &st_tmp_dur) == 0);
     bool have_tmp_tgt = (stat("/tmp/vanish_target", &st_tmp_tgt) == 0);
     bool have_tmp_shd = (stat("/tmp/vanish_shadows", &st_tmp_shd) == 0);
+    bool have_tmp_hz  = (stat("/tmp/vanish_refresh_rate", &st_tmp_hz) == 0);
 
     os_unfair_lock_lock(&gPrefsLock);
     bool fresh = gPrefsValid && have_stat &&
                  st.st_mtimespec.tv_sec  == gPrefsMtime.tv_sec &&
                  st.st_mtimespec.tv_nsec == gPrefsMtime.tv_nsec &&
-                 !have_tmp_dur && !have_tmp_tgt && !have_tmp_shd;
+                 !have_tmp_dur && !have_tmp_tgt && !have_tmp_shd && !have_tmp_hz;
     if (!fresh) {
         vn_reload_prefs_locked();
     }
@@ -800,6 +837,16 @@ static double vn_get_display_refresh_interval(CGXWindow *win) {
     return (1.0 / 120.0); // High-refresh ProMotion default (8.33ms)
 }
 
+static double vn_get_refresh_interval(CGXWindow *win) {
+    VNPreferences prefs = vn_get_prefs();
+    if (prefs.refreshRate == 60) {
+        return (1.0 / 60.0);
+    } else if (prefs.refreshRate == 120) {
+        return (1.0 / 120.0);
+    }
+    return vn_get_display_refresh_interval(win);
+}
+
 /// Fills the mesh for one frame.
 ///
 /// `t` runs 0 -> 1. `bounds` is the window's frame in screen coordinates. The
@@ -904,7 +951,7 @@ static void vn_anim_tick(void *ctx, double when) {
             }
         }
         os_unfair_lock_unlock(&gAnimsLock);
-        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + vn_get_display_refresh_interval(active_win));
+        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + vn_get_refresh_interval(active_win));
     }
 }
 
@@ -961,10 +1008,11 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
     };
     os_unfair_lock_unlock(&gAnimsLock);
 
-    VN_LOG("starting fade animation for target wid=%u (orig=%u) win=%p duration=%.2fs (anim_id=%llu)",
-           wid, orig_wid, win, dur, anim_id);
+    double interval = vn_get_refresh_interval(win);
+    double hz = interval > 0.0 ? (1.0 / interval) : 120.0;
 
-    double interval = vn_get_display_refresh_interval(win);
+    VN_LOG("starting fade animation for target wid=%u (orig=%u) win=%p duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
+           wid, orig_wid, win, dur, interval * 1000.0, hz, anim_id);
 
     if (vn_schedule_callback) {
         vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);

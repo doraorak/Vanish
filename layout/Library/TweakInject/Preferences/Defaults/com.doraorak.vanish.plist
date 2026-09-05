@@ -4,6 +4,10 @@
 <dict>
 	<key>enabled</key>
 	<true/>
+	<key>shadows</key>
+	<true/>
+	<key>refreshRate</key>
+	<string>auto</string>
 	<key>duration</key>
 	<real>0.25</real>
 	<key>targetApp</key>
