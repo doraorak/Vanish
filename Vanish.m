@@ -156,17 +156,19 @@ static VNUpdateCAVisibilityFn       vn_update_ca_visibility;
 
 typedef struct {
     bool  enabled;
+    bool  shadows;
     float duration;
     char  targetApp[256];
 } VNPreferences;
 
-static VNPreferences  gPrefs = { .enabled = true, .duration = 0.25f, .targetApp = "all" };
+static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .duration = 0.25f, .targetApp = "all" };
 static os_unfair_lock gPrefsLock = OS_UNFAIR_LOCK_INIT;
 static struct timespec gPrefsMtime = {0};
 static bool           gPrefsValid = false;
 
 static void vn_reload_prefs_locked(void) {
     gPrefs.enabled = true;
+    gPrefs.shadows = true;
     gPrefs.duration = 0.25f;
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
 
@@ -181,6 +183,9 @@ static void vn_reload_prefs_locked(void) {
         if (dict) {
             if (dict[@"enabled"] != nil) {
                 gPrefs.enabled = [dict[@"enabled"] boolValue];
+            }
+            if (dict[@"shadows"] != nil) {
+                gPrefs.shadows = [dict[@"shadows"] boolValue];
             }
             if (dict[@"duration"] != nil) {
                 float dur = [dict[@"duration"] floatValue];
@@ -228,20 +233,32 @@ static void vn_reload_prefs_locked(void) {
         }
         fclose(f_tgt);
     }
+
+    // /tmp/vanish_shadows overrides shadows (0 or 1)
+    FILE *f_shd = fopen("/tmp/vanish_shadows", "r");
+    if (f_shd) {
+        char buf[16] = {0};
+        if (fgets(buf, sizeof(buf), f_shd)) {
+            int val = atoi(buf);
+            gPrefs.shadows = (val != 0);
+        }
+        fclose(f_shd);
+    }
 }
 
 static VNPreferences vn_get_prefs(void) {
     struct stat st;
     bool have_stat = (stat("/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist", &st) == 0);
-    struct stat st_tmp_dur, st_tmp_tgt;
+    struct stat st_tmp_dur, st_tmp_tgt, st_tmp_shd;
     bool have_tmp_dur = (stat("/tmp/vanish_duration", &st_tmp_dur) == 0);
     bool have_tmp_tgt = (stat("/tmp/vanish_target", &st_tmp_tgt) == 0);
+    bool have_tmp_shd = (stat("/tmp/vanish_shadows", &st_tmp_shd) == 0);
 
     os_unfair_lock_lock(&gPrefsLock);
     bool fresh = gPrefsValid && have_stat &&
                  st.st_mtimespec.tv_sec  == gPrefsMtime.tv_sec &&
                  st.st_mtimespec.tv_nsec == gPrefsMtime.tv_nsec &&
-                 !have_tmp_dur && !have_tmp_tgt;
+                 !have_tmp_dur && !have_tmp_tgt && !have_tmp_shd;
     if (!fresh) {
         vn_reload_prefs_locked();
     }
@@ -662,7 +679,15 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         }
     }
 
-    CGRect frame = (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) ? bounds : content;
+    VNPreferences prefs = vn_get_prefs();
+    CGRect frame = CGRectZero;
+    if (prefs.shadows && bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
+        frame = bounds;
+    } else if (content.size.width >= 1.0 && content.size.height >= 1.0) {
+        frame = content;
+    } else if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
+        frame = bounds;
+    }
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         VN_LOG("snapshot: no usable frame for wid=%u -- not cloning", orig_wid);
@@ -818,9 +843,12 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
     float dur = vn_duration();
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
+        VNPreferences prefs = vn_get_prefs();
         CGRect b = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
         CGRect p = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
-        if (b.size.width >= 1.0 && b.size.height >= 1.0) {
+        if (!prefs.shadows && p.size.width >= 1.0 && p.size.height >= 1.0) {
+            frame = p;
+        } else if (b.size.width >= 1.0 && b.size.height >= 1.0) {
             frame = b;
         } else if (p.size.width >= 1.0 && p.size.height >= 1.0) {
             frame = p;
@@ -884,7 +912,6 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
 static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win, CGXConnection *conn) {
     CGXWindow *clone_to_release = NULL;
     uint32_t clone_wid = 0;
-    CGXConnection *clone_conn = NULL;
     CGXWindow *orig_win = NULL;
     CGXConnection *orig_conn = NULL;
     CGRect orig_bounds = CGRectZero;
@@ -898,7 +925,6 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
             if (gActiveAnims[i].is_clone) {
                 clone_to_release = gActiveAnims[i].win;
                 clone_wid = gActiveAnims[i].wid;
-                clone_conn = gActiveAnims[i].conn;
             } else {
                 orig_win = gActiveAnims[i].win;
                 orig_conn = gActiveAnims[i].conn ? gActiveAnims[i].conn : conn;
