@@ -738,6 +738,49 @@ static long vn_trace_ms(void);
 #define kVNMeshH 5
 #define kVNMeshCount (kVNMeshW * kVNMeshH)
 
+static double vn_get_display_refresh_interval(CGXWindow *win) {
+    static int (*s_PKGDisplayGetCurrentMode)(const void *, void *) = NULL;
+    static uint32_t (*s_SLMainDisplayID)(void) = NULL;
+    static void * (*s_SLDisplayCopyDisplayMode)(uint32_t) = NULL;
+    static double (*s_SLDisplayModeGetRefreshRate)(void *) = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        s_PKGDisplayGetCurrentMode = (int (*)(const void *, void *))vn_skylight_symbol("_PKGDisplayGetCurrentMode");
+        s_SLMainDisplayID = (uint32_t (*)(void))vn_skylight_symbol("SLMainDisplayID");
+        s_SLDisplayCopyDisplayMode = (void * (*)(uint32_t))vn_skylight_symbol("SLDisplayCopyDisplayMode");
+        s_SLDisplayModeGetRefreshRate = (double (*)(void *))vn_skylight_symbol("SLDisplayModeGetRefreshRate");
+    });
+
+    if (win && vn_window_get_display && s_PKGDisplayGetCurrentMode) {
+        const void *display = vn_window_get_display(win);
+        if (display) {
+            uint8_t mode[64] = {0};
+            if (s_PKGDisplayGetCurrentMode(display, mode) == 1) {
+                float rate = *(float *)(mode + 0x10);
+                if (rate >= 30.0f && rate <= 360.0f) {
+                    return 1.0 / (double)rate;
+                }
+            }
+        }
+    }
+
+    if (s_SLMainDisplayID && s_SLDisplayCopyDisplayMode && s_SLDisplayModeGetRefreshRate) {
+        uint32_t disp = s_SLMainDisplayID();
+        if (disp != 0) {
+            void *mode = s_SLDisplayCopyDisplayMode(disp);
+            if (mode) {
+                double rate = s_SLDisplayModeGetRefreshRate(mode);
+                CFRelease((CFTypeRef)mode);
+                if (rate >= 30.0 && rate <= 360.0) {
+                    return 1.0 / rate;
+                }
+            }
+        }
+    }
+
+    return (1.0 / 120.0); // High-refresh ProMotion default (8.33ms)
+}
+
 /// Fills the mesh for one frame.
 ///
 /// `t` runs 0 -> 1. `bounds` is the window's frame in screen coordinates. The
@@ -745,7 +788,12 @@ static long vn_trace_ms(void);
 /// -- and only the global ones move. Every future animation is a new function
 /// of exactly this shape.
 static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
-    double s  = 1.0 - t;
+    // Cubic Ease-Out curve for instantaneous visual response:
+    // Window starts with high initial velocity upon click release,
+    // then decelerates smoothly into the vanishing point.
+    double inv = 1.0 - t;
+    if (inv < 0.0) inv = 0.0;
+    double s = inv * inv * inv;
     if (s < 0.005) s = 0.005;  // Keep non-zero positive area to avoid GPU shader singularity
     double cx = bounds.origin.x + bounds.size.width  * 0.5;
     double cy = bounds.origin.y + bounds.size.height * 0.5;
@@ -833,7 +881,16 @@ static void vn_anim_tick(void *ctx, double when) {
     for (int i = 0; i < finished_count; i++) vn_finish_animation_for_id(finished[i]);
 
     if (more && vn_schedule_callback) {
-        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + (1.0 / 60.0));
+        CGXWindow *active_win = NULL;
+        os_unfair_lock_lock(&gAnimsLock);
+        for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
+            if (gActiveAnims[i].is_animating && gActiveAnims[i].win) {
+                active_win = gActiveAnims[i].win;
+                break;
+            }
+        }
+        os_unfair_lock_unlock(&gAnimsLock);
+        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + vn_get_display_refresh_interval(active_win));
     }
 }
 
@@ -893,17 +950,19 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
     VN_LOG("starting fade animation for target wid=%u (orig=%u) win=%p duration=%.2fs (anim_id=%llu)",
            wid, orig_wid, win, dur, anim_id);
 
-    // Ask the window server to fade the window with its own drag-fade
-    // machinery. Everything the alpha path needed is done for us here: the
-    // per-display alphas, the timer, and the compositing that actually reads
-    // them. Setting an alpha, by contrast, only ever wrote a number nobody read.
-    // Nothing to kick off: the animation is drawn frame by frame in vn_anim_tick.
-    // The window keeps its own shape until the first tick lands.
+    double interval = vn_get_display_refresh_interval(win);
 
-    // The order-out still has to be deferred by hand; the drag fade animates the
-    // window but does not remove it.
+    // Apply immediate initial deformation tick synchronously so the window is
+    // visibly shrinking on the very first display frame following orderOut.
+    if (vn_set_mesh_warp) {
+        VNPointWarp mesh[kVNMeshCount];
+        vn_anim_shrink(mesh, frame, 0.02);
+        CGXConnection *warp_conn = is_clone ? NULL : conn;
+        vn_set_mesh_warp(win, warp_conn, kVNMeshW, kVNMeshH, (const float *)mesh);
+    }
+
     if (vn_schedule_callback) {
-        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + (1.0 / 60.0));
+        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
     } else {
         vn_finish_animation_for_id(anim_id);
     }
