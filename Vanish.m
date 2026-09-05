@@ -196,16 +196,15 @@ static void vn_reload_prefs_locked(void) {
             if (dict[@"refreshRate"] != nil) {
                 id rr = dict[@"refreshRate"];
                 if ([rr isKindOfClass:[NSString class]]) {
-                    if ([rr isEqualToString:@"60"]) {
-                        gPrefs.refreshRate = 60;
-                    } else if ([rr isEqualToString:@"120"]) {
-                        gPrefs.refreshRate = 120;
+                    int r = [rr intValue];
+                    if (r >= 1 && r <= 360) {
+                        gPrefs.refreshRate = r;
                     } else {
                         gPrefs.refreshRate = 0; // auto
                     }
                 } else if ([rr respondsToSelector:@selector(intValue)]) {
                     int r = [rr intValue];
-                    if (r == 60 || r == 120) {
+                    if (r >= 1 && r <= 360) {
                         gPrefs.refreshRate = r;
                     } else {
                         gPrefs.refreshRate = 0;
@@ -270,13 +269,13 @@ static void vn_reload_prefs_locked(void) {
         fclose(f_shd);
     }
 
-    // /tmp/vanish_refresh_rate overrides refreshRate (60, 120, auto)
+    // /tmp/vanish_refresh_rate overrides refreshRate (e.g. 10, 60, 120, auto)
     FILE *f_hz = fopen("/tmp/vanish_refresh_rate", "r");
     if (f_hz) {
         char buf[16] = {0};
         if (fgets(buf, sizeof(buf), f_hz)) {
             int val = atoi(buf);
-            if (val == 60 || val == 120) {
+            if (val >= 1 && val <= 360) {
                 gPrefs.refreshRate = val;
             } else if (strncmp(buf, "auto", 4) == 0) {
                 gPrefs.refreshRate = 0;
@@ -839,10 +838,8 @@ static double vn_get_display_refresh_interval(CGXWindow *win) {
 
 static double vn_get_refresh_interval(CGXWindow *win) {
     VNPreferences prefs = vn_get_prefs();
-    if (prefs.refreshRate == 60) {
-        return (1.0 / 60.0);
-    } else if (prefs.refreshRate == 120) {
-        return (1.0 / 120.0);
+    if (prefs.refreshRate > 0) {
+        return (1.0 / (double)prefs.refreshRate);
     }
     return vn_get_display_refresh_interval(win);
 }

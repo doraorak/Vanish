@@ -54,7 +54,7 @@
 			<key>label</key>
 			<string>Refresh Rate</string>
 			<key>footerText</key>
-			<string>Animation frame rate. 120 Hz provides ultra-smooth animations on ProMotion displays; 60 Hz conserves power. 'Auto' dynamically syncs with the display's native refresh rate.</string>
+			<string>Animation frame rate. 120 Hz provides ultra-smooth animations on ProMotion displays; 60 Hz conserves power; 10 Hz demonstrates low-frame-rate stepping. 'Auto' dynamically syncs with the display's native refresh rate.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -70,12 +70,14 @@
 				<string>Auto</string>
 				<string>120 Hz</string>
 				<string>60 Hz</string>
+				<string>10 Hz</string>
 			</array>
 			<key>validValues</key>
 			<array>
 				<string>auto</string>
 				<string>120</string>
 				<string>60</string>
+				<string>10</string>
 			</array>
 			<key>PostNotification</key>
 			<string>com.doraorak.vanish/prefsChanged</string>
