@@ -20,6 +20,7 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <string.h>
 #import <stdbool.h>
+#import <math.h>
 #import <dlfcn.h>
 #import <ptrauth.h>
 #import <time.h>
@@ -507,6 +508,9 @@ typedef struct {
     CGXConnection *conn;
     CGRect         frame;
     double         created_at;
+    CGPoint        mouseDownScreenPt;
+    CGPoint        mouseDownLocalPt;
+    double         mouseUpTime;
 } VNPreClone;
 
 static VNPreClone     gPreClone = {0};
@@ -526,11 +530,14 @@ static CGXWindow *vn_preclone_take_locked(uint32_t *out_clone_wid, uint32_t *out
     gPreClone.conn = NULL;
     gPreClone.frame = CGRectZero;
     gPreClone.created_at = 0.0;
+    gPreClone.mouseDownScreenPt = CGPointZero;
+    gPreClone.mouseDownLocalPt  = CGPointZero;
+    gPreClone.mouseUpTime = 0.0;
     return clone;
 }
 
 // Discards the pre-clone safely: extracts clone under lock, unlocks,
-// and then calls vn_system_window_release outside the lock.
+// suppresses CA visibility, orders out the clone, and releases it.
 static void vn_preclone_discard(void) {
     uint32_t clone_wid = 0, orig_wid = 0;
     os_unfair_lock_lock(&gPreCloneLock);
@@ -538,7 +545,15 @@ static void vn_preclone_discard(void) {
     os_unfair_lock_unlock(&gPreCloneLock);
 
     if (clone) {
-        VN_LOG("pre-clone: releasing unused clone wid=%u for orig=%u", clone_wid, orig_wid);
+        VN_LOG("pre-clone: discarding and hiding unused clone wid=%u for orig=%u", clone_wid, orig_wid);
+        if (vn_update_ca_visibility) {
+            vn_update_ca_visibility(clone, false);
+        }
+        if (clone_wid != 0) {
+            CGSOrderOp op = kVNOrderOut;
+            uint32_t rel = 0;
+            vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
+        }
         if (vn_system_window_release) {
             vn_system_window_release(clone);
         }
@@ -552,10 +567,19 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
     uint32_t clone_wid = 0, orig_wid = 0;
 
     os_unfair_lock_lock(&gPreCloneLock);
-    if (gPreClone.orig_wid != 0 && (now - gPreClone.created_at) >= 1.4) {
-        VN_LOG("pre-clone: timed out after %.2fs without close -- cleaning up",
-               now - gPreClone.created_at);
-        clone = vn_preclone_take_locked(&clone_wid, &orig_wid, NULL);
+    if (gPreClone.orig_wid != 0) {
+        bool expired = false;
+        if (gPreClone.mouseUpTime > 0.0 && (now - gPreClone.mouseUpTime) >= 0.25) {
+            expired = true;
+        } else if ((now - gPreClone.created_at) >= 0.50) {
+            expired = true;
+        }
+        if (expired) {
+            VN_LOG("pre-clone: timed out (age=%.2fs, since_up=%.2fs) without close -- cleaning up",
+                   now - gPreClone.created_at,
+                   gPreClone.mouseUpTime > 0.0 ? (now - gPreClone.mouseUpTime) : -1.0);
+            clone = vn_preclone_take_locked(&clone_wid, &orig_wid, NULL);
+        }
     }
     os_unfair_lock_unlock(&gPreCloneLock);
 
@@ -1139,12 +1163,7 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     os_unfair_lock_lock(&gPreCloneLock);
     if (gPreClone.clone == win) {
         // The clone itself is being released -- simply zero out without calling vn_system_window_release
-        gPreClone.clone = NULL;
-        gPreClone.orig_wid = 0;
-        gPreClone.clone_wid = 0;
-        gPreClone.conn = NULL;
-        gPreClone.frame = CGRectZero;
-        gPreClone.created_at = 0.0;
+        vn_preclone_take_locked(NULL, NULL, NULL);
     } else if (gPreClone.orig_wid != 0 && vn_window_by_id && vn_window_by_id(gPreClone.orig_wid) == win) {
         clone_conn = gPreClone.conn;
         clone_to_animate = vn_preclone_take_locked(&clone_wid, &orig_wid, &clone_frame);
@@ -1202,6 +1221,11 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
 }
 
+static uint64_t gLastMouseDownTimeMs = 0;
+static CGPoint  gLastMouseDownPt     = {0};
+static uint32_t gLastMouseDownWid    = 0;
+static uint64_t gDoubleClickSuppressUntilMs = 0;
+
 static void vn_hooked_post_event(CGXConnection *conn, void *event) {
     if (!event) {
         if (vn_orig_post_event) vn_orig_post_event(conn, event);
@@ -1248,35 +1272,74 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
         if (wid != 0 && vn_window_by_id) {
             CGXWindow *win = vn_window_by_id(wid);
             if (win && vn_is_target_window(win) && !vn_is_window_animating(wid, win)) {
-                const CGPoint *local_pt = (const CGPoint *)((const char *)event + 0x20);
+                const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
+                const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
                 double lx = local_pt->x;
                 double ly = local_pt->y;
+
+                uint64_t now_ms = vn_now_ms();
+
+                // Double-click check: if user double clicks titlebar / corner (e.g. to zoom/maximize),
+                // abort any pre-clone and suppress pre-cloning during the zoom gesture.
+                bool is_double_click = false;
+                if (now_ms < gDoubleClickSuppressUntilMs) {
+                    VN_LOG("hit-test: suppressing pre-clone due to recent double-click (remaining %llums)",
+                           gDoubleClickSuppressUntilMs - now_ms);
+                    vn_preclone_discard();
+                    goto dispatch;
+                }
+
+                if (wid == gLastMouseDownWid && (now_ms - gLastMouseDownTimeMs) < 450) {
+                    double dist = hypot(screen_pt->x - gLastMouseDownPt.x, screen_pt->y - gLastMouseDownPt.y);
+                    if (dist < 8.0) {
+                        is_double_click = true;
+                    }
+                }
+                gLastMouseDownTimeMs = now_ms;
+                gLastMouseDownPt = *screen_pt;
+                gLastMouseDownWid = wid;
+
+                if (is_double_click) {
+                    VN_LOG("hit-test: double-click detected on wid=%u -- suppressing pre-clone for 600ms", wid);
+                    vn_preclone_discard();
+                    gDoubleClickSuppressUntilMs = now_ms + 600;
+                    goto dispatch;
+                }
 
                 bool is_red = false;
                 bool is_yellow_or_green = false;
 
                 // Hit-test traffic lights:
-                // Standard titlebar windows (e.g. VanishTest, TweakInject, simple apps):
-                //   y is in [4.0, 18.0). Red center ~17pt, Yellow center ~38pt, Green center ~58pt.
-                // Unified toolbar windows (e.g. Mail, Messages, Notes, Calculator, Safari, Antigravity):
-                //   y is in [18.0, 36.0]. Red center ~26pt, Yellow center ~49pt, Green center ~72pt.
-                if (ly >= 4.0 && ly < 18.0) {
-                    if (lx >= 3.0 && lx <= 28.0) {
-                        is_red = true;
-                    } else if (lx >= 29.0 && lx <= 80.0) {
-                        is_yellow_or_green = true;
-                    }
-                } else if (ly >= 18.0 && ly <= 36.0) {
-                    if (lx >= 8.0 && lx <= 36.0) {
-                        is_red = true;
-                    } else if (lx >= 37.0 && lx <= 88.0) {
-                        is_yellow_or_green = true;
+                // Strict bounds to exclude resize handles (lx < 8, ly < 6) and toolbar content (ly > 35, lx > 33):
+                if (lx >= 8.0 && lx <= 33.0 && ly >= 6.0 && ly <= 35.0) {
+                    if (ly < 18.0) {
+                        // Compact titlebars (Chrome tabs, WhatsApp, simple apps):
+                        // Red center ~ (16..18, 11..13), radius ~7pt. Yellow starts at x > 26.
+                        if (lx <= 24.0) {
+                            is_red = true;
+                        }
+                    } else {
+                        // Unified titlebars & toolbars (Mail, System Settings, Calculator, Safari, Antigravity):
+                        // Red center ~ (20..26, 20..26), radius ~7pt.
+                        // Region lx in [0, 14) is empty toolbar drag space.
+                        if (lx >= 14.0 && lx <= 32.0) {
+                            is_red = true;
+                        }
                     }
                 }
 
-                // Every corner click on a target window, classified or not. This
-                // is the only way to find out where an app actually puts its
-                // lights: click the red button once and read the point back.
+                if (ly >= 6.0 && ly <= 35.0) {
+                    if (ly < 18.0) {
+                        if (lx >= 27.0 && lx <= 80.0) {
+                            is_yellow_or_green = true;
+                        }
+                    } else {
+                        if (lx >= 35.0 && lx <= 88.0) {
+                            is_yellow_or_green = true;
+                        }
+                    }
+                }
+
                 if (lx <= 150.0 && ly <= 60.0) {
                     char hit_app[256] = {0};
                     pid_t hit_pid = 0;
@@ -1294,16 +1357,11 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     VN_LOG(">>> Mouse down in RED CLOSE box of '%s' (wid=%u, pt=(%.1f, %.1f)) -- pre-cloning now!",
                            app, wid, lx, ly);
 
-                    // Safely discard any existing pre-clone
                     vn_preclone_discard();
-
-                    // Clear any non-close state for this window
                     atomic_store_explicit(&gNonCloseWid, 0, memory_order_relaxed);
 
                     uint32_t clone_wid = 0;
                     CGRect clone_frame = CGRectZero;
-                    // Order pre-clone BELOW original window!
-                    // This keeps the original window on top to receive mouse-up and execute close normally.
                     CGXWindow *clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderBelow);
                     if (clone && clone_wid != 0) {
                         os_unfair_lock_lock(&gPreCloneLock);
@@ -1313,12 +1371,15 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                         gPreClone.conn = conn;
                         gPreClone.frame = clone_frame;
                         gPreClone.created_at = SLSCurrentRealTime();
+                        gPreClone.mouseDownScreenPt = *screen_pt;
+                        gPreClone.mouseDownLocalPt  = *local_pt;
+                        gPreClone.mouseUpTime = 0.0;
                         os_unfair_lock_unlock(&gPreCloneLock);
 
                         VN_LOG("pre-clone: ready! wid=%u clone_wid=%u (ordered below original)", wid, clone_wid);
 
                         if (vn_schedule_callback) {
-                            vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.5);
+                            vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 0.50);
                         }
                     } else {
                         VN_LOG("pre-clone: failed to create clone for wid=%u", wid);
@@ -1329,14 +1390,77 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     vn_preclone_discard();
                     atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
                     atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
-                } else if (lx > 88.0 || ly > 36.0) {
-                    // Clicked clearly elsewhere on the window: discard any pending pre-clone
+                } else {
+                    // Clicked elsewhere on the window: discard any pending pre-clone
                     vn_preclone_discard();
                 }
             }
         }
     }
+    // 3. Mouse release interception (kCGEventLeftMouseUp)
+    else if (type == 2) { // kCGEventLeftMouseUp
+        os_unfair_lock_lock(&gPreCloneLock);
+        bool has_preclone = (gPreClone.orig_wid != 0);
+        uint32_t orig_wid = gPreClone.orig_wid;
+        os_unfair_lock_unlock(&gPreCloneLock);
 
+        if (has_preclone) {
+            const CGPoint *local_pt = (const CGPoint *)((const char *)event + 0x20);
+            double lx = local_pt->x;
+            double ly = local_pt->y;
+            uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
+
+            bool on_red = false;
+            if ((wid == 0 || wid == orig_wid) &&
+                lx >= 8.0 && lx <= 33.0 && ly >= 6.0 && ly <= 35.0) {
+                if (ly < 18.0) {
+                    on_red = (lx <= 24.0);
+                } else {
+                    on_red = (lx >= 14.0 && lx <= 32.0);
+                }
+            }
+
+            if (!on_red) {
+                VN_LOG("pre-clone: mouse up outside red button (wid=%u pt=(%.1f, %.1f)) -- canceling pre-clone",
+                       wid, lx, ly);
+                vn_preclone_discard();
+            } else {
+                os_unfair_lock_lock(&gPreCloneLock);
+                if (gPreClone.orig_wid == orig_wid) {
+                    gPreClone.mouseUpTime = SLSCurrentRealTime();
+                }
+                os_unfair_lock_unlock(&gPreCloneLock);
+
+                if (vn_schedule_callback) {
+                    vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 0.25);
+                }
+            }
+        }
+    }
+    // 4. Mouse drag interception (kCGEventLeftMouseDragged)
+    else if (type == 6) { // kCGEventLeftMouseDragged
+        os_unfair_lock_lock(&gPreCloneLock);
+        bool has_preclone = (gPreClone.orig_wid != 0);
+        CGPoint down_scr = gPreClone.mouseDownScreenPt;
+        CGPoint down_loc = gPreClone.mouseDownLocalPt;
+        uint32_t orig_wid = gPreClone.orig_wid;
+        os_unfair_lock_unlock(&gPreCloneLock);
+
+        if (has_preclone) {
+            const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
+            const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
+            double d_scr = hypot(screen_pt->x - down_scr.x, screen_pt->y - down_scr.y);
+            double d_loc = hypot(local_pt->x - down_loc.x, local_pt->y - down_loc.y);
+
+            if (d_scr >= 3.0 || d_loc >= 3.0) {
+                VN_LOG("pre-clone: drag detected (d_scr=%.1f d_loc=%.1f) -- aborting pre-clone for wid=%u",
+                       d_scr, d_loc, orig_wid);
+                vn_preclone_discard();
+            }
+        }
+    }
+
+dispatch:
     if (vn_orig_post_event) {
         vn_orig_post_event(conn, event);
     }
