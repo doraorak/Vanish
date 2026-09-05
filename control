@@ -1,6 +1,6 @@
 Package: com.doraorak.vanish
 Name: Vanish
-Version: 1.0.10
+Version: 1.0.11
 Architecture: darwin-arm64e
 Description: Animates windows closing from the red traffic-light button.
 Maintainer: Dora Orak

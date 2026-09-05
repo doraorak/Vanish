@@ -1267,6 +1267,7 @@ static inline bool vn_is_in_yellow_or_green_hitbox(double lx, double ly) {
 static uint64_t gLastMouseDownTimeMs = 0;
 static CGPoint  gLastMouseDownPt     = {0};
 static uint32_t gLastMouseDownWid    = 0;
+static uint32_t gRedMouseDownWid     = 0;
 static uint64_t gDoubleClickSuppressUntilMs = 0;
 
 static void vn_hooked_post_event(CGXConnection *conn, void *event) {
@@ -1344,6 +1345,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 if (is_double_click) {
                     VN_LOG("hit-test: double-click detected on wid=%u (pt=%.1f,%.1f) -- discarding pre-clone and suppressing for 600ms",
                            wid, lx, ly);
+                    gRedMouseDownWid = 0;
                     vn_preclone_discard();
                     gDoubleClickSuppressUntilMs = now_ms + 600;
                     goto dispatch;
@@ -1351,6 +1353,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
                 if (suppressed_by_double_click) {
                     VN_LOG("hit-test: click on wid=%u suppressed due to active double-click window", wid);
+                    gRedMouseDownWid = 0;
                     vn_preclone_discard();
                     goto dispatch;
                 }
@@ -1375,6 +1378,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     VN_LOG(">>> Mouse down in RED CLOSE box of '%s' (wid=%u, pt=(%.1f, %.1f)) -- pre-cloning now!",
                            app, wid, lx, ly);
 
+                    gRedMouseDownWid = wid;
                     vn_preclone_discard();
                     atomic_store_explicit(&gNonCloseWid, 0, memory_order_relaxed);
 
@@ -1405,11 +1409,13 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 } else if (is_yellow_or_green) {
                     VN_LOG(">>> Mouse down in YELLOW/GREEN button of wid=%u (pt=(%.1f, %.1f)) -- ignoring close animation",
                            wid, lx, ly);
+                    gRedMouseDownWid = 0;
                     vn_preclone_discard();
                     atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
                     atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
                 } else {
                     // Clicked elsewhere on the window: discard any pending pre-clone
+                    gRedMouseDownWid = 0;
                     vn_preclone_discard();
                 }
             }
@@ -1417,6 +1423,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
     }
     // 3. Mouse release interception (kCGEventLeftMouseUp)
     else if (type == 2) { // kCGEventLeftMouseUp
+        gRedMouseDownWid = 0;
         os_unfair_lock_lock(&gPreCloneLock);
         bool has_preclone = (gPreClone.orig_wid != 0);
         uint32_t orig_wid = gPreClone.orig_wid;
@@ -1454,12 +1461,12 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
         uint32_t orig_wid = gPreClone.orig_wid;
         os_unfair_lock_unlock(&gPreCloneLock);
 
-        if (has_preclone) {
-            const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
-            const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
-            double lx = local_pt->x;
-            double ly = local_pt->y;
+        const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
+        const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
+        double lx = local_pt->x;
+        double ly = local_pt->y;
 
+        if (has_preclone) {
             bool on_red = vn_is_in_red_hitbox(lx, ly);
             if (!on_red) {
                 // Dragged off the red button! User either dragged away to cancel the close,
@@ -1475,6 +1482,58 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     VN_LOG("pre-clone: window drag detected (d_scr=%.1f) -- aborting pre-clone for wid=%u",
                            d_scr, orig_wid);
                     vn_preclone_discard();
+                }
+            }
+        } else if (gRedMouseDownWid != 0) {
+            // Re-arm on re-entry (Option 2):
+            // Initial click was on the red close button, the pre-clone was discarded when dragged off,
+            // and the user has dragged back into the red button hitbox while still holding mouse-down!
+            bool on_red = vn_is_in_red_hitbox(lx, ly);
+            if (on_red) {
+                uint32_t target_wid = gRedMouseDownWid;
+                CGXWindow *win = vn_window_by_id ? vn_window_by_id(target_wid) : NULL;
+                uint64_t now_ms = vn_now_ms();
+                bool suppressed = (now_ms < gDoubleClickSuppressUntilMs);
+
+                if (win && !suppressed && vn_is_target_window(win) && !vn_is_window_animating(target_wid, win) &&
+                    atomic_load_explicit(&gNonCloseWid, memory_order_relaxed) != target_wid) {
+                    // Check under lock that no clone was created in the meantime
+                    os_unfair_lock_lock(&gPreCloneLock);
+                    bool already_has = (gPreClone.orig_wid != 0);
+                    os_unfair_lock_unlock(&gPreCloneLock);
+
+                    if (!already_has) {
+                        uint32_t clone_wid = 0;
+                        CGRect clone_frame = CGRectZero;
+                        CGXWindow *clone = vn_make_snapshot(win, conn, target_wid, &clone_wid, &clone_frame, kVNOrderBelow);
+                        if (clone && clone_wid != 0) {
+                            os_unfair_lock_lock(&gPreCloneLock);
+                            if (gPreClone.orig_wid == 0) {
+                                gPreClone.orig_wid = target_wid;
+                                gPreClone.clone_wid = clone_wid;
+                                gPreClone.clone = clone;
+                                gPreClone.conn = conn;
+                                gPreClone.frame = clone_frame;
+                                gPreClone.created_at = SLSCurrentRealTime();
+                                gPreClone.mouseDownScreenPt = *screen_pt;
+                                gPreClone.mouseDownLocalPt  = *local_pt;
+                                gPreClone.mouseUpTime = 0.0;
+                                os_unfair_lock_unlock(&gPreCloneLock);
+
+                                VN_LOG("pre-clone: re-armed on re-entry! wid=%u clone_wid=%u (ordered below original)",
+                                       target_wid, clone_wid);
+
+                                if (vn_schedule_callback) {
+                                    vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 30.0);
+                                }
+                            } else {
+                                // Redundant clone guard: another clone was stored, release this one immediately
+                                os_unfair_lock_unlock(&gPreCloneLock);
+                                if (vn_update_ca_visibility) vn_update_ca_visibility(clone, false);
+                                if (vn_system_window_release) vn_system_window_release(clone);
+                            }
+                        }
+                    }
                 }
             }
         }
