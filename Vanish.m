@@ -161,12 +161,12 @@ static VNSLSSetWindowShadowParametersFn   vn_set_window_shadow_parameters;
 typedef struct {
     bool  enabled;
     bool  shadows;
-    int   refreshRate; // 0 = auto/ProMotion, 120 = 120Hz, 60 = 60Hz
+    float refreshRate; // in Hz: e.g. 10.0 .. 120.0 (default 120.0)
     float duration;
     char  targetApp[256];
 } VNPreferences;
 
-static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .refreshRate = 0, .duration = 0.25f, .targetApp = "all" };
+static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .refreshRate = 120.0f, .duration = 0.25f, .targetApp = "all" };
 static os_unfair_lock gPrefsLock = OS_UNFAIR_LOCK_INIT;
 static struct timespec gPrefsMtime = {0};
 static bool           gPrefsValid = false;
@@ -174,7 +174,7 @@ static bool           gPrefsValid = false;
 static void vn_reload_prefs_locked(void) {
     gPrefs.enabled = true;
     gPrefs.shadows = true;
-    gPrefs.refreshRate = 0;
+    gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
 
@@ -196,18 +196,14 @@ static void vn_reload_prefs_locked(void) {
             if (dict[@"refreshRate"] != nil) {
                 id rr = dict[@"refreshRate"];
                 if ([rr isKindOfClass:[NSString class]]) {
-                    int r = [rr intValue];
-                    if (r >= 1 && r <= 360) {
+                    float r = [rr floatValue];
+                    if (r >= 5.0f && r <= 360.0f) {
                         gPrefs.refreshRate = r;
-                    } else {
-                        gPrefs.refreshRate = 0; // auto
                     }
-                } else if ([rr respondsToSelector:@selector(intValue)]) {
-                    int r = [rr intValue];
-                    if (r >= 1 && r <= 360) {
+                } else if ([rr respondsToSelector:@selector(floatValue)]) {
+                    float r = [rr floatValue];
+                    if (r >= 5.0f && r <= 360.0f) {
                         gPrefs.refreshRate = r;
-                    } else {
-                        gPrefs.refreshRate = 0;
                     }
                 }
             }
@@ -269,16 +265,14 @@ static void vn_reload_prefs_locked(void) {
         fclose(f_shd);
     }
 
-    // /tmp/vanish_refresh_rate overrides refreshRate (e.g. 10, 60, 120, auto)
+    // /tmp/vanish_refresh_rate overrides refreshRate (e.g. 10, 60, 120)
     FILE *f_hz = fopen("/tmp/vanish_refresh_rate", "r");
     if (f_hz) {
         char buf[16] = {0};
         if (fgets(buf, sizeof(buf), f_hz)) {
-            int val = atoi(buf);
-            if (val >= 1 && val <= 360) {
+            float val = strtof(buf, NULL);
+            if (val >= 5.0f && val <= 360.0f) {
                 gPrefs.refreshRate = val;
-            } else if (strncmp(buf, "auto", 4) == 0) {
-                gPrefs.refreshRate = 0;
             }
         }
         fclose(f_hz);

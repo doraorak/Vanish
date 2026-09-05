@@ -7,7 +7,7 @@
 	<key>shadows</key>
 	<true/>
 	<key>refreshRate</key>
-	<string>auto</string>
+	<real>120</real>
 	<key>duration</key>
 	<real>0.25</real>
 	<key>targetApp</key>

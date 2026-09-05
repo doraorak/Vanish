@@ -54,31 +54,23 @@
 			<key>label</key>
 			<string>Refresh Rate</string>
 			<key>footerText</key>
-			<string>Animation frame rate. 120 Hz provides ultra-smooth animations on ProMotion displays; 60 Hz conserves power; 10 Hz demonstrates low-frame-rate stepping. 'Auto' dynamically syncs with the display's native refresh rate.</string>
+			<string>Frame rate for the vanish animation (default: 120 Hz, min: 10 Hz, max: 120 Hz). Lower values produce visible frame stepping.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSSegmentCell</string>
+			<string>PSSliderCell</string>
 			<key>default</key>
-			<string>auto</string>
+			<real>120</real>
+			<key>min</key>
+			<real>10</real>
+			<key>max</key>
+			<real>120</real>
+			<key>showValue</key>
+			<true/>
 			<key>key</key>
 			<string>refreshRate</string>
 			<key>label</key>
 			<string>Refresh Rate</string>
-			<key>validTitles</key>
-			<array>
-				<string>Auto</string>
-				<string>120 Hz</string>
-				<string>60 Hz</string>
-				<string>10 Hz</string>
-			</array>
-			<key>validValues</key>
-			<array>
-				<string>auto</string>
-				<string>120</string>
-				<string>60</string>
-				<string>10</string>
-			</array>
 			<key>PostNotification</key>
 			<string>com.doraorak.vanish/prefsChanged</string>
 		</dict>
