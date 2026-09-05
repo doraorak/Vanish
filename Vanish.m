@@ -575,19 +575,41 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     const void *display = vn_window_get_display(win);
     if (!display) { VN_LOG("snapshot: no display for wid=%u", orig_wid); return NULL; }
 
-    // bounds is window-local: includes negative origin offset for window shadow (e.g. x = -23.0).
-    // Mapping bounds directly through screen_rect_from_rect produces the full screen frame including shadow!
+    // bounds is window-local: includes negative origin offset for window shadow (e.g. x = -56.0).
+    // Mapping bounds directly through screen_rect_from_rect failed because CGSNewRegionWithRect
+    // clamps negative origins to 0, which placed the clone at (content.origin.x, content.origin.y)
+    // instead of (content.origin.x + bounds.origin.x, content.origin.y + bounds.origin.y), chopping
+    // off all left and top shadows.
+    //
+    // By querying content rect via screen_rect_from_rect(win, CGRectMake(0, 0, 1, 1)), we get the exact
+    // content origin on screen, and add bounds.origin (the negative shadow insets) to place the
+    // clone exactly where the original window and its shadow are.
     CGRect bounds = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
-    CGRect frame  = (bounds.size.width >= 1.0 && bounds.size.height >= 1.0)
-                  ? vn_screen_rect_from_rect(win, bounds)
-                  : CGRectZero;
+    CGRect probe  = vn_screen_rect_from_rect ? vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0)) : CGRectZero;
 
-    // Belt and braces: if screen_rect_from_rect returned empty, fallback to bounds
-    bool fell_back = false;
-    if (frame.size.width < 1.0 || frame.size.height < 1.0) {
+    CGRect frame = CGRectZero;
+    if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0 &&
+        probe.size.width >= 1.0 && probe.size.height >= 1.0) {
+        frame = CGRectMake(probe.origin.x + bounds.origin.x,
+                           probe.origin.y + bounds.origin.y,
+                           bounds.size.width,
+                           bounds.size.height);
+    } else if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
         frame = bounds;
-        fell_back = true;
+    } else {
+        frame = probe;
     }
+
+    // Prevent negative screen origin coordinates if window shadow extends beyond display edges
+    if (frame.origin.x < 0.0) {
+        frame.size.width += frame.origin.x;
+        frame.origin.x = 0.0;
+    }
+    if (frame.origin.y < 0.0) {
+        frame.size.height += frame.origin.y;
+        frame.origin.y = 0.0;
+    }
+
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         VN_LOG("snapshot: no usable frame for wid=%u -- not cloning", orig_wid);
         return NULL;
@@ -608,10 +630,12 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     // Logged only now, once the clone exists and is ordered in. VN_LOG opens,
     // writes and closes /tmp/vanish_ws.log; three of those sitting between the
     // close arriving and the clone being up is exactly the delay being chased.
-    VN_LOG("snapshot: clone=%p wid=%u %s %u frame=(%.0f,%.0f %.0fx%.0f)%s display=%p",
-           clone, wid, place == kVNOrderBelow ? "below" : "above", orig_wid, frame.origin.x, frame.origin.y,
-           frame.size.width, frame.size.height,
-           fell_back ? " [fell back to bounds]" : "", display);
+    VN_LOG("snapshot: clone=%p wid=%u %s %u bounds=(%.1f,%.1f %.1fx%.1f) probe=(%.1f,%.1f) frame=(%.1f,%.1f %.1fx%.1f) display=%p",
+           clone, wid, place == kVNOrderBelow ? "below" : "above", orig_wid,
+           bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height,
+           probe.origin.x, probe.origin.y,
+           frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+           display);
     return clone;
 }
 
@@ -731,9 +755,20 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         CGRect b = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
-        frame = (b.size.width >= 1.0 && b.size.height >= 1.0 && vn_screen_rect_from_rect)
-              ? vn_screen_rect_from_rect(win, b)
-              : b;
+        CGRect p = vn_screen_rect_from_rect ? vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0)) : CGRectZero;
+        if (b.size.width >= 1.0 && b.size.height >= 1.0 && p.size.width >= 1.0 && p.size.height >= 1.0) {
+            frame = CGRectMake(p.origin.x + b.origin.x, p.origin.y + b.origin.y, b.size.width, b.size.height);
+        } else {
+            frame = (b.size.width >= 1.0 && b.size.height >= 1.0) ? b : p;
+        }
+        if (frame.origin.x < 0.0) {
+            frame.size.width += frame.origin.x;
+            frame.origin.x = 0.0;
+        }
+        if (frame.origin.y < 0.0) {
+            frame.size.height += frame.origin.y;
+            frame.origin.y = 0.0;
+        }
     }
 
     os_unfair_lock_lock(&gAnimsLock);
