@@ -683,7 +683,15 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         }
     }
 
-    CGRect frame = (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) ? bounds : content;
+    VNPreferences prefs = vn_get_prefs();
+    CGRect frame = CGRectZero;
+    if (prefs.shadows && bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
+        frame = bounds;
+    } else if (content.size.width >= 1.0 && content.size.height >= 1.0) {
+        frame = content;
+    } else if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
+        frame = bounds;
+    }
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         VN_LOG("snapshot: no usable frame for wid=%u -- not cloning", orig_wid);
@@ -702,7 +710,6 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         if (out_frame) *out_frame = frame;
     }
 
-    VNPreferences prefs = vn_get_prefs();
     if (!prefs.shadows) {
         if (vn_clear_shadow_density) {
             vn_clear_shadow_density(clone);
@@ -907,9 +914,12 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
     float dur = vn_duration();
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
+        VNPreferences prefs = vn_get_prefs();
         CGRect b = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
         CGRect p = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
-        if (b.size.width >= 1.0 && b.size.height >= 1.0) {
+        if (!prefs.shadows && p.size.width >= 1.0 && p.size.height >= 1.0) {
+            frame = p;
+        } else if (b.size.width >= 1.0 && b.size.height >= 1.0) {
             frame = b;
         } else if (p.size.width >= 1.0 && p.size.height >= 1.0) {
             frame = p;
