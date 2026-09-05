@@ -341,6 +341,19 @@ static bool vn_is_target_window(CGXWindow *win) {
                 strcasecmp(name, "WindowManager") == 0) {
                 return false;
             }
+
+            // Exclude Finder Get Info inspector panels (fixed width 400pt).
+            // Regular Finder folder browsing windows have min-width 510pt.
+            // This preserves Finder's native desktop icon-zoom close transition!
+            if (strcasecmp(name, "Finder") == 0) {
+                CGRect content = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
+                if (content.size.width < 1.0 && vn_clipped_frame_bounds) {
+                    content = vn_clipped_frame_bounds(win);
+                }
+                if (content.size.width > 0.0 && content.size.width <= 450.0) {
+                    return false;
+                }
+            }
         }
         // Exclude system/special window levels (e.g. desktop level -2147483628, menu level 24, status level 25)
         int32_t lvl = vn_window_level(win);
