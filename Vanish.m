@@ -149,6 +149,7 @@ static VNReleaseWindowFn            vn_orig_release_window;
 static VNWindowGetOwningPIDFn       vn_window_get_owning_pid;
 static VNGetConnectionAppNameFn     vn_get_connection_app_name;
 static VNPostEventByConnectionFn    vn_orig_post_event;
+static VNUpdateCAVisibilityFn       vn_update_ca_visibility;
 
 #pragma mark - Preferences
 
@@ -449,16 +450,20 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
         }
     }
 
-    // A clone is ours: order it out using its own connection, and defer destruction by
-    // 100ms to allow the display compositor to flush the orderOut while warped to size 0.
+    // A clone is ours:
+    // 1. Immediately hide its CoreAnimation layer so CA stops drawing it completely.
+    // 2. Order it out using server-internal context (conn = NULL), bypassing client ownership checks.
+    // 3. Defer destruction by 100ms so the compositor commits the hide and orderOut
+    //    before the mesh warp is deallocated. This guarantees zero 1-frame unwarped flash.
     if (is_clone) {
-        VN_LOG("finish: ordering out clone wid=%u win=%p (release deferred 100ms)", wid, win);
-        CGXConnection *order_conn = vn_window_connection(win);
-        if (!order_conn) order_conn = conn;
-        if (order_conn && wid != 0) {
+        VN_LOG("finish: hiding and ordering out clone wid=%u win=%p (release deferred 100ms)", wid, win);
+        if (win && vn_update_ca_visibility) {
+            vn_update_ca_visibility(win, false);
+        }
+        if (wid != 0) {
             CGSOrderOp op = kVNOrderOut;
             uint32_t rel = 0;
-            vn_orig_order(order_conn, &wid, &op, &rel, 1, false);
+            vn_orig_order(NULL, &wid, &op, &rel, 1, false);
         }
         if (vn_schedule_callback && win) {
             vn_schedule_callback(vn_delayed_clone_release, win, SLSCurrentRealTime() + 0.1);
@@ -554,8 +559,18 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
     }
     os_unfair_lock_unlock(&gPreCloneLock);
 
-    if (clone && vn_system_window_release) {
-        vn_system_window_release(clone);
+    if (clone) {
+        if (vn_update_ca_visibility) {
+            vn_update_ca_visibility(clone, false);
+        }
+        if (clone_wid != 0) {
+            CGSOrderOp op = kVNOrderOut;
+            uint32_t rel = 0;
+            vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
+        }
+        if (vn_system_window_release) {
+            vn_system_window_release(clone);
+        }
     }
 }
 
@@ -663,6 +678,7 @@ static long vn_trace_ms(void);
 /// of exactly this shape.
 static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
     double s  = 1.0 - t;
+    if (s < 0.005) s = 0.005;  // Keep non-zero positive area to avoid GPU shader singularity
     double cx = bounds.origin.x + bounds.size.width  * 0.5;
     double cy = bounds.origin.y + bounds.size.height * 0.5;
 
@@ -725,6 +741,7 @@ static void vn_anim_tick(void *ctx, double when) {
 
         CGXWindow *win = gActiveAnims[i].win;
         CGXConnection *conn = gActiveAnims[i].conn;
+        bool is_clone = gActiveAnims[i].is_clone;
         CGRect b = gActiveAnims[i].bounds;
         os_unfair_lock_unlock(&gAnimsLock);
 
@@ -732,7 +749,8 @@ static void vn_anim_tick(void *ctx, double when) {
         if (vn_set_mesh_warp) {
             VNPointWarp mesh[kVNMeshCount];
             vn_anim_shrink(mesh, b, p);
-            vn_set_mesh_warp(win, conn, kVNMeshW, kVNMeshH, (const float *)mesh);
+            CGXConnection *warp_conn = is_clone ? NULL : conn;
+            vn_set_mesh_warp(win, warp_conn, kVNMeshW, kVNMeshH, (const float *)mesh);
 
             if (vn_trace_win(win)) {
                 VN_LOG("  +%4ldms  warp t=%.3f bounds=(%.0f,%.0f %.0fx%.0f) topleft=(%.0f,%.0f)",
@@ -770,13 +788,9 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
 
     // Ensure clone is ordered on top so it animates cleanly above any underlying windows
     if (is_clone && wid != 0) {
-        CGXConnection *c = vn_window_connection(win);
-        if (!c) c = conn;
-        if (c) {
-            CGSOrderOp op = kVNOrderAbove;
-            uint32_t rel = 0;
-            vn_orig_order(c, &wid, &op, &rel, 1, false);
-        }
+        CGSOrderOp op = kVNOrderAbove;
+        uint32_t rel = 0;
+        vn_orig_order(NULL, &wid, &op, &rel, 1, false);
     }
 
     os_unfair_lock_lock(&gAnimsLock);
@@ -861,12 +875,13 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
     if (clone_to_release) {
         VN_LOG("Target window wid=%u ordered back in while clone wid=%u was animating; ordering out and destroying clone",
                wid, clone_wid);
-        CGXConnection *order_conn = vn_window_connection(clone_to_release);
-        if (!order_conn) order_conn = clone_conn ? clone_conn : conn;
-        if (order_conn && clone_wid != 0) {
+        if (vn_update_ca_visibility) {
+            vn_update_ca_visibility(clone_to_release, false);
+        }
+        if (clone_wid != 0) {
             CGSOrderOp op = kVNOrderOut;
             uint32_t rel = 0;
-            vn_orig_order(order_conn, &clone_wid, &op, &rel, 1, false);
+            vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
         }
         if (vn_schedule_callback) {
             vn_schedule_callback(vn_delayed_clone_release, clone_to_release, SLSCurrentRealTime() + 0.1);
@@ -888,10 +903,13 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
 
     if (clone) {
         VN_LOG("pre-clone: window wid=%u ordered in, discarding unused clone wid=%u", wid, c_wid);
-        if (conn && c_wid != 0) {
+        if (vn_update_ca_visibility) {
+            vn_update_ca_visibility(clone, false);
+        }
+        if (c_wid != 0) {
             CGSOrderOp op = kVNOrderOut;
             uint32_t rel = 0;
-            vn_orig_order(conn, &c_wid, &op, &rel, 1, false);
+            vn_orig_order(NULL, &c_wid, &op, &rel, 1, false);
         }
         if (vn_system_window_release) {
             vn_system_window_release(clone);
@@ -1597,6 +1615,7 @@ static void vanish_init(void) {
     vn_screen_rect                  = (VNScreenRectFn)vn_skylight_symbol(kVNSymScreenRect);
     vn_window_get_id                = (VNWindowGetIDFn)vn_skylight_symbol(kVNSymWindowGetID);
     vn_clipped_frame_bounds         = (VNClippedFrameBoundsFn)vn_skylight_symbol(kVNSymClippedFrameBounds);
+    vn_update_ca_visibility         = (VNUpdateCAVisibilityFn)vn_skylight_symbol(kVNSymUpdateCAVisibility);
 
     if (!targetOrder || !targetRelease || !vn_window_by_id ||
         !vn_schedule_callback || !vn_set_mesh_warp || !vn_clipped_frame_bounds) {

@@ -139,6 +139,7 @@ typedef void (*VNSetAlphaFn)(CGXConnection *, CGXWindow *, float, float);
 typedef void (*VNReleaseWindowFn)(CGXConnection *, CGXWindow *);
 typedef pid_t (*VNWindowGetOwningPIDFn)(CGXWindow *);
 typedef int (*VNGetConnectionAppNameFn)(uint32_t, char *, size_t);
+typedef void (*VNUpdateCAVisibilityFn)(CGXWindow *, bool);
 
 
 #pragma mark - Trace targets
