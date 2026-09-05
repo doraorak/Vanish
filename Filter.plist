@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Filter</key>
+	<dict>
+		<!-- WindowServer only. It is not an app bundle, so it is matched by
+		     executable name rather than by bundle identifier. -->
+		<key>Executables</key>
+		<array>
+			<string>WindowServer</string>
+		</array>
+		<key>Type</key>
+		<string>Any</string>
+	</dict>
+</dict>
+</plist>

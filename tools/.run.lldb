@@ -1,0 +1,4 @@
+process attach --pid 55012
+disassemble -n "CreateCloneOfWindow"
+detach
+quit
