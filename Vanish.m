@@ -569,10 +569,14 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
     os_unfair_lock_lock(&gPreCloneLock);
     if (gPreClone.orig_wid != 0) {
         bool expired = false;
-        if (gPreClone.mouseUpTime > 0.0 && (now - gPreClone.mouseUpTime) >= 0.25) {
-            expired = true;
-        } else if ((now - gPreClone.created_at) >= 0.50) {
-            expired = true;
+        if (gPreClone.mouseUpTime > 0.0) {
+            if ((now - gPreClone.mouseUpTime) >= 0.65) {
+                expired = true;
+            }
+        } else {
+            if ((now - gPreClone.created_at) >= 4.0) {
+                expired = true;
+            }
         }
         if (expired) {
             VN_LOG("pre-clone: timed out (age=%.2fs, since_up=%.2fs) without close -- cleaning up",
@@ -1221,6 +1225,20 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
 }
 
+static inline bool vn_is_in_red_hitbox(double lx, double ly) {
+    // Exclude outer resize handles (lx < 8.5, ly < 4.5) and toolbar body (ly > 34.0)
+    if (ly < 4.5 || ly > 34.0 || lx < 8.5) {
+        return false;
+    }
+    if (ly < 18.0) {
+        // Compact titlebars (Chrome tabs, WhatsApp, Urban VPN compact)
+        return (lx <= 26.0);
+    } else {
+        // Unified toolbars (TweakInject, System Settings, Calculator, Urban VPN, Antigravity, Mail)
+        return (lx >= 9.0 && lx <= 33.5);
+    }
+}
+
 static uint64_t gLastMouseDownTimeMs = 0;
 static CGPoint  gLastMouseDownPt     = {0};
 static uint32_t gLastMouseDownWid    = 0;
@@ -1279,56 +1297,10 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
                 uint64_t now_ms = vn_now_ms();
 
-                // Double-click check: if user double clicks titlebar / corner (e.g. to zoom/maximize),
-                // abort any pre-clone and suppress pre-cloning during the zoom gesture.
-                bool is_double_click = false;
-                if (now_ms < gDoubleClickSuppressUntilMs) {
-                    VN_LOG("hit-test: suppressing pre-clone due to recent double-click (remaining %llums)",
-                           gDoubleClickSuppressUntilMs - now_ms);
-                    vn_preclone_discard();
-                    goto dispatch;
-                }
-
-                if (wid == gLastMouseDownWid && (now_ms - gLastMouseDownTimeMs) < 450) {
-                    double dist = hypot(screen_pt->x - gLastMouseDownPt.x, screen_pt->y - gLastMouseDownPt.y);
-                    if (dist < 8.0) {
-                        is_double_click = true;
-                    }
-                }
-                gLastMouseDownTimeMs = now_ms;
-                gLastMouseDownPt = *screen_pt;
-                gLastMouseDownWid = wid;
-
-                if (is_double_click) {
-                    VN_LOG("hit-test: double-click detected on wid=%u -- suppressing pre-clone for 600ms", wid);
-                    vn_preclone_discard();
-                    gDoubleClickSuppressUntilMs = now_ms + 600;
-                    goto dispatch;
-                }
-
-                bool is_red = false;
+                bool is_red = vn_is_in_red_hitbox(lx, ly);
                 bool is_yellow_or_green = false;
 
-                // Hit-test traffic lights:
-                // Strict bounds to exclude resize handles (lx < 8, ly < 6) and toolbar content (ly > 35, lx > 33):
-                if (lx >= 8.0 && lx <= 33.0 && ly >= 6.0 && ly <= 35.0) {
-                    if (ly < 18.0) {
-                        // Compact titlebars (Chrome tabs, WhatsApp, simple apps):
-                        // Red center ~ (16..18, 11..13), radius ~7pt. Yellow starts at x > 26.
-                        if (lx <= 24.0) {
-                            is_red = true;
-                        }
-                    } else {
-                        // Unified titlebars & toolbars (Mail, System Settings, Calculator, Safari, Antigravity):
-                        // Red center ~ (20..26, 20..26), radius ~7pt.
-                        // Region lx in [0, 14) is empty toolbar drag space.
-                        if (lx >= 14.0 && lx <= 32.0) {
-                            is_red = true;
-                        }
-                    }
-                }
-
-                if (ly >= 6.0 && ly <= 35.0) {
+                if (!is_red && ly >= 4.5 && ly <= 34.0) {
                     if (ly < 18.0) {
                         if (lx >= 27.0 && lx <= 80.0) {
                             is_yellow_or_green = true;
@@ -1339,6 +1311,27 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                         }
                     }
                 }
+
+                // Double-click check: if user double clicks empty titlebar/corner (e.g. to zoom/maximize),
+                // abort any pre-clone and suppress pre-cloning during the zoom gesture.
+                // Note: Clicks inside the red button are close intents and will never be suppressed as zoom!
+                if (!is_red) {
+                    if (wid == gLastMouseDownWid && (now_ms - gLastMouseDownTimeMs) < 450) {
+                        double dist = hypot(screen_pt->x - gLastMouseDownPt.x, screen_pt->y - gLastMouseDownPt.y);
+                        if (dist < 8.0) {
+                            VN_LOG("hit-test: double-click outside red detected on wid=%u -- suppressing pre-clone for 600ms", wid);
+                            vn_preclone_discard();
+                            gDoubleClickSuppressUntilMs = now_ms + 600;
+                            gLastMouseDownTimeMs = now_ms;
+                            gLastMouseDownPt = *screen_pt;
+                            gLastMouseDownWid = wid;
+                            goto dispatch;
+                        }
+                    }
+                }
+                gLastMouseDownTimeMs = now_ms;
+                gLastMouseDownPt = *screen_pt;
+                gLastMouseDownWid = wid;
 
                 if (lx <= 150.0 && ly <= 60.0) {
                     char hit_app[256] = {0};
@@ -1379,7 +1372,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                         VN_LOG("pre-clone: ready! wid=%u clone_wid=%u (ordered below original)", wid, clone_wid);
 
                         if (vn_schedule_callback) {
-                            vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 0.50);
+                            vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 4.0);
                         }
                     } else {
                         VN_LOG("pre-clone: failed to create clone for wid=%u", wid);
@@ -1408,21 +1401,12 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
             const CGPoint *local_pt = (const CGPoint *)((const char *)event + 0x20);
             double lx = local_pt->x;
             double ly = local_pt->y;
-            uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
 
-            bool on_red = false;
-            if ((wid == 0 || wid == orig_wid) &&
-                lx >= 8.0 && lx <= 33.0 && ly >= 6.0 && ly <= 35.0) {
-                if (ly < 18.0) {
-                    on_red = (lx <= 24.0);
-                } else {
-                    on_red = (lx >= 14.0 && lx <= 32.0);
-                }
-            }
-
-            if (!on_red) {
-                VN_LOG("pre-clone: mouse up outside red button (wid=%u pt=(%.1f, %.1f)) -- canceling pre-clone",
-                       wid, lx, ly);
+            // Wide tracking leeway for mouse release (allows standard AppKit release margin)
+            bool near_red = (lx >= 6.0 && lx <= 42.0 && ly >= 3.0 && ly <= 40.0);
+            if (!near_red) {
+                VN_LOG("pre-clone: mouse up clearly outside button area (wid=%u pt=(%.1f, %.1f)) -- canceling pre-clone",
+                       orig_wid, lx, ly);
                 vn_preclone_discard();
             } else {
                 os_unfair_lock_lock(&gPreCloneLock);
@@ -1432,7 +1416,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 os_unfair_lock_unlock(&gPreCloneLock);
 
                 if (vn_schedule_callback) {
-                    vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 0.25);
+                    vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 0.65);
                 }
             }
         }
@@ -1442,20 +1426,31 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
         os_unfair_lock_lock(&gPreCloneLock);
         bool has_preclone = (gPreClone.orig_wid != 0);
         CGPoint down_scr = gPreClone.mouseDownScreenPt;
-        CGPoint down_loc = gPreClone.mouseDownLocalPt;
         uint32_t orig_wid = gPreClone.orig_wid;
         os_unfair_lock_unlock(&gPreCloneLock);
 
         if (has_preclone) {
-            const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
             const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
-            double d_scr = hypot(screen_pt->x - down_scr.x, screen_pt->y - down_scr.y);
-            double d_loc = hypot(local_pt->x - down_loc.x, local_pt->y - down_loc.y);
+            const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
+            double lx = local_pt->x;
+            double ly = local_pt->y;
 
-            if (d_scr >= 3.0 || d_loc >= 3.0) {
-                VN_LOG("pre-clone: drag detected (d_scr=%.1f d_loc=%.1f) -- aborting pre-clone for wid=%u",
-                       d_scr, d_loc, orig_wid);
+            bool on_red = vn_is_in_red_hitbox(lx, ly);
+            if (!on_red) {
+                // Dragged off the red button! User either dragged away to cancel the close,
+                // or is dragging/resizing the window.
+                VN_LOG("pre-clone: dragged off red button pt=(%.1f, %.1f) -- aborting pre-clone for wid=%u",
+                       lx, ly, orig_wid);
                 vn_preclone_discard();
+            } else {
+                // Still within the red button hitbox.
+                // Guard against someone dragging the whole window by the traffic light area:
+                double d_scr = hypot(screen_pt->x - down_scr.x, screen_pt->y - down_scr.y);
+                if (d_scr >= 12.0) {
+                    VN_LOG("pre-clone: window drag detected (d_scr=%.1f) -- aborting pre-clone for wid=%u",
+                           d_scr, orig_wid);
+                    vn_preclone_discard();
+                }
             }
         }
     }
