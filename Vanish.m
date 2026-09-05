@@ -570,11 +570,13 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
     if (gPreClone.orig_wid != 0) {
         bool expired = false;
         if (gPreClone.mouseUpTime > 0.0) {
-            if ((now - gPreClone.mouseUpTime) >= 0.65) {
+            // Mouse was released: if AppKit/SwiftUI didn't close the window within 1.0s, clean up
+            if ((now - gPreClone.mouseUpTime) >= 1.0) {
                 expired = true;
             }
         } else {
-            if ((now - gPreClone.created_at) >= 4.0) {
+            // Mouse is still held down: do not time out unless held for an extreme failsafe duration (30s)
+            if ((now - gPreClone.created_at) >= 30.0) {
                 expired = true;
             }
         }
@@ -1226,17 +1228,27 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
 }
 
 static inline bool vn_is_in_red_hitbox(double lx, double ly) {
-    // Exclude outer resize handles (lx < 8.5, ly < 4.5) and toolbar body (ly > 34.0)
-    if (ly < 4.5 || ly > 34.0 || lx < 8.5) {
-        return false;
+    // Cluster 1: Compact / Standard titlebars (Antigravity, Urban VPN, TweakInject, Chrome, WhatsApp)
+    // Red center ~ (17.0, 14.0), radius ~7.5pt
+    bool in_c1 = (lx >= 9.0 && lx <= 26.0 && ly >= 4.5 && ly <= 25.0);
+
+    // Cluster 2: Tall Unified toolbars (System Settings, Calculator, Notes, Messages, Mail)
+    // Red center ~ (25.5, 26.0), radius ~7.5pt
+    bool in_c2 = (lx >= 18.0 && lx <= 33.5 && ly >= 18.0 && ly <= 33.5);
+
+    return in_c1 || in_c2;
+}
+
+static inline bool vn_is_in_yellow_or_green_hitbox(double lx, double ly) {
+    // Cluster 1: Compact / Standard titlebars
+    if (lx >= 26.5 && lx <= 80.0 && ly >= 4.5 && ly <= 25.0) {
+        return true;
     }
-    if (ly < 18.0) {
-        // Compact titlebars (Chrome tabs, WhatsApp, Urban VPN compact)
-        return (lx <= 26.0);
-    } else {
-        // Unified toolbars (TweakInject, System Settings, Calculator, Urban VPN, Antigravity, Mail)
-        return (lx >= 9.0 && lx <= 33.5);
+    // Cluster 2: Tall Unified toolbars
+    if (lx >= 34.0 && lx <= 88.0 && ly >= 18.0 && ly <= 33.5) {
+        return true;
     }
+    return false;
 }
 
 static uint64_t gLastMouseDownTimeMs = 0;
@@ -1297,41 +1309,41 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
                 uint64_t now_ms = vn_now_ms();
 
-                bool is_red = vn_is_in_red_hitbox(lx, ly);
-                bool is_yellow_or_green = false;
-
-                if (!is_red && ly >= 4.5 && ly <= 34.0) {
-                    if (ly < 18.0) {
-                        if (lx >= 27.0 && lx <= 80.0) {
-                            is_yellow_or_green = true;
-                        }
-                    } else {
-                        if (lx >= 35.0 && lx <= 88.0) {
-                            is_yellow_or_green = true;
-                        }
+                // Double-click check:
+                // If a second click occurs within 450ms and 8pt on the same window,
+                // it is a double-click gesture (e.g. zooming/maximizing via titlebar double-click).
+                // In macOS, closing via the red button is NEVER a double-click.
+                // Immediately discard any pre-clone, suppress pre-cloning for 600ms, and skip pre-cloning for this click.
+                bool is_double_click = false;
+                if (wid == gLastMouseDownWid && (now_ms - gLastMouseDownTimeMs) < 450) {
+                    double dist = hypot(screen_pt->x - gLastMouseDownPt.x, screen_pt->y - gLastMouseDownPt.y);
+                    if (dist < 8.0) {
+                        is_double_click = true;
                     }
                 }
 
-                // Double-click check: if user double clicks empty titlebar/corner (e.g. to zoom/maximize),
-                // abort any pre-clone and suppress pre-cloning during the zoom gesture.
-                // Note: Clicks inside the red button are close intents and will never be suppressed as zoom!
-                if (!is_red) {
-                    if (wid == gLastMouseDownWid && (now_ms - gLastMouseDownTimeMs) < 450) {
-                        double dist = hypot(screen_pt->x - gLastMouseDownPt.x, screen_pt->y - gLastMouseDownPt.y);
-                        if (dist < 8.0) {
-                            VN_LOG("hit-test: double-click outside red detected on wid=%u -- suppressing pre-clone for 600ms", wid);
-                            vn_preclone_discard();
-                            gDoubleClickSuppressUntilMs = now_ms + 600;
-                            gLastMouseDownTimeMs = now_ms;
-                            gLastMouseDownPt = *screen_pt;
-                            gLastMouseDownWid = wid;
-                            goto dispatch;
-                        }
-                    }
-                }
+                bool suppressed_by_double_click = (now_ms < gDoubleClickSuppressUntilMs);
+
                 gLastMouseDownTimeMs = now_ms;
                 gLastMouseDownPt = *screen_pt;
                 gLastMouseDownWid = wid;
+
+                if (is_double_click) {
+                    VN_LOG("hit-test: double-click detected on wid=%u (pt=%.1f,%.1f) -- discarding pre-clone and suppressing for 600ms",
+                           wid, lx, ly);
+                    vn_preclone_discard();
+                    gDoubleClickSuppressUntilMs = now_ms + 600;
+                    goto dispatch;
+                }
+
+                if (suppressed_by_double_click) {
+                    VN_LOG("hit-test: click on wid=%u suppressed due to active double-click window", wid);
+                    vn_preclone_discard();
+                    goto dispatch;
+                }
+
+                bool is_red = vn_is_in_red_hitbox(lx, ly);
+                bool is_yellow_or_green = vn_is_in_yellow_or_green_hitbox(lx, ly);
 
                 if (lx <= 150.0 && ly <= 60.0) {
                     char hit_app[256] = {0};
@@ -1372,7 +1384,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                         VN_LOG("pre-clone: ready! wid=%u clone_wid=%u (ordered below original)", wid, clone_wid);
 
                         if (vn_schedule_callback) {
-                            vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 4.0);
+                            vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 30.0);
                         }
                     } else {
                         VN_LOG("pre-clone: failed to create clone for wid=%u", wid);
@@ -1416,7 +1428,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 os_unfair_lock_unlock(&gPreCloneLock);
 
                 if (vn_schedule_callback) {
-                    vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 0.65);
+                    vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.0);
                 }
             }
         }
