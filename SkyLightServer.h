@@ -294,6 +294,9 @@ typedef void   (*VNFreezeContentFn)(CGXWindow *);
 /// CGRectZero to get the window's own frame.
 #define kVNSymScreenRectFromRect "__ZNK9CGXWindow21screen_rect_from_rectE6CGRect"
 
+/// Returns the window content bounding box in screen coordinates.
+#define kVNSymScreenRect "__ZNK9CGXWindow11screen_rectEv"
+
 /// `ldr w0, [x0]` -- the window id is the first field.
 #define kVNSymWindowGetID "_WSWindowGetID"
 
@@ -308,6 +311,7 @@ typedef void (*VNSystemWindowReleaseFn)(CGXWindow *);
 typedef CGXWindow *(*VNCreateCloneFn)(CGXWindow *, CGRect, const void *, bool);
 typedef const void *(*VNWindowGetDisplayFn)(CGXWindow *);
 typedef CGRect      (*VNScreenRectFromRectFn)(CGXWindow *, CGRect);
+typedef CGRect      (*VNScreenRectFn)(CGXWindow *);
 typedef uint32_t    (*VNWindowGetIDFn)(CGXWindow *);
 
 typedef void   (*VNSetMeshWarpFn)(CGXWindow *, CGXConnection *, unsigned, unsigned, const float *);

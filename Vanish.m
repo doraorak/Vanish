@@ -142,6 +142,7 @@ static VNCreateCloneFn              vn_create_clone;
 static VNSystemWindowReleaseFn      vn_system_window_release;
 static VNWindowGetDisplayFn         vn_window_get_display;
 static VNScreenRectFromRectFn       vn_screen_rect_from_rect;
+static VNScreenRectFn               vn_screen_rect;
 static VNWindowGetIDFn              vn_window_get_id;
 static VNClippedFrameBoundsFn       vn_clipped_frame_bounds;
 static VNReleaseWindowFn            vn_orig_release_window;
@@ -575,40 +576,22 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     const void *display = vn_window_get_display(win);
     if (!display) { VN_LOG("snapshot: no display for wid=%u", orig_wid); return NULL; }
 
-    // bounds is window-local: includes negative origin offset for window shadow (e.g. x = -56.0).
-    // Mapping bounds directly through screen_rect_from_rect failed because CGSNewRegionWithRect
-    // clamps negative origins to 0, which placed the clone at (content.origin.x, content.origin.y)
-    // instead of (content.origin.x + bounds.origin.x, content.origin.y + bounds.origin.y), chopping
-    // off all left and top shadows.
-    //
-    // By querying content rect via screen_rect_from_rect(win, CGRectMake(0, 0, 1, 1)), we get the exact
-    // content origin on screen, and add bounds.origin (the negative shadow insets) to place the
-    // clone exactly where the original window and its shadow are.
+    // vn_clipped_frame_bounds(win) returns the window frame INCLUDING the full drop shadow
+    // in screen coordinates (e.g. bounds starts 56pt to the left and 38pt above the window content).
+    // It is ALREADY in screen coordinates. Do NOT add probe.origin or pass through screen_rect_from_rect,
+    // which would double the screen origin offset and push the clone hundreds of pixels into the middle of the app!
     CGRect bounds = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
-    CGRect probe  = vn_screen_rect_from_rect ? vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0)) : CGRectZero;
-
-    CGRect frame = CGRectZero;
-    if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0 &&
-        probe.size.width >= 1.0 && probe.size.height >= 1.0) {
-        frame = CGRectMake(probe.origin.x + bounds.origin.x,
-                           probe.origin.y + bounds.origin.y,
-                           bounds.size.width,
-                           bounds.size.height);
-    } else if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
-        frame = bounds;
-    } else {
-        frame = probe;
+    CGRect content = CGRectZero;
+    if (vn_screen_rect) {
+        content = vn_screen_rect(win);
+    }
+    if (content.size.width < 1.0 || content.size.height < 1.0) {
+        if (vn_screen_rect_from_rect) {
+            content = vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0));
+        }
     }
 
-    // Prevent negative screen origin coordinates if window shadow extends beyond display edges
-    if (frame.origin.x < 0.0) {
-        frame.size.width += frame.origin.x;
-        frame.origin.x = 0.0;
-    }
-    if (frame.origin.y < 0.0) {
-        frame.size.height += frame.origin.y;
-        frame.origin.y = 0.0;
-    }
+    CGRect frame = (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) ? bounds : content;
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         VN_LOG("snapshot: no usable frame for wid=%u -- not cloning", orig_wid);
@@ -627,15 +610,21 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         if (out_frame) *out_frame = frame;
     }
 
-    // Logged only now, once the clone exists and is ordered in. VN_LOG opens,
-    // writes and closes /tmp/vanish_ws.log; three of those sitting between the
-    // close arriving and the clone being up is exactly the delay being chased.
-    VN_LOG("snapshot: clone=%p wid=%u %s %u bounds=(%.1f,%.1f %.1fx%.1f) probe=(%.1f,%.1f) frame=(%.1f,%.1f %.1fx%.1f) display=%p",
+    float shadow_l = (content.size.width >= 1.0) ? (content.origin.x - frame.origin.x) : 0.0f;
+    float shadow_t = (content.size.height >= 1.0) ? (content.origin.y - frame.origin.y) : 0.0f;
+    float shadow_r = (content.size.width >= 1.0) ? ((frame.origin.x + frame.size.width) - (content.origin.x + content.size.width)) : 0.0f;
+    float shadow_b = (content.size.height >= 1.0) ? ((frame.origin.y + frame.size.height) - (content.origin.y + content.size.height)) : 0.0f;
+    float extra_w  = (content.size.width >= 1.0) ? (frame.size.width - content.size.width) : 0.0f;
+    float extra_h  = (content.size.height >= 1.0) ? (frame.size.height - content.size.height) : 0.0f;
+
+    VN_LOG("snapshot: clone=%p wid=%u %s %u frame=(%.1f,%.1f %.1fx%.1f) display=%p",
            clone, wid, place == kVNOrderBelow ? "below" : "above", orig_wid,
-           bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height,
-           probe.origin.x, probe.origin.y,
            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
            display);
+    VN_LOG("  [SHADOW TRACE] orig_content=(%.1f,%.1f %.1fx%.1f) clone_frame=(%.1f,%.1f %.1fx%.1f) shadow=[L=%.1f T=%.1f R=%.1f B=%.1f] extra=[+%.1fw, +%.1fh]",
+           content.origin.x, content.origin.y, content.size.width, content.size.height,
+           frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+           shadow_l, shadow_t, shadow_r, shadow_b, extra_w, extra_h);
     return clone;
 }
 
@@ -755,19 +744,13 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         CGRect b = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
-        CGRect p = vn_screen_rect_from_rect ? vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0)) : CGRectZero;
-        if (b.size.width >= 1.0 && b.size.height >= 1.0 && p.size.width >= 1.0 && p.size.height >= 1.0) {
-            frame = CGRectMake(p.origin.x + b.origin.x, p.origin.y + b.origin.y, b.size.width, b.size.height);
-        } else {
-            frame = (b.size.width >= 1.0 && b.size.height >= 1.0) ? b : p;
-        }
-        if (frame.origin.x < 0.0) {
-            frame.size.width += frame.origin.x;
-            frame.origin.x = 0.0;
-        }
-        if (frame.origin.y < 0.0) {
-            frame.size.height += frame.origin.y;
-            frame.origin.y = 0.0;
+        CGRect p = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
+        if (b.size.width >= 1.0 && b.size.height >= 1.0) {
+            frame = b;
+        } else if (p.size.width >= 1.0 && p.size.height >= 1.0) {
+            frame = p;
+        } else if (vn_screen_rect_from_rect) {
+            frame = vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0));
         }
     }
 
@@ -1564,6 +1547,7 @@ static void vanish_init(void) {
     vn_system_window_release        = (VNSystemWindowReleaseFn)vn_skylight_symbol(kVNSymSystemWindowRelease);
     vn_window_get_display           = (VNWindowGetDisplayFn)vn_skylight_symbol(kVNSymWindowGetDisplay);
     vn_screen_rect_from_rect        = (VNScreenRectFromRectFn)vn_skylight_symbol(kVNSymScreenRectFromRect);
+    vn_screen_rect                  = (VNScreenRectFn)vn_skylight_symbol(kVNSymScreenRect);
     vn_window_get_id                = (VNWindowGetIDFn)vn_skylight_symbol(kVNSymWindowGetID);
     vn_clipped_frame_bounds         = (VNClippedFrameBoundsFn)vn_skylight_symbol(kVNSymClippedFrameBounds);
 
