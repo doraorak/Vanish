@@ -151,6 +151,10 @@ static VNWindowGetOwningPIDFn       vn_window_get_owning_pid;
 static VNGetConnectionAppNameFn     vn_get_connection_app_name;
 static VNPostEventByConnectionFn    vn_orig_post_event;
 static VNUpdateCAVisibilityFn       vn_update_ca_visibility;
+static VNClearShadowDensityFn            vn_clear_shadow_density;
+static VNWSWindowSetShadowEnableFn        vn_window_set_shadow_enable;
+static VNWSWindowReleaseShadowResourcesFn vn_window_release_shadow_resources;
+static VNSLSSetWindowShadowParametersFn   vn_set_window_shadow_parameters;
 
 #pragma mark - Preferences
 
@@ -679,15 +683,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         }
     }
 
-    VNPreferences prefs = vn_get_prefs();
-    CGRect frame = CGRectZero;
-    if (prefs.shadows && bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
-        frame = bounds;
-    } else if (content.size.width >= 1.0 && content.size.height >= 1.0) {
-        frame = content;
-    } else if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
-        frame = bounds;
-    }
+    CGRect frame = (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) ? bounds : content;
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         VN_LOG("snapshot: no usable frame for wid=%u -- not cloning", orig_wid);
@@ -704,6 +700,22 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         vn_orig_order(conn, &wid, &op, &rel, 1, false);
         if (out_wid) *out_wid = wid;
         if (out_frame) *out_frame = frame;
+    }
+
+    VNPreferences prefs = vn_get_prefs();
+    if (!prefs.shadows) {
+        if (vn_clear_shadow_density) {
+            vn_clear_shadow_density(clone);
+        } else if (vn_window_set_shadow_enable) {
+            vn_window_set_shadow_enable(clone);
+        }
+        if (vn_window_release_shadow_resources) {
+            vn_window_release_shadow_resources(clone);
+        }
+        if (wid != 0 && vn_set_window_shadow_parameters) {
+            vn_set_window_shadow_parameters(0, wid, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        VN_LOG("snapshot: disabled shadow property on clone wid=%u win=%p", wid, clone);
     }
 
     float shadow_l = (content.size.width >= 1.0) ? (content.origin.x - frame.origin.x) : 0.0f;
@@ -788,12 +800,7 @@ static double vn_get_display_refresh_interval(CGXWindow *win) {
 /// -- and only the global ones move. Every future animation is a new function
 /// of exactly this shape.
 static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
-    // Cubic Ease-Out curve for instantaneous visual response:
-    // Window starts with high initial velocity upon click release,
-    // then decelerates smoothly into the vanishing point.
-    double inv = 1.0 - t;
-    if (inv < 0.0) inv = 0.0;
-    double s = inv * inv * inv;
+    double s  = 1.0 - t;
     if (s < 0.005) s = 0.005;  // Keep non-zero positive area to avoid GPU shader singularity
     double cx = bounds.origin.x + bounds.size.width  * 0.5;
     double cy = bounds.origin.y + bounds.size.height * 0.5;
@@ -849,8 +856,8 @@ static void vn_anim_tick(void *ctx, double when) {
 
         (void)aid;
         if (p >= 1.0) {
-            p = 1.0;
             finished[finished_count++] = gActiveAnims[i].anim_id;
+            continue;
         } else {
             more = true;
         }
@@ -900,12 +907,9 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
     float dur = vn_duration();
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
-        VNPreferences prefs = vn_get_prefs();
         CGRect b = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
         CGRect p = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
-        if (!prefs.shadows && p.size.width >= 1.0 && p.size.height >= 1.0) {
-            frame = p;
-        } else if (b.size.width >= 1.0 && b.size.height >= 1.0) {
+        if (b.size.width >= 1.0 && b.size.height >= 1.0) {
             frame = b;
         } else if (p.size.width >= 1.0 && p.size.height >= 1.0) {
             frame = p;
@@ -951,15 +955,6 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
            wid, orig_wid, win, dur, anim_id);
 
     double interval = vn_get_display_refresh_interval(win);
-
-    // Apply immediate initial deformation tick synchronously so the window is
-    // visibly shrinking on the very first display frame following orderOut.
-    if (vn_set_mesh_warp) {
-        VNPointWarp mesh[kVNMeshCount];
-        vn_anim_shrink(mesh, frame, 0.02);
-        CGXConnection *warp_conn = is_clone ? NULL : conn;
-        vn_set_mesh_warp(win, warp_conn, kVNMeshW, kVNMeshH, (const float *)mesh);
-    }
 
     if (vn_schedule_callback) {
         vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
@@ -1845,6 +1840,10 @@ static void vanish_init(void) {
     vn_window_get_id                = (VNWindowGetIDFn)vn_skylight_symbol(kVNSymWindowGetID);
     vn_clipped_frame_bounds         = (VNClippedFrameBoundsFn)vn_skylight_symbol(kVNSymClippedFrameBounds);
     vn_update_ca_visibility         = (VNUpdateCAVisibilityFn)vn_skylight_symbol(kVNSymUpdateCAVisibility);
+    vn_clear_shadow_density         = (VNClearShadowDensityFn)vn_skylight_symbol(kVNSymClearShadowDensity);
+    vn_window_set_shadow_enable     = (VNWSWindowSetShadowEnableFn)vn_skylight_symbol(kVNSymWSWindowSetShadowEnable);
+    vn_window_release_shadow_resources = (VNWSWindowReleaseShadowResourcesFn)vn_skylight_symbol(kVNSymWSWindowReleaseShadowResources);
+    vn_set_window_shadow_parameters = (VNSLSSetWindowShadowParametersFn)vn_skylight_symbol(kVNSymSLSSetWindowShadowParameters);
 
     if (!targetOrder || !targetRelease || !vn_window_by_id ||
         !vn_schedule_callback || !vn_set_mesh_warp || !vn_clipped_frame_bounds) {

@@ -308,6 +308,12 @@ typedef void   (*VNFreezeContentFn)(CGXWindow *);
 /// window, which makes it safe to call on anything.
 #define kVNSymSystemWindowRelease "_WSSystemWindowRelease"
 
+/// Window shadow management
+#define kVNSymClearShadowDensity "__ZL20clear_shadow_densityP9CGXWindow"
+#define kVNSymWSWindowSetShadowEnable "_WSWindowSetShadowEnable"
+#define kVNSymWSWindowReleaseShadowResources "_WSWindowReleaseShadowResources"
+#define kVNSymSLSSetWindowShadowParameters "_SLSSetWindowShadowParameters"
+
 typedef void (*VNSystemWindowReleaseFn)(CGXWindow *);
 typedef CGXWindow *(*VNCreateCloneFn)(CGXWindow *, CGRect, const void *, bool);
 typedef const void *(*VNWindowGetDisplayFn)(CGXWindow *);
@@ -317,6 +323,11 @@ typedef uint32_t    (*VNWindowGetIDFn)(CGXWindow *);
 
 typedef void   (*VNSetMeshWarpFn)(CGXWindow *, CGXConnection *, unsigned, unsigned, const float *);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);
+
+typedef void (*VNClearShadowDensityFn)(CGXWindow *);
+typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);
+typedef void (*VNWSWindowReleaseShadowResourcesFn)(CGXWindow *);
+typedef CGError (*VNSLSSetWindowShadowParametersFn)(uint32_t cid, uint32_t wid, float density, float radius, float xOffset, float yOffset);
 
 typedef int (*VNUpdateAlphasFn)(CGXWindow *, CGXConnection *, bool, float, float, float);
 typedef void (*VNCAWindowContentDtorFn)(void *);
