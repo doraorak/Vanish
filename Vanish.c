@@ -426,6 +426,13 @@ typedef struct {
 static VNCloneAnim    gActiveAnims[MAX_ACTIVE_ANIMS];
 static os_unfair_lock gAnimsLock = OS_UNFAIR_LOCK_INIT;
 static uint64_t       gNextAnimId = 1;
+static _Atomic bool   gAnimTimerRunning = false;
+
+typedef struct {
+    CGXWindow *clone_win;
+    CGRect     bounds;
+    double     p;
+} VNAnimSnapshot;
 
 static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
     os_unfair_lock_lock(&gAnimsLock);
@@ -497,6 +504,8 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
 /// Creating and ordering the clone above the window gives the compositor ~100ms
 /// (physical click duration) to composite the clone. When the real close order arrives,
 /// the clone is already composited on screen, eliminating any 1-frame gaps or flashes.
+#define MAX_PRECLONES 8
+
 typedef struct {
     uint32_t       orig_wid;
     uint32_t       clone_wid;
@@ -508,34 +517,45 @@ typedef struct {
     double         mouseUpTime;
 } VNPreClone;
 
-static VNPreClone     gPreClone = {0};
+static VNPreClone     gPreClones[MAX_PRECLONES] = {0};
 static os_unfair_lock gPreCloneLock = OS_UNFAIR_LOCK_INIT;
 
-// Clears gPreClone under lock and returns the clone pointer to release, if any.
+static int vn_preclone_find_slot_locked(uint32_t orig_wid) {
+    if (orig_wid == 0) return -1;
+    for (int i = 0; i < MAX_PRECLONES; i++) {
+        if (gPreClones[i].orig_wid == orig_wid) return i;
+    }
+    return -1;
+}
+
+static int vn_preclone_find_empty_slot_locked(void) {
+    for (int i = 0; i < MAX_PRECLONES; i++) {
+        if (gPreClones[i].orig_wid == 0) return i;
+    }
+    return 0; // Overwrite slot 0 if table is saturated
+}
+
+// Clears pre-clone for orig_wid under lock and returns the clone pointer to release/animate.
 // MUST be called with gPreCloneLock held.
 // NEVER calls any external or system functions.
-static CGXWindow *vn_preclone_take_locked(uint32_t *out_clone_wid, uint32_t *out_orig_wid, CGRect *out_frame) {
-    CGXWindow *clone = gPreClone.clone;
-    if (out_clone_wid) *out_clone_wid = gPreClone.clone_wid;
-    if (out_orig_wid) *out_orig_wid = gPreClone.orig_wid;
-    if (out_frame) *out_frame = gPreClone.frame;
-    gPreClone.orig_wid = 0;
-    gPreClone.clone_wid = 0;
-    gPreClone.clone = NULL;
-    gPreClone.frame = CGRectZero;
-    gPreClone.created_at = 0.0;
-    gPreClone.mouseDownScreenPt = CGPointZero;
-    gPreClone.mouseDownLocalPt  = CGPointZero;
-    gPreClone.mouseUpTime = 0.0;
+static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone_wid, CGRect *out_frame) {
+    int idx = vn_preclone_find_slot_locked(orig_wid);
+    if (idx < 0) return NULL;
+
+    CGXWindow *clone = gPreClones[idx].clone;
+    if (out_clone_wid) *out_clone_wid = gPreClones[idx].clone_wid;
+    if (out_frame) *out_frame = gPreClones[idx].frame;
+    memset(&gPreClones[idx], 0, sizeof(VNPreClone));
     return clone;
 }
 
-// Discards the pre-clone safely: extracts clone under lock, unlocks,
+// Discards a specific window's pre-clone safely: extracts clone under lock, unlocks,
 // suppresses CA visibility, orders out the clone, and releases it.
-static void vn_preclone_discard(void) {
-    uint32_t clone_wid = 0, orig_wid = 0;
+static void vn_preclone_discard_wid(uint32_t orig_wid) {
+    if (orig_wid == 0) return;
+    uint32_t clone_wid = 0;
     os_unfair_lock_lock(&gPreCloneLock);
-    CGXWindow *clone = vn_preclone_take_locked(&clone_wid, &orig_wid, NULL);
+    CGXWindow *clone = vn_preclone_take_locked(orig_wid, &clone_wid, NULL);
     os_unfair_lock_unlock(&gPreCloneLock);
 
     if (clone) {
@@ -557,43 +577,50 @@ static void vn_preclone_discard(void) {
 static void vn_preclone_cleanup_timer(void *ctx, double when) {
     (void)ctx; (void)when;
     double now = SLSCurrentRealTime();
-    CGXWindow *clone = NULL;
-    uint32_t clone_wid = 0, orig_wid = 0;
+    CGXWindow *clones_to_free[MAX_PRECLONES];
+    uint32_t   wids_to_free[MAX_PRECLONES];
+    int        free_count = 0;
 
     os_unfair_lock_lock(&gPreCloneLock);
-    if (gPreClone.orig_wid != 0) {
+    for (int i = 0; i < MAX_PRECLONES; i++) {
+        if (gPreClones[i].orig_wid == 0) continue;
+
         bool expired = false;
-        if (gPreClone.mouseUpTime > 0.0) {
+        if (gPreClones[i].mouseUpTime > 0.0) {
             // Mouse was released: if AppKit/SwiftUI didn't close the window within 1.0s, clean up
-            if ((now - gPreClone.mouseUpTime) >= 1.0) {
+            if ((now - gPreClones[i].mouseUpTime) >= 1.0) {
                 expired = true;
             }
         } else {
             // Mouse is still held down: do not time out unless held for an extreme failsafe duration (30s)
-            if ((now - gPreClone.created_at) >= 30.0) {
+            if ((now - gPreClones[i].created_at) >= 30.0) {
                 expired = true;
             }
         }
         if (expired) {
-            VN_LOG("pre-clone: timed out (age=%.2fs, since_up=%.2fs) without close -- cleaning up",
-                   now - gPreClone.created_at,
-                   gPreClone.mouseUpTime > 0.0 ? (now - gPreClone.mouseUpTime) : -1.0);
-            clone = vn_preclone_take_locked(&clone_wid, &orig_wid, NULL);
+            VN_LOG("pre-clone: slot %d (wid=%u, age=%.2fs) timed out without close -- cleaning up",
+                   i, gPreClones[i].orig_wid, now - gPreClones[i].created_at);
+            clones_to_free[free_count] = gPreClones[i].clone;
+            wids_to_free[free_count]   = gPreClones[i].clone_wid;
+            free_count++;
+            memset(&gPreClones[i], 0, sizeof(VNPreClone));
         }
     }
     os_unfair_lock_unlock(&gPreCloneLock);
 
-    if (clone) {
-        if (vn_update_ca_visibility) {
-            vn_update_ca_visibility(clone, false);
-        }
-        if (clone_wid != 0) {
-            CGSOrderOp op = kVNOrderOut;
-            uint32_t rel = 0;
-            vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
-        }
-        if (vn_system_window_release) {
-            vn_system_window_release(clone);
+    for (int i = 0; i < free_count; i++) {
+        if (clones_to_free[i]) {
+            if (vn_update_ca_visibility) {
+                vn_update_ca_visibility(clones_to_free[i], false);
+            }
+            if (wids_to_free[i] != 0) {
+                CGSOrderOp op = kVNOrderOut;
+                uint32_t rel = 0;
+                vn_orig_order(NULL, &wids_to_free[i], &op, &rel, 1, false);
+            }
+            if (vn_system_window_release) {
+                vn_system_window_release(clones_to_free[i]);
+            }
         }
     }
 }
@@ -784,9 +811,12 @@ static void vn_anim_tick(void *ctx, double when) {
     (void)ctx; (void)when;
 
     double now = SLSCurrentRealTime();
+    VNAnimSnapshot snapshots[MAX_ACTIVE_ANIMS];
+    int snapshot_count = 0;
     uint64_t finished[MAX_ACTIVE_ANIMS];
     int finished_count = 0;
     bool more = false;
+    CGXWindow *first_active_win = NULL;
 
     os_unfair_lock_lock(&gAnimsLock);
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
@@ -797,37 +827,42 @@ static void vn_anim_tick(void *ctx, double when) {
 
         if (p >= 1.0) {
             finished[finished_count++] = gActiveAnims[i].anim_id;
-            continue;
         } else {
             more = true;
+            if (!first_active_win && gActiveAnims[i].clone_win) {
+                first_active_win = gActiveAnims[i].clone_win;
+            }
+            if (snapshot_count < MAX_ACTIVE_ANIMS) {
+                snapshots[snapshot_count++] = (VNAnimSnapshot){
+                    .clone_win = gActiveAnims[i].clone_win,
+                    .bounds = gActiveAnims[i].bounds,
+                    .p = p,
+                };
+            }
         }
-
-        CGXWindow *clone_win = gActiveAnims[i].clone_win;
-        CGRect b = gActiveAnims[i].bounds;
-        os_unfair_lock_unlock(&gAnimsLock);
-
-        if (vn_set_mesh_warp && clone_win) {
-            VNPointWarp mesh[kVNMeshCount];
-            vn_anim_shrink(mesh, b, p);
-            vn_set_mesh_warp(clone_win, NULL, kVNMeshW, kVNMeshH, (const float *)mesh);
-        }
-        os_unfair_lock_lock(&gAnimsLock);
     }
     os_unfair_lock_unlock(&gAnimsLock);
 
-    for (int i = 0; i < finished_count; i++) vn_finish_animation_for_id(finished[i]);
+    // 1. Finish any completed animations outside the lock
+    for (int i = 0; i < finished_count; i++) {
+        vn_finish_animation_for_id(finished[i]);
+    }
 
-    if (more && vn_schedule_callback) {
-        CGXWindow *active_win = NULL;
-        os_unfair_lock_lock(&gAnimsLock);
-        for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-            if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_win) {
-                active_win = gActiveAnims[i].clone_win;
-                break;
-            }
+    // 2. Render warp mesh updates for all animating windows outside the lock
+    for (int i = 0; i < snapshot_count; i++) {
+        if (vn_set_mesh_warp && snapshots[i].clone_win) {
+            VNPointWarp mesh[kVNMeshCount];
+            vn_anim_shrink(mesh, snapshots[i].bounds, snapshots[i].p);
+            vn_set_mesh_warp(snapshots[i].clone_win, NULL, kVNMeshW, kVNMeshH, (const float *)mesh);
         }
-        os_unfair_lock_unlock(&gAnimsLock);
-        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + vn_get_refresh_interval(active_win));
+    }
+
+    // 3. Reschedule single timer chain if more frames remain
+    if (more && vn_schedule_callback) {
+        double interval = vn_get_refresh_interval(first_active_win);
+        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
+    } else {
+        atomic_store_explicit(&gAnimTimerRunning, false, memory_order_release);
     }
 }
 
@@ -851,10 +886,22 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         }
     }
 
-    // Ensure clone is ordered on top so it animates cleanly above any underlying windows
+    // If another clone is already actively animating, order this clone BELOW that existing
+    // animating clone so ongoing foreground animations are never occluded!
+    // If no other clone is animating, order above to ensure it is cleanly on top of underlying content.
+    uint32_t existing_clone_wid = 0;
+    os_unfair_lock_lock(&gAnimsLock);
+    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
+        if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_wid != 0 && gActiveAnims[i].clone_wid != clone_wid) {
+            existing_clone_wid = gActiveAnims[i].clone_wid;
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&gAnimsLock);
+
     if (clone_wid != 0) {
-        CGSOrderOp op = kVNOrderAbove;
-        uint32_t rel = 0;
+        CGSOrderOp op = existing_clone_wid != 0 ? kVNOrderBelow : kVNOrderAbove;
+        uint32_t rel = existing_clone_wid;
         vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
     }
 
@@ -888,7 +935,13 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
            clone_wid, orig_wid, clone_win, dur, interval * 1000.0, hz, anim_id);
 
     if (vn_schedule_callback) {
-        vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
+        bool expected = false;
+        if (atomic_compare_exchange_strong_explicit(&gAnimTimerRunning, &expected, true,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
+        } else {
+            VN_LOG("anim_tick timer loop already active -- clone wid=%u animating concurrently", clone_wid);
+        }
     } else {
         vn_finish_animation_for_id(anim_id);
     }
@@ -934,27 +987,8 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
         }
     }
 
-    CGXWindow *clone = NULL;
-    uint32_t c_wid = 0, o_wid = 0;
-    os_unfair_lock_lock(&gPreCloneLock);
-    if (wid != 0 && gPreClone.orig_wid == wid) {
-        clone = vn_preclone_take_locked(&c_wid, &o_wid, NULL);
-    }
-    os_unfair_lock_unlock(&gPreCloneLock);
-
-    if (clone) {
-        VN_LOG("pre-clone: window wid=%u ordered in, discarding unused clone wid=%u", wid, c_wid);
-        if (vn_update_ca_visibility) {
-            vn_update_ca_visibility(clone, false);
-        }
-        if (c_wid != 0) {
-            CGSOrderOp op = kVNOrderOut;
-            uint32_t rel = 0;
-            vn_orig_order(NULL, &c_wid, &op, &rel, 1, false);
-        }
-        if (vn_system_window_release) {
-            vn_system_window_release(clone);
-        }
+    if (wid != 0) {
+        vn_preclone_discard_wid(wid);
     }
 }
 
@@ -1016,11 +1050,19 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     CGRect clone_frame = CGRectZero;
 
     os_unfair_lock_lock(&gPreCloneLock);
-    if (gPreClone.clone == win) {
-        // The clone itself is being released -- simply zero out without calling vn_system_window_release
-        vn_preclone_take_locked(NULL, NULL, NULL);
-    } else if (gPreClone.orig_wid != 0 && vn_window_by_id && vn_window_by_id(gPreClone.orig_wid) == win) {
-        clone_to_animate = vn_preclone_take_locked(&clone_wid, &orig_wid, &clone_frame);
+    for (int i = 0; i < MAX_PRECLONES; i++) {
+        if (gPreClones[i].clone == win) {
+            // The clone itself is being released -- simply zero out without calling vn_system_window_release
+            memset(&gPreClones[i], 0, sizeof(VNPreClone));
+            break;
+        }
+        if (gPreClones[i].orig_wid != 0 &&
+            ((rel_wid != 0 && gPreClones[i].orig_wid == rel_wid) ||
+             (vn_window_by_id && vn_window_by_id(gPreClones[i].orig_wid) == win))) {
+            orig_wid = gPreClones[i].orig_wid;
+            clone_to_animate = vn_preclone_take_locked(orig_wid, &clone_wid, &clone_frame);
+            break;
+        }
     }
     os_unfair_lock_unlock(&gPreCloneLock);
 
@@ -1113,14 +1155,14 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 if (is_double_click) {
                     VN_LOG("hit-test: double-click detected on wid=%u (pt=%.1f,%.1f) -- discarding pre-clone and suppressing for 600ms",
                            wid, lx, ly);
-                    vn_preclone_discard();
+                    vn_preclone_discard_wid(wid);
                     gDoubleClickSuppressUntilMs = now_ms + 600;
                     goto dispatch;
                 }
 
                 if (suppressed_by_double_click) {
                     VN_LOG("hit-test: click on wid=%u suppressed due to active double-click window", wid);
-                    vn_preclone_discard();
+                    vn_preclone_discard_wid(wid);
                     goto dispatch;
                 }
 
@@ -1144,7 +1186,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     VN_LOG(">>> Mouse down in RED CLOSE box of '%s' (wid=%u, pt=(%.1f, %.1f)) -- pre-cloning now!",
                            app, wid, lx, ly);
 
-                    vn_preclone_discard();
+                    vn_preclone_discard_wid(wid);
                     atomic_store_explicit(&gNonCloseWid, 0, memory_order_relaxed);
 
                     uint32_t clone_wid = 0;
@@ -1152,17 +1194,21 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     CGXWindow *clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderBelow);
                     if (clone && clone_wid != 0) {
                         os_unfair_lock_lock(&gPreCloneLock);
-                        gPreClone.orig_wid = wid;
-                        gPreClone.clone_wid = clone_wid;
-                        gPreClone.clone = clone;
-                        gPreClone.frame = clone_frame;
-                        gPreClone.created_at = SLSCurrentRealTime();
-                        gPreClone.mouseDownScreenPt = *screen_pt;
-                        gPreClone.mouseDownLocalPt  = *local_pt;
-                        gPreClone.mouseUpTime = 0.0;
+                        int slot = vn_preclone_find_slot_locked(wid);
+                        if (slot < 0) slot = vn_preclone_find_empty_slot_locked();
+                        gPreClones[slot] = (VNPreClone){
+                            .orig_wid = wid,
+                            .clone_wid = clone_wid,
+                            .clone = clone,
+                            .frame = clone_frame,
+                            .created_at = SLSCurrentRealTime(),
+                            .mouseDownScreenPt = *screen_pt,
+                            .mouseDownLocalPt  = *local_pt,
+                            .mouseUpTime = 0.0,
+                        };
                         os_unfair_lock_unlock(&gPreCloneLock);
 
-                        VN_LOG("pre-clone: ready! wid=%u clone_wid=%u (ordered below original)", wid, clone_wid);
+                        VN_LOG("pre-clone: ready! wid=%u clone_wid=%u in slot %d (ordered below original)", wid, clone_wid, slot);
 
                         if (vn_schedule_callback) {
                             vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 30.0);
@@ -1173,24 +1219,27 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 } else if (is_yellow_or_green) {
                     VN_LOG(">>> Mouse down in YELLOW/GREEN button of wid=%u (pt=(%.1f, %.1f)) -- ignoring close animation",
                            wid, lx, ly);
-                    vn_preclone_discard();
+                    vn_preclone_discard_wid(wid);
                     atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
                     atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
                 } else {
                     // Clicked elsewhere on the window: discard any pending pre-clone
-                    vn_preclone_discard();
+                    vn_preclone_discard_wid(wid);
                 }
             }
         }
     }
     // 3. Mouse release interception (kCGEventLeftMouseUp)
     else if (type == 2) { // kCGEventLeftMouseUp
+        uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
+        int slot = -1;
         os_unfair_lock_lock(&gPreCloneLock);
-        bool has_preclone = (gPreClone.orig_wid != 0);
-        uint32_t orig_wid = gPreClone.orig_wid;
+        if (wid != 0) {
+            slot = vn_preclone_find_slot_locked(wid);
+        }
         os_unfair_lock_unlock(&gPreCloneLock);
 
-        if (has_preclone) {
+        if (slot >= 0) {
             const CGPoint *local_pt = (const CGPoint *)((const char *)event + 0x20);
             double lx = local_pt->x;
             double ly = local_pt->y;
@@ -1199,12 +1248,12 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
             bool near_red = (lx >= 6.0 && lx <= 42.0 && ly >= 3.0 && ly <= 40.0);
             if (!near_red) {
                 VN_LOG("pre-clone: mouse up clearly outside button area (wid=%u pt=(%.1f, %.1f)) -- canceling pre-clone",
-                       orig_wid, lx, ly);
-                vn_preclone_discard();
+                       wid, lx, ly);
+                vn_preclone_discard_wid(wid);
             } else {
                 os_unfair_lock_lock(&gPreCloneLock);
-                if (gPreClone.orig_wid == orig_wid) {
-                    gPreClone.mouseUpTime = SLSCurrentRealTime();
+                if (slot < MAX_PRECLONES && gPreClones[slot].orig_wid == wid) {
+                    gPreClones[slot].mouseUpTime = SLSCurrentRealTime();
                 }
                 os_unfair_lock_unlock(&gPreCloneLock);
 
@@ -1216,13 +1265,19 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
     }
     // 4. Mouse drag interception (kCGEventLeftMouseDragged)
     else if (type == 6) { // kCGEventLeftMouseDragged
+        uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
+        int slot = -1;
+        CGPoint down_scr = CGPointZero;
         os_unfair_lock_lock(&gPreCloneLock);
-        bool has_preclone = (gPreClone.orig_wid != 0);
-        CGPoint down_scr = gPreClone.mouseDownScreenPt;
-        uint32_t orig_wid = gPreClone.orig_wid;
+        if (wid != 0) {
+            slot = vn_preclone_find_slot_locked(wid);
+            if (slot >= 0) {
+                down_scr = gPreClones[slot].mouseDownScreenPt;
+            }
+        }
         os_unfair_lock_unlock(&gPreCloneLock);
 
-        if (has_preclone) {
+        if (slot >= 0) {
             const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
             const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
             double lx = local_pt->x;
@@ -1233,16 +1288,16 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 // Dragged off the red button! User either dragged away to cancel the close,
                 // or is dragging/resizing the window.
                 VN_LOG("pre-clone: dragged off red button pt=(%.1f, %.1f) -- aborting pre-clone for wid=%u",
-                       lx, ly, orig_wid);
-                vn_preclone_discard();
+                       lx, ly, wid);
+                vn_preclone_discard_wid(wid);
             } else {
                 // Still within the red button hitbox.
                 // Guard against someone dragging the whole window by the traffic light area:
                 double d_scr = hypot(screen_pt->x - down_scr.x, screen_pt->y - down_scr.y);
                 if (d_scr >= 12.0) {
                     VN_LOG("pre-clone: window drag detected (d_scr=%.1f) -- aborting pre-clone for wid=%u",
-                           d_scr, orig_wid);
-                    vn_preclone_discard();
+                           d_scr, wid);
+                    vn_preclone_discard_wid(wid);
                 }
             }
         }
@@ -1291,12 +1346,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     CGRect clone_frame = CGRectZero;
 
                     os_unfair_lock_lock(&gPreCloneLock);
-                    if (gPreClone.orig_wid == wid && gPreClone.clone != NULL && gPreClone.clone_wid != 0) {
-                        double age_ms = (SLSCurrentRealTime() - gPreClone.created_at) * 1000.0;
-                        VN_LOG(">>> Using PRE-CLONE wid=%u clone_wid=%u (ready for %.1f ms -- zero gap!)",
-                               wid, gPreClone.clone_wid, age_ms);
-                        clone = vn_preclone_take_locked(&clone_wid, NULL, &clone_frame);
-                    }
+                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame);
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
@@ -1370,9 +1420,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     CGRect clone_frame = CGRectZero;
 
                     os_unfair_lock_lock(&gPreCloneLock);
-                    if (gPreClone.orig_wid == wid && gPreClone.clone != NULL && gPreClone.clone_wid != 0) {
-                        clone = vn_preclone_take_locked(&clone_wid, NULL, &clone_frame);
-                    }
+                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame);
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
