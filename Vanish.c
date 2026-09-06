@@ -504,7 +504,7 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
 /// Creating and ordering the clone above the window gives the compositor ~100ms
 /// (physical click duration) to composite the clone. When the real close order arrives,
 /// the clone is already composited on screen, eliminating any 1-frame gaps or flashes.
-#define MAX_PRECLONES 8
+#define MAX_PRECLONES 32
 
 typedef struct {
     uint32_t       orig_wid;
