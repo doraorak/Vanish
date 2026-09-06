@@ -117,8 +117,8 @@ extern CGError SLSReleaseWindow(SLSConnectionID cid, SLSWindowID wid);
 //  _X MIG server routine for any of them, so there is nothing on the other side
 //  listening either.
 //
-//  They are deliberately not declared here. Checking that a symbol is exported
-//  was not enough to know it is implemented -- see ANALYSIS.md.
+//  They are deliberately not declared here. Many exported animation symbols
+//  are stubs that return kCGErrorNotImplemented.
 //
 //  The live engine is server-internal and unexported (PKGWindowAnimationCreate,
 //  PKGWindowTransformAnimationCreate, _PKGAnimationCallback). Reaching it means

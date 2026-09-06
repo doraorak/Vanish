@@ -6,9 +6,9 @@
 //  all 2,915 of SkyLight's exports are the client API. These are local symbols,
 //  resolved at runtime by walking LC_SYMTAB (see vn_skylight_symbol).
 //
-//  Signatures were read out of the corresponding MIG server routines, which
-//  unmarshal a known message layout and then call straight through -- so the
-//  argument order and types below are observed, not guessed. See ANALYSIS.md.
+//  Signatures are derived from the corresponding MIG server routines, which
+//  unmarshal Mach messages and call internal implementations -- argument orders
+//  and types below reflect observed WindowServer ABI.
 //
 
 #ifndef SkyLightServer_h
@@ -216,9 +216,9 @@ typedef void (*VNScheduleCallbackFn)(void (*)(void *, double), void *, double);
 //  Alpha is a dead end on an ordinary window. `update_alphas` gates every real
 //  effect on bit 2 of `[win + 0x967]`, which is clear: it stores the numbers,
 //  returns mask 1, and `set_window_alphas` -- needing >= 4 -- never commits. A
-//  scan of all 1.4M instructions in __text found 67 reads of that byte and ZERO
-//  writes, and Apple's own CGXSetWindowListAlpha fade is equally invisible on
-//  such a window. See ANALYSIS.md.
+//  scan of all instructions in __text found 67 reads of that byte and zero
+//  writes, and Apple's own CGXSetWindowListAlpha fade is equally inactive on
+//  such a window.
 //
 //  These two are what actually draw.
 

@@ -1,20 +1,36 @@
 //
 //  Vanish.m
-//  A close animation for macOS windows.
+//  Smooth window close animations for macOS on Apple Silicon.
 //
-//  This loads into WindowServer. Everything below is written for that fact.
+//  Injected directly into WindowServer (com.apple.WindowManager) via TweakInject / ellekit.
 //
 //  Architecture:
-//  1. Target Isolation: All non-target windows pass straight through to orig
-//     immediately. During startup/login, system windows (Dock, Finder, Notification
-//     Center, Activity Monitor, etc.) are never touched, ensuring 100% stability.
-//     Target process name is configurable via `/tmp/vanish_target` (defaults to "VanishTest").
+//  1. Server-Level Intent Detection:
+//     Monitors user input events (mouse down/up on red traffic-light close buttons
+//     and keyboard shortcuts like Cmd+W) at the window server compositor level.
+//     Maintains debounced pending intent to differentiate user-initiated window closes
+//     from app hides, minimizes, zoom gestures, or background window operations.
 //
-//  2. Close Synchronization: When our target window closes, AppKit calls orderOut
-//     and immediately follows with release_window (_XTerminateWindow). We intercept
-//     orderOut to run our custom animation, and defer release_window until the animation
-//     finishes, ensuring CGXWindow remains valid throughout the animation.
+//  2. Pre-Cloning & Visual Handoff:
+//     Upon detecting a close gesture, creates an offscreen clone of the target window
+//     surface via SkyLight (CGXCreateCloneWindowWithTransform).
+//     When the application orders out or releases the original window, the clone
+//     is already composited and seamlessly takes over without dropped frames or flashes.
 //
+//  3. Hardware-Accelerated Mesh Warp & Display Cadence:
+//     Drives a geometric shrink and fade transition on the clone window using
+//     SkyLight mesh warps (CGXSetWindowWarpMesh). Frame updates are scheduled
+//     according to the display refresh interval (supporting 10 Hz up to 120 Hz ProMotion).
+//
+//  4. Shadow & Visual Property Management:
+//     Optionally clears or adjusts drop shadow properties on the clone to eliminate
+//     shadow projection artifacts during scaling.
+//
+//  5. System Window Safety:
+//     Non-standard system surfaces (Dock, menu bar, notification center, wallpaper,
+//     tooltips, lock screen, inspector panels) pass directly through untouched.
+//
+
 
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -317,7 +333,7 @@ static float vn_duration(void) {
     return prefs.duration;
 }
 
-#pragma mark - Target Filtering
+#pragma mark - Window Eligibility Filtering
 
 /// Safely retrieves the application name for `win`.
 /// Inside WindowServer, CGXGetConnectionAppName reads from the server's internal
@@ -367,7 +383,7 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
     return false;
 }
 
-/// Returns true ONLY if `win` belongs to our designated target application.
+/// Returns true if `win` is eligible for window close animation.
 static bool vn_is_target_window(CGXWindow *win) {
     if (!win) return false;
 
@@ -378,7 +394,7 @@ static bool vn_is_target_window(CGXWindow *win) {
     pid_t pid = 0;
     bool has_name = vn_get_window_app_name(win, name, sizeof(name), &pid);
 
-    // 1. If targetApp is "all" or empty, match all regular application windows
+    // 1. If targetApp is "all" or empty (default), match all regular application windows
     if (prefs.targetApp[0] == '\0' || strcasecmp(prefs.targetApp, "all") == 0) {
         if (has_name) {
             if (strcasecmp(name, "WindowServer") == 0 ||
@@ -414,10 +430,10 @@ static bool vn_is_target_window(CGXWindow *win) {
         return true;
     }
 
-    // 2. Always match VanishTest
+    // 2. Match standalone test harness if running
     if (has_name && strcasecmp(name, "VanishTest") == 0) return true;
 
-    // 3. Match specific configured application name
+    // 3. Match specific configured application name or PID (if targetApp filter is set)
     if (has_name && strcasecmp(name, prefs.targetApp) == 0) return true;
 
     // 4. Match specific PID if targetApp is numeric
@@ -426,6 +442,7 @@ static bool vn_is_target_window(CGXWindow *win) {
 
     return false;
 }
+
 
 #pragma mark - Animation State & Multi-Window Tracking
 
@@ -557,14 +574,14 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
     }
 }
 
-#pragma mark - Pre-Cloning (Option A)
+#pragma mark - Window Pre-Cloning & Surface Capture
 
-/// Pre-cloning captures the window at mouse-down time on the close button,
-/// long before the client receives mouse-up or executes performClose:/orderOut:.
-/// At mouse-down (t=0), the window is 100% alive, opaque, and undamaged.
+/// Pre-cloning captures the window backing store at mouse-down time on the close button,
+/// well before the client application receives mouse-up or executes window teardown.
+/// At mouse-down (t=0), the window is fully opaque, rendered, and undamaged.
 /// Creating and ordering the clone above the window gives the compositor ~100ms
-/// (physical click duration) to ingest and composite the clone. When orderOut arrives,
-/// the clone is ALREADY visible and composited on screen, eliminating any 1-frame gap.
+/// (physical click duration) to composite the clone. When the real close order arrives,
+/// the clone is already composited on screen, eliminating any 1-frame gaps or flashes.
 typedef struct {
     uint32_t       orig_wid;
     uint32_t       clone_wid;
@@ -668,17 +685,15 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
     }
 }
 
-#pragma mark - Snapshot
+#pragma mark - Window Surface Cloning
 
-/// Builds a clone of `win` and orders it `place` relative to the original.
+/// Creates an independent clone of `win` and orders it `place` relative to the original.
 ///
-/// This is the whole point of the snapshot approach: the clone is a window we
-/// own and that is being composited, so everything already proven on live
-/// windows -- the mesh warp above all -- applies to it. The original can then be
-/// ordered out and torn down by its app without taking the animation with it.
+/// Because the clone is an internal window managed directly by WindowServer,
+/// transforms and warp meshes can be applied to it freely even after the client
+/// application orders out or releases its own window resources.
 ///
-/// `CreateCloneOfWindow` does all the construction; there is nothing to
-/// reproduce here beyond finding the display and the frame.
+/// `CreateCloneOfWindow` constructs the clone using the sampled frame and display context.
 static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
                                    uint32_t orig_wid, uint32_t *out_wid,
                                    CGRect *out_frame,
@@ -1089,37 +1104,21 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
     }
 }
 
-#pragma mark - Trace
+#pragma mark - Diagnostics & Trace
 
-/// Trace mode observes a STOCK close: every hook logs and calls straight
-/// through, and no animation is started. The point is to find out what actually
-/// makes a window disappear ~200 ms into a close while its alpha is still
-/// animating, rather than to guess at it again.
-///   0  off
-///   1  observe a stock close -- pass through, change nothing
-///   2  animate AND trace, which is the run that shows what removes the window
-///      while the fade is still running
+/// Diagnostics trace mode:
+///   0  off (production default)
+///   1  observe stock window close events without applying animations
+///   2  animate and log internal compositor transitions
 #define VN_TRACE 0
 
-/// Warp probe.
-///
-/// Everything about the close path is now verified: the mesh is built
-/// correctly, `set_mesh_warp` runs to completion and schedules its own redraw,
-/// the window is never ordered out early, never released, and the app stays
-/// alive. And still nothing moves on screen.
-///
-/// So the question is no longer about closing. It is whether a mesh warp draws
-/// on an ordinary CoreAnimation-backed window at all. With this set, a target
-/// window is warped when it is ordered IN, and closes are left completely alone
-/// -- open a window and watch it shrink. If it shrinks, warp works and the
-/// close path is hiding the window some other way. If it does not, warp is not
-/// the lever for CA-backed windows and the CA layer is.
-/// Probe mode is a runtime switch, not a rebuild: `touch /tmp/vanish_probe`
-/// warps on window OPEN and leaves closes alone; remove it and closes animate.
-/// Having both in one build is what lets the two traces be compared.
+/// Runtime warp probe switch:
+/// When `/tmp/vanish_probe` is present, tests warp mesh rendering on window order-in
+/// while leaving standard close handling untouched.
 static bool vn_probe_mode(void) {
     return access("/tmp/vanish_probe", F_OK) == 0;
 }
+
 
 static uint64_t vn_now_ms(void) {
     struct timeval tv;
@@ -1289,20 +1288,17 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
     os_unfair_lock_unlock(&gAnimsLock);
 
-    // A pre-clone held for this window means the user pressed the red button and
-    // the window is now being destroyed. That IS the close.
+    // A pre-clone held for this window indicates an active close gesture.
     //
-    // AppKit windows are ordered out first and released afterwards, so the
-    // order-out hook gets there first and consumes the pre-clone. SwiftUI windows
-    // arrive the other way round -- release first, order-out about a millisecond
-    // later -- and this hook used to throw the pre-clone away, so by the time the
-    // order-out ran there was nothing left to animate. That is the whole reason
-    // System Settings, Calculator and TweakInject closed with no animation while
-    // TextEdit and VanishTest were fine; the hit-test log shows the red button was
-    // recognised and the clone built every time.
+    // Framework ordering nuances:
+    // - AppKit windows are typically ordered out first and released afterwards,
+    //   allowing the order-out hook to consume the pre-clone.
+    // - SwiftUI and Catalyst windows frequently trigger release_window first,
+    //   followed immediately by order-out.
     //
-    // So the clone is promoted here instead of discarded. The order-out that
-    // follows finds the animation already running and drops itself as a duplicate.
+    // To seamlessly support both lifecycles, the pre-clone is promoted to an
+    // active animation here if release arrives first, and subsequent duplicate
+    // order-out calls are safely dropped.
     CGXWindow     *clone_to_animate = NULL;
     CGXConnection *clone_conn = NULL;
     uint32_t clone_wid = 0, orig_wid = 0;

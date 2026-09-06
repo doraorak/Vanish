@@ -1,14 +1,11 @@
-# Reference only -- the build here is package.sh.
+# Canonical Theos Makefile for Vanish.
 #
-# theos `make` does not work on this machine: its vendored IOKit headers
-# conflict with the macOS 27 SDK and the build dies with "could not build
-# module 'Foundation'", with and without any change of ours. dockpid hit the
-# same wall and sidesteps it the same way. This file is kept so anyone with a
-# working theos has the canonical recipe.
+# Standalone compilation and packaging without external Theos setup can be
+# performed directly using ./package.sh.
 #
-# Keep it in step with package.sh. The link line is not optional decoration:
-# without ellekit there is no MSHookFunction, and without SkyLight there is
-# nothing to anchor dladdr on when resolving the server-side symbols.
+# Required linkages:
+# - ellekit for MSHookFunction
+# - SkyLight (private framework) for compositor symbols and types
 
 TARGET := macosx:clang:latest:15.0
 ARCH = arm64e
