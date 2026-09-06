@@ -6,10 +6,9 @@
 //
 //  Architecture:
 //  1. Server-Level Intent Detection:
-//     Monitors user input events (mouse down/up on red traffic-light close buttons
-//     and keyboard shortcuts like Cmd+W) at the window server compositor level.
-//     Maintains debounced pending intent to differentiate user-initiated window closes
-//     from app hides, minimizes, zoom gestures, or background window operations.
+//     Monitors mouse down/up events within the red traffic-light close button at the
+//     window server compositor level.
+//     Maintains a short-lived pre-clone to ensure 100% gapless, flash-free visual handoff.
 //
 //  2. Pre-Cloning & Visual Handoff:
 //     Upon detecting a close gesture, creates an offscreen clone of the target window
@@ -1248,10 +1247,6 @@ static void vn_t_start_order_window(CGXConnection *conn, void *state) {
 
 #pragma mark - Hooks
 
-static _Atomic(uint64_t) gCmdWRequestTimeMs = 0;
-static _Atomic(pid_t)    gCmdWTargetPID = 0;
-static _Atomic(uint32_t) gCmdWTargetWID = 0;
-
 static _Atomic(uint64_t) gNonCloseTimeMs = 0;
 static _Atomic(uint32_t) gNonCloseWid = 0;
 
@@ -1314,44 +1309,6 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
     os_unfair_lock_unlock(&gPreCloneLock);
 
-    // Fallback: If no pre-clone was held, check whether Cmd+W was pressed recently for this window/process!
-    // (Crucial for SwiftUI apps like Calculator, where release_window precedes orderOut upon Cmd+W)
-    if (!clone_to_animate && rel_wid != 0 && vn_is_target_window(win)) {
-        uint64_t now_ms = vn_now_ms();
-        uint64_t cmdw_time = atomic_load_explicit(&gCmdWRequestTimeMs, memory_order_relaxed);
-        pid_t cmdw_pid = atomic_load_explicit(&gCmdWTargetPID, memory_order_relaxed);
-        uint32_t cmdw_wid = atomic_load_explicit(&gCmdWTargetWID, memory_order_relaxed);
-
-        char app_name[256] = {0};
-        pid_t win_pid = 0;
-        vn_get_window_app_name(win, app_name, sizeof(app_name), &win_pid);
-
-        bool is_valid_doc = false;
-        CGRect probe = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
-        if (probe.size.width < 1.0 || probe.size.height < 1.0) {
-            if (vn_clipped_frame_bounds) probe = vn_clipped_frame_bounds(win);
-        }
-        if (probe.size.width >= 200.0 && probe.size.height >= 150.0 && vn_window_level(win) == 0) {
-            is_valid_doc = true;
-        }
-
-        if (is_valid_doc && (now_ms - cmdw_time) < 400 && (cmdw_wid == rel_wid || (win_pid > 0 && cmdw_pid == win_pid))) {
-            VN_LOG(">>> Cmd+W confirmed at release_window for '%s' wid=%u (pid=%d) -- cloning on the fly",
-                   app_name, rel_wid, win_pid);
-            atomic_store_explicit(&gCmdWRequestTimeMs, 0, memory_order_relaxed);
-            uint32_t c_wid = 0;
-            CGRect c_frame = CGRectZero;
-            CGXWindow *clone = vn_make_snapshot(win, conn, rel_wid, &c_wid, &c_frame, kVNOrderAbove);
-            if (clone && c_wid != 0) {
-                clone_to_animate = clone;
-                clone_wid = c_wid;
-                clone_frame = c_frame;
-                clone_conn = conn;
-                orig_wid = rel_wid;
-            }
-        }
-    }
-
     // Call original release_window IMMEDIATELY! Never defer it.
     // Deferring release_window causes deadlocks and use-after-free when a connection deallocates on quit.
     vn_orig_release_window(conn, win);
@@ -1406,36 +1363,8 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
         pid = *(const pid_t *)((const char *)conn + 0x268);
     }
 
-    // 1. Keyboard shortcut interception (Cmd+W, Cmd+M, Cmd+H, Ctrl+Cmd+F)
-    if (type == 10) { // kCGEventKeyDown
-        uint32_t flags = *(const uint32_t *)((const char *)event + 0x38);
-        uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
-        uint16_t keycode = *(const uint16_t *)((const char *)event + 0x90);
-
-        if ((flags & 0x00100000) != 0) { // Command key down
-            if (keycode == 13) { // 'W' key -> Close Window
-                VN_LOG(">>> KeyDown Cmd+W detected for wid=%u pid=%d", wid, pid);
-                atomic_store_explicit(&gCmdWRequestTimeMs, vn_now_ms(), memory_order_relaxed);
-                atomic_store_explicit(&gCmdWTargetPID, pid, memory_order_relaxed);
-                atomic_store_explicit(&gCmdWTargetWID, wid, memory_order_relaxed);
-                atomic_store_explicit(&gNonCloseWid, 0, memory_order_relaxed);
-            } else if (keycode == 46) { // 'M' key -> Minimize
-                VN_LOG(">>> KeyDown Cmd+M detected for wid=%u pid=%d (ignoring future orderOut)", wid, pid);
-                atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
-                atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
-            } else if (keycode == 4) { // 'H' key -> Hide App
-                VN_LOG(">>> KeyDown Cmd+H detected for wid=%u pid=%d (ignoring future orderOut)", wid, pid);
-                atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
-                atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
-            } else if (keycode == 3 && (flags & 0x00040000) != 0) { // Ctrl+Cmd+F -> Fullscreen
-                VN_LOG(">>> KeyDown Ctrl+Cmd+F detected for wid=%u pid=%d (ignoring future orderOut)", wid, pid);
-                atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
-                atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
-            }
-        }
-    }
-    // 2. Mouse click interception (Traffic lights: Red vs Yellow vs Green)
-    else if (type == 1) { // kCGEventLeftMouseDown
+    // Mouse click interception (Traffic lights: Red vs Yellow vs Green)
+    if (type == 1) { // kCGEventLeftMouseDown
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
         if (wid != 0 && vn_window_by_id) {
             CGXWindow *win = vn_window_by_id(wid);
@@ -1670,31 +1599,10 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     }
                     os_unfair_lock_unlock(&gPreCloneLock);
 
-                    // 2. Fallback: ONLY if Cmd+W was pressed recently for this process/window
-                    if (!clone) {
-                        uint64_t cmdw_time = atomic_load_explicit(&gCmdWRequestTimeMs, memory_order_relaxed);
-                        pid_t cmdw_pid = atomic_load_explicit(&gCmdWTargetPID, memory_order_relaxed);
-                        uint32_t cmdw_wid = atomic_load_explicit(&gCmdWTargetWID, memory_order_relaxed);
-
-                        bool is_valid_doc = false;
-                        CGRect probe = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
-                        if (probe.size.width < 1.0 || probe.size.height < 1.0) {
-                            if (vn_clipped_frame_bounds) probe = vn_clipped_frame_bounds(win);
-                        }
-                        if (probe.size.width >= 200.0 && probe.size.height >= 150.0 && vn_window_level(win) == 0) {
-                            is_valid_doc = true;
-                        }
-
-                        if (is_valid_doc && (now_ms - cmdw_time) < 400 && (cmdw_wid == wid || cmdw_pid == pid)) {
-                            VN_LOG(">>> Cmd+W close confirmed for wid=%u (pid=%d, time delta %llu ms) -- cloning on the fly",
-                                   wid, pid, (now_ms - cmdw_time));
-                            atomic_store_explicit(&gCmdWRequestTimeMs, 0, memory_order_relaxed);
-                            clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderAbove);
-                        } else {
-                            VN_LOG("Window wid=%u orderOut has no pre-clone and no Cmd+W intent -- not a close (passing through directly)", wid);
-                            vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-                            return;
-                        }
+                    if (!clone || clone_wid == 0) {
+                        VN_LOG("Window wid=%u orderOut has no pre-clone (not closed via red button) -- passing through directly", wid);
+                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
+                        return;
                     }
 
                     if (clone && clone_wid != 0) {
@@ -1785,7 +1693,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         continue;
                     }
 
-                    // Same as single-window path: check pre-clone or Cmd+W
+                    // Same as single-window path: check active pre-clone
                     uint32_t clone_wid = 0;
                     CGXWindow *clone = NULL;
                     CGRect clone_frame = CGRectZero;
@@ -1796,32 +1704,13 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     }
                     os_unfair_lock_unlock(&gPreCloneLock);
 
-                    if (!clone) {
-                        uint64_t cmdw_time = atomic_load_explicit(&gCmdWRequestTimeMs, memory_order_relaxed);
-                        pid_t cmdw_pid = atomic_load_explicit(&gCmdWTargetPID, memory_order_relaxed);
-                        uint32_t cmdw_wid = atomic_load_explicit(&gCmdWTargetWID, memory_order_relaxed);
-
-                        bool is_valid_doc = false;
-                        CGRect probe = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
-                        if (probe.size.width < 1.0 || probe.size.height < 1.0) {
-                            if (vn_clipped_frame_bounds) probe = vn_clipped_frame_bounds(win);
-                        }
-                        if (probe.size.width >= 200.0 && probe.size.height >= 150.0 && vn_window_level(win) == 0) {
-                            is_valid_doc = true;
-                        }
-
-                        if (is_valid_doc && (now_ms - cmdw_time) < 400 && (cmdw_wid == wid || cmdw_pid == pid)) {
-                            VN_LOG(">>> Cmd+W multi-close confirmed for wid=%u (pid=%d) -- cloning on the fly", wid, pid);
-                            atomic_store_explicit(&gCmdWRequestTimeMs, 0, memory_order_relaxed);
-                            clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderAbove);
-                        } else {
-                            VN_LOG("Window wid=%u multi-orderOut has no pre-clone and no Cmd+W intent -- passing through", wid);
-                            pass_wids[pass_count] = wid;
-                            pass_ops[pass_count] = ops[i];
-                            pass_rel[pass_count] = relativeTo ? relativeTo[i] : 0;
-                            pass_count++;
-                            continue;
-                        }
+                    if (!clone || clone_wid == 0) {
+                        VN_LOG("Window wid=%u multi-orderOut has no pre-clone (not closed via red button) -- passing through", wid);
+                        pass_wids[pass_count] = wid;
+                        pass_ops[pass_count] = ops[i];
+                        pass_rel[pass_count] = relativeTo ? relativeTo[i] : 0;
+                        pass_count++;
+                        continue;
                     }
 
                     if (clone && clone_wid != 0) {
