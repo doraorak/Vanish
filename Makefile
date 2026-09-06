@@ -8,15 +8,15 @@
 # - SkyLight (private framework) for compositor symbols and types
 
 TARGET := macosx:clang:latest:15.0
-ARCH = arm64e
+ARCHS = arm64e
 
 include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = Vanish
 
-Vanish_FILES = Vanish.m
+Vanish_FILES = Vanish.c
 Vanish_INSTALL_PATH = /Library/TweakInject/Tweaks/Bundles
-Vanish_CFLAGS = -fobjc-arc
+Vanish_CFLAGS = -fblocks -std=c11
 
 # MSHookFunction. Installed at /usr/local/lib/libellekit.dylib, which is also
 # its install name, so -L is a link-time concern only.
@@ -25,7 +25,7 @@ Vanish_LDFLAGS = -L/Library/TweakInject
 
 # SkyLight is private, so it needs the private-framework path rather than
 # _FRAMEWORKS.
-Vanish_FRAMEWORKS = Foundation CoreGraphics
+Vanish_FRAMEWORKS = CoreFoundation CoreGraphics
 Vanish_PRIVATE_FRAMEWORKS = SkyLight
 
 include $(THEOS_MAKE_PATH)/bundle.mk

@@ -27,12 +27,12 @@ mkdir -p "$DIR/$BUNDLE/Contents/MacOS" "$DIR/$BUNDLE/Contents/Resources"
 #
 # ellekit provides MSHookFunction. Its install name is /usr/local/lib, which is
 # where the loader keeps it, so -L only matters at link time.
-clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fobjc-arc -x objective-c \
+clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fblocks -std=c11 \
     -F"$SDK_PATH/System/Library/PrivateFrameworks" \
-    -framework Foundation -framework CoreGraphics -framework SkyLight \
+    -framework CoreFoundation -framework CoreGraphics -framework SkyLight \
     -L/Library/TweakInject -lellekit \
     -install_name "/Library/TweakInject/Tweaks/Bundles/$BUNDLE/Contents/MacOS/$NAME" \
-    -o "$DIR/$BUNDLE/Contents/MacOS/$NAME" "$DIR/$NAME.m"
+    -o "$DIR/$BUNDLE/Contents/MacOS/$NAME" "$DIR/$NAME.c"
 
 PREFS_BUNDLE="${NAME}Prefs.bundle"
 PREFS_SRC="$DIR/layout/Library/TweakInject/Preferences/PreferenceBundles/$PREFS_BUNDLE"
@@ -151,12 +151,6 @@ cp -R "$DIR/$BUNDLE" "$DIR/packages/$BUNDLE"
 if [ -d "$DIR/layout/Library/TweakInject/Preferences/PreferenceBundles/VanishPrefs.bundle" ]; then
     rm -rf "$DIR/packages/VanishPrefs.bundle"
     cp -R "$DIR/layout/Library/TweakInject/Preferences/PreferenceBundles/VanishPrefs.bundle" "$DIR/packages/VanishPrefs.bundle"
-fi
-
-if [ -f "$DIR/tools/VanishTest.m" ]; then
-    echo "==> 5. Compiling VanishTest test app..."
-    clang -arch arm64e -isysroot "$SDK_PATH" -framework Cocoa -o "$DIR/packages/VanishTest" "$DIR/tools/VanishTest.m"
-    codesign -f -s - "$DIR/packages/VanishTest"
 fi
 
 echo "==> Done: $OUTPUT_DEB, $DIR/packages/$BUNDLE"

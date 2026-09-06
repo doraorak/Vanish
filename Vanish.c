@@ -1,5 +1,5 @@
 //
-//  Vanish.m
+//  Vanish.c
 //  Smooth window close animations for macOS on Apple Silicon.
 //
 //  Injected directly into WindowServer (com.apple.WindowManager) via TweakInject / ellekit.
@@ -30,27 +30,26 @@
 //     tooltips, lock screen, inspector panels) pass directly through untouched.
 //
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <string.h>
+#include <stdbool.h>
+#include <math.h>
+#include <dlfcn.h>
+#include <ptrauth.h>
+#include <time.h>
+#include <libproc.h>
+#include <os/lock.h>
+#include <os/log.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach-o/dyld.h>
 
-#import <Foundation/Foundation.h>
-#import <CoreFoundation/CoreFoundation.h>
-#import <string.h>
-#import <stdbool.h>
-#import <math.h>
-#import <dlfcn.h>
-#import <ptrauth.h>
-#import <time.h>
-#import <libproc.h>
-#import <os/lock.h>
-#import <os/log.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
+#include "SLSPrivate.h"
+#include "SkyLightServer.h"
 
-#import "SLSPrivate.h"
-#import "SkyLightServer.h"
-
-#import <sys/time.h>
-#import <sys/stat.h>
-#import <stdatomic.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <stdatomic.h>
 
 #pragma mark - Logging
 
@@ -151,7 +150,6 @@ static void *vn_skylight_symbol(const char *wanted) {
 
 static VNOrderWindowListFn          vn_orig_order;
 static VNWindowByIDFn               vn_window_by_id;
-static VNSetWindowAlphasFn          vn_orig_set_window_alphas;  // set when tracing hooks it
 static VNScheduleCallbackFn         vn_schedule_callback;
 static VNSetMeshWarpFn              vn_set_mesh_warp;
 static VNCreateCloneFn              vn_create_clone;
@@ -194,120 +192,90 @@ static void vn_reload_prefs_locked(void) {
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
 
     // 1. Read from /Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist
-    NSString *path = @"/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist";
+    const char *path = "/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist";
     struct stat st;
-    if (stat([path UTF8String], &st) == 0) {
+    if (stat(path, &st) == 0) {
         gPrefsMtime = st.st_mtimespec;
         gPrefsValid = true;
 
-        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
-        if (dict) {
-            if (dict[@"enabled"] != nil) {
-                gPrefs.enabled = [dict[@"enabled"] boolValue];
-            }
-            if (dict[@"shadows"] != nil) {
-                gPrefs.shadows = [dict[@"shadows"] boolValue];
-            }
-            if (dict[@"refreshRate"] != nil) {
-                id rr = dict[@"refreshRate"];
-                if ([rr isKindOfClass:[NSString class]]) {
-                    float r = [rr floatValue];
-                    if (r >= 5.0f && r <= 360.0f) {
-                        gPrefs.refreshRate = r;
+        CFURLRef fileURL = CFURLCreateFromFileSystemRepresentation(
+            kCFAllocatorDefault, (const UInt8 *)path, (CFIndex)strlen(path), false);
+        if (fileURL) {
+            CFReadStreamRef stream = CFReadStreamCreateWithFile(kCFAllocatorDefault, fileURL);
+            CFRelease(fileURL);
+            if (stream) {
+                if (CFReadStreamOpen(stream)) {
+                    CFPropertyListFormat format;
+                    CFDictionaryRef dict = (CFDictionaryRef)CFPropertyListCreateWithStream(
+                        kCFAllocatorDefault, stream, 0, kCFPropertyListImmutable, &format, NULL);
+                    CFReadStreamClose(stream);
+                    CFRelease(stream);
+
+                    if (dict && CFGetTypeID(dict) == CFDictionaryGetTypeID()) {
+                        CFBooleanRef enabledVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("enabled"));
+                        if (enabledVal && CFGetTypeID(enabledVal) == CFBooleanGetTypeID()) {
+                            gPrefs.enabled = CFBooleanGetValue(enabledVal);
+                        }
+
+                        CFBooleanRef shadowsVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("shadows"));
+                        if (shadowsVal && CFGetTypeID(shadowsVal) == CFBooleanGetTypeID()) {
+                            gPrefs.shadows = CFBooleanGetValue(shadowsVal);
+                        }
+
+                        CFTypeRef rrVal = CFDictionaryGetValue(dict, CFSTR("refreshRate"));
+                        if (rrVal) {
+                            float r = 0.0f;
+                            if (CFGetTypeID(rrVal) == CFNumberGetTypeID()) {
+                                CFNumberGetValue((CFNumberRef)rrVal, kCFNumberFloatType, &r);
+                            } else if (CFGetTypeID(rrVal) == CFStringGetTypeID()) {
+                                r = (float)CFStringGetDoubleValue((CFStringRef)rrVal);
+                            }
+                            if (r >= 5.0f && r <= 360.0f) {
+                                gPrefs.refreshRate = r;
+                            }
+                        }
+
+                        CFTypeRef durVal = CFDictionaryGetValue(dict, CFSTR("duration"));
+                        if (durVal) {
+                            float dur = 0.0f;
+                            if (CFGetTypeID(durVal) == CFNumberGetTypeID()) {
+                                CFNumberGetValue((CFNumberRef)durVal, kCFNumberFloatType, &dur);
+                            } else if (CFGetTypeID(durVal) == CFStringGetTypeID()) {
+                                dur = (float)CFStringGetDoubleValue((CFStringRef)durVal);
+                            }
+                            if (dur >= 0.05f && dur <= 60.0f) {
+                                gPrefs.duration = dur;
+                            }
+                        }
+
+                        CFStringRef targetVal = (CFStringRef)CFDictionaryGetValue(dict, CFSTR("targetApp"));
+                        if (targetVal && CFGetTypeID(targetVal) == CFStringGetTypeID()) {
+                            char s[sizeof(gPrefs.targetApp)] = {0};
+                            if (CFStringGetCString(targetVal, s, sizeof(s), kCFStringEncodingUTF8) && s[0] != '\0') {
+                                strlcpy(gPrefs.targetApp, s, sizeof(gPrefs.targetApp));
+                            }
+                        }
+
+                        CFRelease(dict);
                     }
-                } else if ([rr respondsToSelector:@selector(floatValue)]) {
-                    float r = [rr floatValue];
-                    if (r >= 5.0f && r <= 360.0f) {
-                        gPrefs.refreshRate = r;
-                    }
-                }
-            }
-            if (dict[@"duration"] != nil) {
-                float dur = [dict[@"duration"] floatValue];
-                if (dur >= 0.05f && dur <= 60.0f) {
-                    gPrefs.duration = dur;
-                }
-            }
-            if (dict[@"targetApp"] != nil) {
-                NSString *target = dict[@"targetApp"];
-                if ([target isKindOfClass:[NSString class]]) {
-                    const char *s = [target UTF8String];
-                    if (s && s[0] != '\0') {
-                        strlcpy(gPrefs.targetApp, s, sizeof(gPrefs.targetApp));
-                    }
+                } else {
+                    CFRelease(stream);
                 }
             }
         }
     } else {
         gPrefsValid = false;
     }
-
-    // 2. Developer command-line overrides (if present and non-empty):
-    // /tmp/vanish_duration overrides duration
-    FILE *f_dur = fopen("/tmp/vanish_duration", "r");
-    if (f_dur) {
-        char buf[64] = {0};
-        if (fgets(buf, sizeof(buf), f_dur)) {
-            float val = strtof(buf, NULL);
-            if (val >= 0.05f && val <= 60.0f) {
-                gPrefs.duration = val;
-            }
-        }
-        fclose(f_dur);
-    }
-
-    // /tmp/vanish_target overrides targetApp
-    FILE *f_tgt = fopen("/tmp/vanish_target", "r");
-    if (f_tgt) {
-        char buf[256] = {0};
-        if (fgets(buf, sizeof(buf), f_tgt)) {
-            buf[strcspn(buf, "\r\n")] = '\0';
-            if (buf[0] != '\0') {
-                strlcpy(gPrefs.targetApp, buf, sizeof(gPrefs.targetApp));
-            }
-        }
-        fclose(f_tgt);
-    }
-
-    // /tmp/vanish_shadows overrides shadows (0 or 1)
-    FILE *f_shd = fopen("/tmp/vanish_shadows", "r");
-    if (f_shd) {
-        char buf[16] = {0};
-        if (fgets(buf, sizeof(buf), f_shd)) {
-            int val = atoi(buf);
-            gPrefs.shadows = (val != 0);
-        }
-        fclose(f_shd);
-    }
-
-    // /tmp/vanish_refresh_rate overrides refreshRate (e.g. 10, 60, 120)
-    FILE *f_hz = fopen("/tmp/vanish_refresh_rate", "r");
-    if (f_hz) {
-        char buf[16] = {0};
-        if (fgets(buf, sizeof(buf), f_hz)) {
-            float val = strtof(buf, NULL);
-            if (val >= 5.0f && val <= 360.0f) {
-                gPrefs.refreshRate = val;
-            }
-        }
-        fclose(f_hz);
-    }
 }
 
 static VNPreferences vn_get_prefs(void) {
     struct stat st;
     bool have_stat = (stat("/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist", &st) == 0);
-    struct stat st_tmp_dur, st_tmp_tgt, st_tmp_shd, st_tmp_hz;
-    bool have_tmp_dur = (stat("/tmp/vanish_duration", &st_tmp_dur) == 0);
-    bool have_tmp_tgt = (stat("/tmp/vanish_target", &st_tmp_tgt) == 0);
-    bool have_tmp_shd = (stat("/tmp/vanish_shadows", &st_tmp_shd) == 0);
-    bool have_tmp_hz  = (stat("/tmp/vanish_refresh_rate", &st_tmp_hz) == 0);
 
     os_unfair_lock_lock(&gPrefsLock);
     bool fresh = gPrefsValid && have_stat &&
                  st.st_mtimespec.tv_sec  == gPrefsMtime.tv_sec &&
-                 st.st_mtimespec.tv_nsec == gPrefsMtime.tv_nsec &&
-                 !have_tmp_dur && !have_tmp_tgt && !have_tmp_shd && !have_tmp_hz;
+                 st.st_mtimespec.tv_nsec == gPrefsMtime.tv_nsec;
     if (!fresh) {
         vn_reload_prefs_locked();
     }
@@ -445,24 +413,19 @@ static bool vn_is_target_window(CGXWindow *win) {
 
 #pragma mark - Animation State & Multi-Window Tracking
 
-static void vn_clear_warp(CGXWindow *win, CGXConnection *conn, CGRect bounds);
-
 typedef struct {
-    uint32_t       wid;             // clone wid if is_clone, else target wid
-    uint32_t       orig_wid;        // original target wid being closed
-    CGXWindow     *win;
-    CGXConnection *conn;
     uint64_t       anim_id;
-    bool           is_animating;
-    bool           probe_only;      // warp for its own sake: never order out
-    bool           is_clone;        // we made this window; destroy it when done
-    CGRect         bounds;          // sampled once; see vn_start_window_animation
-    double         start_time;   // SLSCurrentRealTime() when the fade began
-    double         duration;
-} VNWindowAnim;
+    uint32_t       orig_wid;        // Original application window ID being closed
+    uint32_t       clone_wid;       // Server-owned clone window ID
+    CGXWindow     *clone_win;       // Pointer to clone window instance
+    CGRect         bounds;          // Sampled frame geometry
+    double         start_time;      // SLSCurrentRealTime() when the animation began
+    double         duration;        // Configured duration in seconds
+    bool           is_animating;    // Active slot indicator
+} VNCloneAnim;
 
 #define MAX_ACTIVE_ANIMS 32
-static VNWindowAnim   gActiveAnims[MAX_ACTIVE_ANIMS];
+static VNCloneAnim    gActiveAnims[MAX_ACTIVE_ANIMS];
 static os_unfair_lock gAnimsLock = OS_UNFAIR_LOCK_INIT;
 static uint64_t       gNextAnimId = 1;
 
@@ -470,8 +433,8 @@ static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
     os_unfair_lock_lock(&gAnimsLock);
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (gActiveAnims[i].is_animating) {
-            if ((wid != 0 && (gActiveAnims[i].wid == wid || gActiveAnims[i].orig_wid == wid)) ||
-                (win != NULL && gActiveAnims[i].win == win)) {
+            if ((wid != 0 && (gActiveAnims[i].clone_wid == wid || gActiveAnims[i].orig_wid == wid)) ||
+                (win != NULL && gActiveAnims[i].clone_win == win)) {
                 os_unfair_lock_unlock(&gAnimsLock);
                 return true;
             }
@@ -491,27 +454,19 @@ static void vn_delayed_clone_release(void *ctx, double when) {
 }
 
 static void vn_finish_animation_for_id(uint64_t anim_id) {
-    uint32_t wid = 0;
-    CGXWindow *win = NULL;
-    CGXConnection *conn = NULL;
+    uint32_t clone_wid = 0;
+    CGXWindow *clone_win = NULL;
     bool found = false;
-    bool probe_only = false;
-    bool is_clone = false;
-    CGRect bounds = CGRectZero;
+
     os_unfair_lock_lock(&gAnimsLock);
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (gActiveAnims[i].is_animating && gActiveAnims[i].anim_id == anim_id) {
-            wid = gActiveAnims[i].wid;
-            win = gActiveAnims[i].win;
-            conn = gActiveAnims[i].conn;
-            probe_only = gActiveAnims[i].probe_only;
-            is_clone = gActiveAnims[i].is_clone;
-            bounds = gActiveAnims[i].bounds;
+            clone_wid = gActiveAnims[i].clone_wid;
+            clone_win = gActiveAnims[i].clone_win;
             gActiveAnims[i].is_animating = false;
-            gActiveAnims[i].wid = 0;
+            gActiveAnims[i].clone_wid = 0;
             gActiveAnims[i].orig_wid = 0;
-            gActiveAnims[i].win = NULL;
-            gActiveAnims[i].conn = NULL;
+            gActiveAnims[i].clone_win = NULL;
             found = true;
             break;
         }
@@ -520,56 +475,19 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
 
     if (!found) return;
 
-    VN_LOG("finish_animation_on_main: wid=%u win=%p", wid, win);
-
-    // Re-validate window through WindowServer's internal table before operating (for real windows)
-    if (!is_clone && wid != 0 && vn_window_by_id) {
-        CGXWindow *live_win = vn_window_by_id(wid);
-        if (!live_win || live_win != win) {
-            VN_LOG("Window wid=%u is no longer valid in WindowServer, skipping order-out", wid);
-            return;
-        }
+    VN_LOG("finish_animation: hiding and ordering out clone wid=%u win=%p (release deferred 100ms)", clone_wid, clone_win);
+    if (clone_win && vn_update_ca_visibility) {
+        vn_update_ca_visibility(clone_win, false);
     }
-
-    // A clone is ours:
-    // 1. Immediately hide its CoreAnimation layer so CA stops drawing it completely.
-    // 2. Order it out using server-internal context (conn = NULL), bypassing client ownership checks.
-    // 3. Defer destruction by 100ms so the compositor commits the hide and orderOut
-    //    before the mesh warp is deallocated. This guarantees zero 1-frame unwarped flash.
-    if (is_clone) {
-        VN_LOG("finish: hiding and ordering out clone wid=%u win=%p (release deferred 100ms)", wid, win);
-        if (win && vn_update_ca_visibility) {
-            vn_update_ca_visibility(win, false);
-        }
-        if (wid != 0) {
-            CGSOrderOp op = kVNOrderOut;
-            uint32_t rel = 0;
-            vn_orig_order(NULL, &wid, &op, &rel, 1, false);
-        }
-        if (vn_schedule_callback && win) {
-            vn_schedule_callback(vn_delayed_clone_release, win, SLSCurrentRealTime() + 0.1);
-        } else if (vn_system_window_release && win) {
-            vn_system_window_release(win);
-        }
-        return;
-    }
-
-    // 1. Commit the actual order-out to the display server.
-    if (probe_only) {
-        VN_LOG("probe finished for wid=%u -- restoring shape, not ordering out", wid);
-        vn_clear_warp(win, conn, bounds);
-        return;
-    }
-    if (conn && wid != 0) {
+    if (clone_wid != 0) {
         CGSOrderOp op = kVNOrderOut;
         uint32_t rel = 0;
-        VN_LOG("finish_animation_on_main: committing order-out for wid=%u win=%p", wid, win);
-        vn_orig_order(conn, &wid, &op, &rel, 1, false);
+        vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
     }
-
-    // 2. Restore alpha to 1.0f in case the window is re-used or ordered back in later.
-    if (win && conn) {
-        vn_clear_warp(win, conn, bounds);
+    if (vn_schedule_callback && clone_win) {
+        vn_schedule_callback(vn_delayed_clone_release, clone_win, SLSCurrentRealTime() + 0.1);
+    } else if (vn_system_window_release && clone_win) {
+        vn_system_window_release(clone_win);
     }
 }
 
@@ -585,7 +503,6 @@ typedef struct {
     uint32_t       orig_wid;
     uint32_t       clone_wid;
     CGXWindow     *clone;
-    CGXConnection *conn;
     CGRect         frame;
     double         created_at;
     CGPoint        mouseDownScreenPt;
@@ -607,7 +524,6 @@ static CGXWindow *vn_preclone_take_locked(uint32_t *out_clone_wid, uint32_t *out
     gPreClone.orig_wid = 0;
     gPreClone.clone_wid = 0;
     gPreClone.clone = NULL;
-    gPreClone.conn = NULL;
     gPreClone.frame = CGRectZero;
     gPreClone.created_at = 0.0;
     gPreClone.mouseDownScreenPt = CGPointZero;
@@ -691,16 +607,10 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 /// Because the clone is an internal window managed directly by WindowServer,
 /// transforms and warp meshes can be applied to it freely even after the client
 /// application orders out or releases its own window resources.
-///
-/// `CreateCloneOfWindow` constructs the clone using the sampled frame and display context.
 static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
                                    uint32_t orig_wid, uint32_t *out_wid,
                                    CGRect *out_frame,
                                    CGSOrderOp place) {
-    if (access("/tmp/vanish_snapshot_off", F_OK) == 0) {
-        VN_LOG("snapshot disabled by /tmp/vanish_snapshot_off");
-        return NULL;
-    }
     if (!vn_create_clone || !vn_window_get_display || !vn_screen_rect_from_rect ||
         !vn_window_get_id) {
         VN_LOG("snapshot: symbols unresolved (clone=%p disp=%p rect=%p id=%p)",
@@ -769,30 +679,14 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         VN_LOG("snapshot: disabled shadow property on clone wid=%u win=%p", wid, clone);
     }
 
-    float shadow_l = (content.size.width >= 1.0) ? (content.origin.x - frame.origin.x) : 0.0f;
-    float shadow_t = (content.size.height >= 1.0) ? (content.origin.y - frame.origin.y) : 0.0f;
-    float shadow_r = (content.size.width >= 1.0) ? ((frame.origin.x + frame.size.width) - (content.origin.x + content.size.width)) : 0.0f;
-    float shadow_b = (content.size.height >= 1.0) ? ((frame.origin.y + frame.size.height) - (content.origin.y + content.size.height)) : 0.0f;
-    float extra_w  = (content.size.width >= 1.0) ? (frame.size.width - content.size.width) : 0.0f;
-    float extra_h  = (content.size.height >= 1.0) ? (frame.size.height - content.size.height) : 0.0f;
-
     VN_LOG("snapshot: clone=%p wid=%u %s %u frame=(%.1f,%.1f %.1fx%.1f) display=%p",
            clone, wid, place == kVNOrderBelow ? "below" : "above", orig_wid,
            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
            display);
-    VN_LOG("  [SHADOW TRACE] orig_content=(%.1f,%.1f %.1fx%.1f) clone_frame=(%.1f,%.1f %.1fx%.1f) shadow=[L=%.1f T=%.1f R=%.1f B=%.1f] extra=[+%.1fw, +%.1fh]",
-           content.origin.x, content.origin.y, content.size.width, content.size.height,
-           frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-           shadow_l, shadow_t, shadow_r, shadow_b, extra_w, extra_h);
     return clone;
 }
 
 #pragma mark - Animations
-
-// Tracing lives further down, next to the hooks it belongs to.
-static bool vn_trace_win(CGXWindow *win);
-static long vn_trace_ms(void);
-
 
 /// Mesh resolution. 2x2 would do for a plain scale, but the grid is the whole
 /// point: anything that can move a vertex can be drawn here, so start with
@@ -880,15 +774,6 @@ static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
     }
 }
 
-/// Puts the window back on its own shape, so one that is ordered back in is not
-/// left holding the last frame of an animation.
-static void vn_clear_warp(CGXWindow *win, CGXConnection *conn, CGRect bounds) {
-    if (!vn_set_mesh_warp || !win || !conn) return;
-    VNPointWarp mesh[kVNMeshCount];
-    vn_anim_shrink(mesh, bounds, 0.0);   // t = 0 is identity
-    vn_set_mesh_warp(win, conn, kVNMeshW, kVNMeshH, (const float *)mesh);
-}
-
 static void vn_finish_animation_for_id(uint64_t anim_id);
 /// Draws one frame of every running animation, from the server's timer pass.
 ///
@@ -909,11 +794,9 @@ static void vn_anim_tick(void *ctx, double when) {
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (!gActiveAnims[i].is_animating) continue;
 
-        uint64_t aid = gActiveAnims[i].anim_id;
         double dur = gActiveAnims[i].duration > 0.0 ? gActiveAnims[i].duration : 0.25;
         double p = (now - gActiveAnims[i].start_time) / dur;
 
-        (void)aid;
         if (p >= 1.0) {
             finished[finished_count++] = gActiveAnims[i].anim_id;
             continue;
@@ -921,24 +804,14 @@ static void vn_anim_tick(void *ctx, double when) {
             more = true;
         }
 
-        CGXWindow *win = gActiveAnims[i].win;
-        CGXConnection *conn = gActiveAnims[i].conn;
-        bool is_clone = gActiveAnims[i].is_clone;
+        CGXWindow *clone_win = gActiveAnims[i].clone_win;
         CGRect b = gActiveAnims[i].bounds;
         os_unfair_lock_unlock(&gAnimsLock);
 
-        // Outside the lock on purpose: this re-enters the server.
-        if (vn_set_mesh_warp) {
+        if (vn_set_mesh_warp && clone_win) {
             VNPointWarp mesh[kVNMeshCount];
             vn_anim_shrink(mesh, b, p);
-            CGXConnection *warp_conn = is_clone ? NULL : conn;
-            vn_set_mesh_warp(win, warp_conn, kVNMeshW, kVNMeshH, (const float *)mesh);
-
-            if (vn_trace_win(win)) {
-                VN_LOG("  +%4ldms  warp t=%.3f bounds=(%.0f,%.0f %.0fx%.0f) topleft=(%.0f,%.0f)",
-                       vn_trace_ms(), p, b.origin.x, b.origin.y, b.size.width, b.size.height,
-                       (double)mesh[0].global.x, (double)mesh[0].global.y);
-            }
+            vn_set_mesh_warp(clone_win, NULL, kVNMeshW, kVNMeshH, (const float *)mesh);
         }
         os_unfair_lock_lock(&gAnimsLock);
     }
@@ -950,8 +823,8 @@ static void vn_anim_tick(void *ctx, double when) {
         CGXWindow *active_win = NULL;
         os_unfair_lock_lock(&gAnimsLock);
         for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-            if (gActiveAnims[i].is_animating && gActiveAnims[i].win) {
-                active_win = gActiveAnims[i].win;
+            if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_win) {
+                active_win = gActiveAnims[i].clone_win;
                 break;
             }
         }
@@ -960,15 +833,15 @@ static void vn_anim_tick(void *ctx, double when) {
     }
 }
 
-
-static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWindow *win,
-                                      uint32_t orig_wid, CGRect frame, bool probe_only, bool is_clone) {
+static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CGRect frame) {
+    if (!clone_win) return;
+    uint32_t clone_wid = vn_window_get_id ? vn_window_get_id(clone_win) : 0;
     float dur = vn_duration();
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         VNPreferences prefs = vn_get_prefs();
-        CGRect b = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
-        CGRect p = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
+        CGRect b = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(clone_win) : CGRectZero;
+        CGRect p = vn_screen_rect ? vn_screen_rect(clone_win) : CGRectZero;
         if (!prefs.shadows && p.size.width >= 1.0 && p.size.height >= 1.0) {
             frame = p;
         } else if (b.size.width >= 1.0 && b.size.height >= 1.0) {
@@ -976,15 +849,15 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
         } else if (p.size.width >= 1.0 && p.size.height >= 1.0) {
             frame = p;
         } else if (vn_screen_rect_from_rect) {
-            frame = vn_screen_rect_from_rect(win, CGRectMake(0.0, 0.0, 1.0, 1.0));
+            frame = vn_screen_rect_from_rect(clone_win, CGRectMake(0.0, 0.0, 1.0, 1.0));
         }
     }
 
     // Ensure clone is ordered on top so it animates cleanly above any underlying windows
-    if (is_clone && wid != 0) {
+    if (clone_wid != 0) {
         CGSOrderOp op = kVNOrderAbove;
         uint32_t rel = 0;
-        vn_orig_order(NULL, &wid, &op, &rel, 1, false);
+        vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
     }
 
     os_unfair_lock_lock(&gAnimsLock);
@@ -998,26 +871,23 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
     if (slot == -1) slot = 0;
 
     uint64_t anim_id = gNextAnimId++;
-    gActiveAnims[slot] = (VNWindowAnim){
-        .wid = wid,
+    gActiveAnims[slot] = (VNCloneAnim){
+        .clone_wid = clone_wid,
         .orig_wid = orig_wid,
-        .win = win,
-        .conn = conn,
+        .clone_win = clone_win,
         .anim_id = anim_id,
         .is_animating = true,
-        .probe_only = probe_only,
-        .is_clone = is_clone,
         .bounds = frame,
         .start_time = SLSCurrentRealTime(),
         .duration = (double)dur,
     };
     os_unfair_lock_unlock(&gAnimsLock);
 
-    double interval = vn_get_refresh_interval(win);
+    double interval = vn_get_refresh_interval(clone_win);
     double hz = interval > 0.0 ? (1.0 / interval) : 120.0;
 
-    VN_LOG("starting fade animation for target wid=%u (orig=%u) win=%p duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
-           wid, orig_wid, win, dur, interval * 1000.0, hz, anim_id);
+    VN_LOG("starting fade animation for clone wid=%u (orig=%u) win=%p duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
+           clone_wid, orig_wid, clone_win, dur, interval * 1000.0, hz, anim_id);
 
     if (vn_schedule_callback) {
         vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
@@ -1026,33 +896,23 @@ static void vn_start_window_animation(CGXConnection *conn, uint32_t wid, CGXWind
     }
 }
 
-static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win, CGXConnection *conn) {
+static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win) {
     CGXWindow *clone_to_release = NULL;
     uint32_t clone_wid = 0;
-    CGXWindow *orig_win = NULL;
-    CGXConnection *orig_conn = NULL;
-    CGRect orig_bounds = CGRectZero;
 
     os_unfair_lock_lock(&gAnimsLock);
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (gActiveAnims[i].is_animating &&
-            ((wid != 0 && (gActiveAnims[i].wid == wid || gActiveAnims[i].orig_wid == wid)) ||
-             (win != NULL && gActiveAnims[i].win == win))) {
+            ((wid != 0 && (gActiveAnims[i].clone_wid == wid || gActiveAnims[i].orig_wid == wid)) ||
+             (win != NULL && gActiveAnims[i].clone_win == win))) {
             
-            if (gActiveAnims[i].is_clone) {
-                clone_to_release = gActiveAnims[i].win;
-                clone_wid = gActiveAnims[i].wid;
-            } else {
-                orig_win = gActiveAnims[i].win;
-                orig_conn = gActiveAnims[i].conn ? gActiveAnims[i].conn : conn;
-                orig_bounds = gActiveAnims[i].bounds;
-            }
+            clone_to_release = gActiveAnims[i].clone_win;
+            clone_wid = gActiveAnims[i].clone_wid;
 
             gActiveAnims[i].is_animating = false;
-            gActiveAnims[i].wid = 0;
+            gActiveAnims[i].clone_wid = 0;
             gActiveAnims[i].orig_wid = 0;
-            gActiveAnims[i].win = NULL;
-            gActiveAnims[i].conn = NULL;
+            gActiveAnims[i].clone_win = NULL;
             break;
         }
     }
@@ -1074,9 +934,6 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
         } else if (vn_system_window_release) {
             vn_system_window_release(clone_to_release);
         }
-    } else if (orig_win && orig_conn) {
-        VN_LOG("Target window wid=%u ordered back in while animating; restored alpha", wid);
-        vn_clear_warp(orig_win, orig_conn, orig_bounds);
     }
 
     CGXWindow *clone = NULL;
@@ -1103,149 +960,13 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
     }
 }
 
-#pragma mark - Diagnostics & Trace
-
-/// Diagnostics trace mode:
-///   0  off (production default)
-///   1  observe stock window close events without applying animations
-///   2  animate and log internal compositor transitions
-#define VN_TRACE 0
-
-/// Runtime warp probe switch:
-/// When `/tmp/vanish_probe` is present, tests warp mesh rendering on window order-in
-/// while leaving standard close handling untouched.
-static bool vn_probe_mode(void) {
-    return access("/tmp/vanish_probe", F_OK) == 0;
-}
-
+#pragma mark - Hooks
 
 static uint64_t vn_now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000ull + (uint64_t)(tv.tv_usec / 1000);
 }
-
-/// Several of the traced functions never see a window, so they cannot be
-/// filtered by target. Instead the trace is armed when a target window is
-/// ordered out and logs everything for a short while after.
-static _Atomic(uint64_t) gTraceStartMs = 0;
-static _Atomic(uint64_t) gTraceWin = 0;   // the CGXWindow * being closed
-
-/// The closing window's content, learned from the first commit after arming, so
-/// its destruction can be called out by name rather than guessed at.
-static _Atomic(uint64_t) gTraceContent = 0;
-
-#define kVNTraceWindowMs 4000
-
-static void vn_trace_arm(CGXWindow *win) {
-    atomic_store_explicit(&gTraceWin, (uint64_t)(uintptr_t)win, memory_order_relaxed);
-    atomic_store_explicit(&gTraceContent, 0, memory_order_relaxed);
-    atomic_store_explicit(&gTraceStartMs, vn_now_ms(), memory_order_relaxed);
-}
-
-static bool vn_trace_armed(void) {
-    uint64_t start = atomic_load_explicit(&gTraceStartMs, memory_order_relaxed);
-    return start != 0 && (vn_now_ms() - start) < kVNTraceWindowMs;
-}
-
-/// Milliseconds since the close that armed the trace. Only meaningful while
-/// armed, which is the only time it is printed.
-static long vn_trace_ms(void) {
-    uint64_t start = atomic_load_explicit(&gTraceStartMs, memory_order_relaxed);
-    if (start == 0) return -1;
-    return (long)((int64_t)vn_now_ms() - (int64_t)start);
-}
-
-/// Only the window being closed is interesting. The last capture was 95% other
-/// windows being updated at display refresh rate, which buried the four lines
-/// that mattered.
-static bool vn_trace_win(CGXWindow *win) {
-    if (!vn_trace_armed()) return false;
-    if (win == NULL) return true;   // context-free hooks: log for the whole window
-    return (uint64_t)(uintptr_t)win == atomic_load_explicit(&gTraceWin, memory_order_relaxed);
-}
-
-static VNUpdateCAVisibilityFn      vn_orig_update_ca_visibility;
-static VNFadeBeginFn               vn_orig_fade_begin;
-static VNFadeFinishFn              vn_orig_fade_finish;
-static VNCommitContextVisibilityFn vn_orig_commit_ctx_visibility;
-static VNStartOrderWindowFn        vn_orig_start_order_window;
-static VNUpdateAlphasFn            vn_orig_update_alphas;
-static VNCAWindowContentDtorFn     vn_orig_ca_content_dtor;
-
-static int vn_t_update_alphas(CGXWindow *win, CGXConnection *conn, bool flag,
-                              float a0, float a1, float a2) {
-    int mask = vn_orig_update_alphas(win, conn, flag, a0, a1, a2);
-    if (vn_trace_win(win)) {
-        // The mask must be returned, not swallowed: set_window_alphas compares
-        // it against 4 to decide whether to commit the change to the screen.
-        VN_LOG("  +%4ldms  update_alphas(win=%p, %.3f/%.3f/%.3f) -> mask=0x%x",
-               vn_trace_ms(), win, (double)a0, (double)a1, (double)a2, mask);
-    }
-    return mask;
-}
-
-static void vn_t_ca_content_dtor(void *content) {
-    if (vn_trace_armed()) {
-        bool mine = ((uint64_t)(uintptr_t)content ==
-                     atomic_load_explicit(&gTraceContent, memory_order_relaxed));
-        VN_LOG("  +%4ldms  ~CAWindowContent(content=%p)%s",
-               vn_trace_ms(), content, mine ? "   <<<< THE CLOSING WINDOW'S CONTENT" : "");
-    }
-    vn_orig_ca_content_dtor(content);
-}
-
-static void vn_t_update_ca_visibility(CGXWindow *win, bool visible) {
-    if (vn_trace_win(win)) {
-        VN_LOG("  +%4ldms  update_ca_visibility(win=%p, visible=%d) alpha=%.3f",
-               vn_trace_ms(), win, (int)visible, vn_window_alpha(win));
-    }
-    vn_orig_update_ca_visibility(win, visible);
-}
-
-static void vn_t_set_window_alphas(CGXConnection *conn, CGXWindow *win, float alpha) {
-    if (vn_trace_win(win)) {
-        VN_LOG("  +%4ldms  set_window_alphas(win=%p, alpha=%.3f)", vn_trace_ms(), win, (double)alpha);
-    }
-    vn_orig_set_window_alphas(conn, win, alpha);
-}
-
-static void vn_t_fade_begin(CGXWindow *win, void (^done)(CGXWindow *, bool),
-                            float alpha, float dur) {
-    if (vn_trace_win(win)) {
-        VN_LOG("  +%4ldms  fade_begin(win=%p, alpha=%.3f, dur=%.3f, block=%p)",
-               vn_trace_ms(), win, (double)alpha, (double)dur, (__bridge void *)done);
-    }
-    vn_orig_fade_begin(win, done, alpha, dur);
-}
-
-static void vn_t_fade_finish(CGXWindow *win, CGXConnection *conn) {
-    if (vn_trace_win(win)) {
-        VN_LOG("  +%4ldms  fade_finish(win=%p) alpha=%.3f", vn_trace_ms(), win, vn_window_alpha(win));
-    }
-    vn_orig_fade_finish(win, conn);
-}
-
-static void vn_t_commit_ctx_visibility(void *content) {
-    if (vn_trace_armed()) {
-        uint64_t expected = 0;
-        bool first = atomic_compare_exchange_strong_explicit(
-            &gTraceContent, &expected, (uint64_t)(uintptr_t)content,
-            memory_order_relaxed, memory_order_relaxed);
-        VN_LOG("  +%4ldms  commit_context_visibility(content=%p)%s",
-               vn_trace_ms(), content, first ? "   <-- assuming this is the closing window's" : "");
-    }
-    vn_orig_commit_ctx_visibility(content);
-}
-
-static void vn_t_start_order_window(CGXConnection *conn, void *state) {
-    if (vn_trace_armed()) {
-        VN_LOG("  +%4ldms  start_order_window(state=%p)", vn_trace_ms(), state);
-    }
-    vn_orig_start_order_window(conn, state);
-}
-
-#pragma mark - Hooks
 
 static _Atomic(uint64_t) gNonCloseTimeMs = 0;
 static _Atomic(uint32_t) gNonCloseWid = 0;
@@ -1262,21 +983,19 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (!gActiveAnims[i].is_animating) continue;
 
-        bool match_self = (gActiveAnims[i].win == win) || (rel_wid != 0 && gActiveAnims[i].wid == rel_wid);
-        bool match_orig = (!gActiveAnims[i].is_clone) && (rel_wid != 0 && gActiveAnims[i].orig_wid == rel_wid);
+        bool match_self = (gActiveAnims[i].clone_win == win) || (rel_wid != 0 && gActiveAnims[i].clone_wid == rel_wid);
 
-        if (match_self || match_orig) {
-            VN_LOG("release_window arrived for animating window wid=%u (orig=%u) win=%p; removing from animation table",
-                   gActiveAnims[i].wid, gActiveAnims[i].orig_wid, win);
+        if (match_self) {
+            VN_LOG("release_window arrived for animating clone wid=%u win=%p; removing from animation table",
+                   gActiveAnims[i].clone_wid, win);
             gActiveAnims[i].is_animating = false;
-            gActiveAnims[i].wid = 0;
+            gActiveAnims[i].clone_wid = 0;
             gActiveAnims[i].orig_wid = 0;
-            gActiveAnims[i].win = NULL;
-            gActiveAnims[i].conn = NULL;
+            gActiveAnims[i].clone_win = NULL;
             break;
-        } else if (gActiveAnims[i].is_clone && rel_wid != 0 && gActiveAnims[i].orig_wid == rel_wid) {
+        } else if (rel_wid != 0 && gActiveAnims[i].orig_wid == rel_wid) {
             VN_LOG("release_window arrived for orig_wid=%u while clone wid=%u is animating (normal AppKit teardown); clone continues",
-                   rel_wid, gActiveAnims[i].wid);
+                   rel_wid, gActiveAnims[i].clone_wid);
             gActiveAnims[i].orig_wid = 0;
             break;
         }
@@ -1295,7 +1014,6 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     // active animation here if release arrives first, and subsequent duplicate
     // order-out calls are safely dropped.
     CGXWindow     *clone_to_animate = NULL;
-    CGXConnection *clone_conn = NULL;
     uint32_t clone_wid = 0, orig_wid = 0;
     CGRect clone_frame = CGRectZero;
 
@@ -1304,7 +1022,6 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
         // The clone itself is being released -- simply zero out without calling vn_system_window_release
         vn_preclone_take_locked(NULL, NULL, NULL);
     } else if (gPreClone.orig_wid != 0 && vn_window_by_id && vn_window_by_id(gPreClone.orig_wid) == win) {
-        clone_conn = gPreClone.conn;
         clone_to_animate = vn_preclone_take_locked(&clone_wid, &orig_wid, &clone_frame);
     }
     os_unfair_lock_unlock(&gPreCloneLock);
@@ -1315,10 +1032,10 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
 
     // After the release, not before: the original has to be off the screen for the
     // clone sitting underneath it to be the thing the user sees warp.
-    if (clone_to_animate && clone_wid != 0) {
+    if (clone_to_animate) {
         VN_LOG(">>> Close seen at release_window for wid=%u -- animating pre-clone wid=%u",
                orig_wid, clone_wid);
-        vn_start_window_animation(clone_conn, clone_wid, clone_to_animate, orig_wid, clone_frame, false, true);
+        vn_start_clone_animation(clone_to_animate, orig_wid, clone_frame);
     }
 }
 
@@ -1440,7 +1157,6 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                         gPreClone.orig_wid = wid;
                         gPreClone.clone_wid = clone_wid;
                         gPreClone.clone = clone;
-                        gPreClone.conn = conn;
                         gPreClone.frame = clone_frame;
                         gPreClone.created_at = SLSCurrentRealTime();
                         gPreClone.mouseDownScreenPt = *screen_pt;
@@ -1549,26 +1265,12 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
             uint32_t wid = wids ? wids[0] : 0;
             CGXWindow *win = vn_window_by_id(wid);
             if (win && vn_is_target_window(win)) {
+                char app[256] = {0};
+                pid_t pid = 0;
+                vn_get_window_app_name(win, app, sizeof(app), &pid);
+
                 if (ops[0] == kVNOrderOut) {
-#if VN_TRACE == 1
-                    // Stock close: pass through, change nothing.
-                    vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-                    return;
-#endif
                     bool animating = vn_is_window_animating(wid, win);
-                    bool probe = vn_probe_mode();
-
-                    char app[256] = {0};
-                    pid_t pid = 0;
-                    vn_get_window_app_name(win, app, sizeof(app), &pid);
-                    VN_LOG("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d",
-                           app, pid, wid, ops[0], vn_window_level(win));
-
-                    if (probe) {
-                        VN_LOG("probe mode: leaving the close alone for wid=%u", wid);
-                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-                        return;
-                    }
                     if (animating) {
                         VN_LOG("Window wid=%u (%p, app: '%s') already animating; dropping duplicate order-out",
                                wid, win, app);
@@ -1605,49 +1307,20 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         return;
                     }
 
-                    if (clone && clone_wid != 0) {
-#if VN_TRACE
-                        vn_trace_arm(win);
-                        VN_LOG("=== CLOSE wid=%u (%p, '%s') alpha=%.3f lvl=%d mode=%d ===",
-                               wid, win, app, vn_window_alpha(win), vn_window_level(win), VN_TRACE);
-#endif
-                        VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s')", wid, win, app);
+                    VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s')", wid, win, app);
 
-                        // Order out the original window immediately (reveals the pre-clone right behind it)
-                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
+                    // Order out the original window immediately (reveals the pre-clone right behind it)
+                    vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
 
-                        // Start shrink/warp animation on the clone, passing wid as orig_wid to block duplicates!
-                        vn_start_window_animation(conn, clone_wid, clone, wid, clone_frame, false, true);
-                    } else {
-                        VN_LOG("no clone for wid=%u -- closing without an animation", wid);
-                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-                    }
+                    // Start shrink/warp animation on the clone, passing wid as orig_wid to block duplicates!
+                    vn_start_clone_animation(clone, wid, clone_frame);
                     return;
                 } else {
-                    char app[256] = {0};
-                    pid_t pid = 0;
-                    vn_get_window_app_name(win, app, sizeof(app), &pid);
                     VN_LOG("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d",
                            app, pid, wid, ops[0], vn_window_level(win));
 
-                    if (vn_probe_mode() && ops[0] == kVNOrderAbove &&
-                        !vn_is_window_animating(wid, win)) {
-                        vn_trace_arm(win);
-                        VN_LOG(">>> PROBE: cloning wid=%u (%p, '%s') on order-in; "
-                               "no animation, nothing destroyed, close path untouched",
-                               wid, win, app);
-                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-
-                        uint32_t clone_wid = 0;
-                        CGRect clone_frame = CGRectZero;
-                        CGXWindow *clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderAbove);
-                        VN_LOG(">>> PROBE result: %s",
-                               clone ? "clone created -- look for a duplicate window on top"
-                                     : "no clone; see the lines above for which step failed");
-                        return;
-                    }
                     // Window being ordered in: cancel animation if active
-                    vn_cancel_window_animation_if_ordering_in(wid, win, conn);
+                    vn_cancel_window_animation_if_ordering_in(wid, win);
                 }
             }
 
@@ -1715,7 +1388,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
 
                     if (clone && clone_wid != 0) {
                         VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s')", wid, win, app);
-                        vn_start_window_animation(conn, clone_wid, clone, wid, clone_frame, false, true);
+                        vn_start_clone_animation(clone, wid, clone_frame);
                     }
                     pass_wids[pass_count] = wid;
                     pass_ops[pass_count] = ops[i];
@@ -1723,7 +1396,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     pass_count++;
                     continue;
                 } else {
-                    vn_cancel_window_animation_if_ordering_in(wid, win, conn);
+                    vn_cancel_window_animation_if_ordering_in(wid, win);
                 }
             }
 
@@ -1751,7 +1424,6 @@ __attribute__((constructor))
 static void vanish_init(void) {
     char self[1024] = {0};
     uint32_t len = (uint32_t)sizeof(self);
-    extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
     if (_NSGetExecutablePath(self, &len) != 0) return;
     if (strstr(self, "WindowServer") == NULL) {
         VN_LOG("not WindowServer (%{public}s) -- doing nothing", self);
@@ -1809,29 +1481,6 @@ static void vanish_init(void) {
         CFNotificationSuspensionBehaviorDeliverImmediately);
     VN_LOG("Registered Darwin notification observer for com.doraorak.vanish/prefsChanged");
 
-#if VN_TRACE
-    // Best effort: a symbol that has moved should cost that one line of trace,
-    // not the whole build.
-    struct { const char *name; void *replace; void **orig; } traces[] = {
-        { kVNSymUpdateCAVisibility,      (void *)vn_t_update_ca_visibility, (void **)&vn_orig_update_ca_visibility },
-        { kVNSymSetWindowAlphas,         (void *)vn_t_set_window_alphas,    (void **)&vn_orig_set_window_alphas },
-        { kVNSymFadeBegin,               (void *)vn_t_fade_begin,           (void **)&vn_orig_fade_begin },
-        { kVNSymFadeFinish,              (void *)vn_t_fade_finish,          (void **)&vn_orig_fade_finish },
-        { kVNSymCommitContextVisibility, (void *)vn_t_commit_ctx_visibility,(void **)&vn_orig_commit_ctx_visibility },
-        { kVNSymStartOrderWindow,        (void *)vn_t_start_order_window,   (void **)&vn_orig_start_order_window },
-        { kVNSymUpdateAlphas,            (void *)vn_t_update_alphas,        (void **)&vn_orig_update_alphas },
-        { kVNSymCAWindowContentDtor,     (void *)vn_t_ca_content_dtor,      (void **)&vn_orig_ca_content_dtor },
-    };
-    for (size_t i = 0; i < sizeof(traces) / sizeof(traces[0]); i++) {
-        void *sym = vn_skylight_symbol(traces[i].name);
-        if (!sym) { VN_LOG("trace: UNRESOLVED %s", traces[i].name); continue; }
-        MSHookFunction(ptrauth_strip(sym, ptrauth_key_function_pointer),
-                       traces[i].replace, traces[i].orig);
-        if (!*traces[i].orig) VN_LOG("trace: no trampoline for %s", traces[i].name);
-    }
-    VN_LOG("Vanish loaded in TRACE mode %d (1=stock close, 2=animate+trace)", VN_TRACE);
-#else
     VN_LOG("Vanish loaded successfully! Target window close hook active (duration: %.2fs)", (double)vn_duration());
-#endif
 }
 

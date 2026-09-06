@@ -142,75 +142,18 @@ typedef int (*VNGetConnectionAppNameFn)(uint32_t, char *, size_t);
 typedef void (*VNUpdateCAVisibilityFn)(CGXWindow *, bool);
 
 
-#pragma mark - Trace targets
-
-//  Every signature below was read off a real call site, not off a demangled
-//  name. That distinction has already cost one session: CGXWindow::fade_begin
-//  demangles with a CGXConnection* it does not actually take.
+#pragma mark - Server-Internal Operations
 
 /// void CGXWindow::update_ca_visibility(CGXWindow *self, bool visible)
-/// x0 = this, x1 = the flag. Verified: it dereferences x0 at +0x10/+0x18/+0x960.
-/// The compositor's own show/hide, independent of alpha -- prime suspect for a
-/// window vanishing while its alpha is still animating.
 #define kVNSymUpdateCAVisibility "__ZN9CGXWindow20update_ca_visibilityEb"
 
-/// void set_window_alphas(CGXConnection *, CGXWindow *, float)
-/// The alpha that actually reaches CoreAnimation. `CGXSetWindowListAlpha`
-/// tail-calls it on the zero-duration path with x0=conn, x1=win, s0=alpha.
-#define kVNSymSetWindowAlphas "__ZL17set_window_alphasP13CGXConnectionP9CGXWindowf"
-
-/// void CGXWindow::fade_begin(CGXWindow *self, void (^)(CGXWindow *, bool),
-///                            float alpha, float duration)
-#define kVNSymFadeBegin \
-    "__ZN9CGXWindow10fade_beginEP13CGXConnectionffU13block_pointerFvPS_bE"
-
-/// void CGXWindow::fade_finish(CGXWindow *self, CGXConnection *)
-#define kVNSymFadeFinish "__ZN9CGXWindow11fade_finishEP13CGXConnection"
-
-/// void WS::CAWindowContent::commit_context_visibility(WS::CAWindowContent *self)
-/// Reads bit 5 of the halfword at +0x840 and pushes it into CoreAnimation.
-#define kVNSymCommitContextVisibility "__ZN2WS15CAWindowContent25commit_context_visibilityEv"
-
-/// void start_order_window(CGXConnection *, CGXOrderWindowState *)
-#define kVNSymStartOrderWindow "__ZL18start_order_windowP13CGXConnectionP19CGXOrderWindowState"
-
-/// Where alpha actually reaches CoreAnimation. `set_window_alphas` reads two
-/// more alpha channels off the window (+0x1ec, +0x1f0) and calls this with all
-/// three, so a window has three alphas, not one.
-///
-///     x0 = this, x1 = conn, w2 = bool, s0/s1/s2 = the three alphas
-#define kVNSymUpdateAlphas "__ZN9CGXWindow13update_alphasEP13CGXConnectionfffb"
-
-/// void WS::CAWindowContent::~CAWindowContent(WS::CAWindowContent *self)
-/// If the window's drawable content is destroyed while the fade is running,
-/// there is nothing left to composite and no alpha can save it.
-#define kVNSymCAWindowContentDtor "__ZN2WS15CAWindowContentD1Ev"
-
-/// The alpha most recently *requested*, as opposed to the one being animated.
-/// `CGXSetWindowListAlpha` writes the target here immediately, before the fade
-/// has run at all.
-#define kVNWindowRequestedAlphaOffset 0x1f4
-
-static inline float vn_window_requested_alpha(const CGXWindow *win) {
-    float a;
-    __builtin_memcpy(&a, (const char *)win + kVNWindowRequestedAlphaOffset, sizeof(a));
-    return a;
-}
-
 /// Runs a callback from the server's timer pass, on the main thread.
-///
 ///     void WSScheduleCallbackOnCurrentSession(void (*cb)(void *ctx, double t),
 ///                                             void *ctx, double fireTime)
-///
-/// `fireTime` is absolute -- `SLSCurrentRealTime()` plus a delay. Read off its
-/// body: it shuffles x0/x1 into x1/x2, fills in `gMainThreadQueue`, the current
-/// session and two zero flags, and tail-calls `reschedule_callback_on_session`.
 #define kVNSymScheduleCallback "_WSScheduleCallbackOnCurrentSession"
 
 typedef void (*VNScheduleCallbackFn)(void (*)(void *, double), void *, double);
-/// Returns a change mask, and the caller acts on it: `set_window_alphas` does
-/// `cmp w0, #4` and only then calls into the CAManager that commits the change
-/// to the screen. A hook that declares this void silently throws that away.
+
 #pragma mark - Drawing a window differently
 
 //  Alpha is a dead end on an ordinary window. `update_alphas` gates every real
@@ -328,31 +271,6 @@ typedef void (*VNClearShadowDensityFn)(CGXWindow *);
 typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);
 typedef void (*VNWSWindowReleaseShadowResourcesFn)(CGXWindow *);
 typedef CGError (*VNSLSSetWindowShadowParametersFn)(uint32_t cid, uint32_t wid, float density, float radius, float xOffset, float yOffset);
-
-typedef int (*VNUpdateAlphasFn)(CGXWindow *, CGXConnection *, bool, float, float, float);
-typedef void (*VNCAWindowContentDtorFn)(void *);
-
-//  CGXScheduleUpdateDisplaysIntersectingWindow takes TWO arguments and the
-//  window is the SECOND one. Calling it as f(win) crashed the server:
-//
-//      CGXWindow::intersecting_displays() + 108   SIGSEGV at 0xac   (x1 = 0)
-//      CGXScheduleUpdateDisplaysIntersectingWindow + 48
-//      vn_apply_alpha
-//
-//  It does `mov x19, x0`, then `mov x0, sp` for the out-vector, and calls
-//  `intersecting_displays` WITHOUT setting x1 -- so x1 arrives straight from
-//  its own caller, and `intersecting_displays` reads it (`mov x20, x1` at its
-//  +64) as the CGXWindow. x0 is something else entirely, forwarded to
-//  `CGXScheduleUpdateDisplay`.
-//
-//  Not declared until a real call site is read. Inferring an arity from a name
-//  is what this file already warns about twice.
-typedef void (*VNUpdateCAVisibilityFn)(CGXWindow *, bool);
-typedef void (*VNSetWindowAlphasFn)(CGXConnection *, CGXWindow *, float);
-typedef void (*VNFadeBeginFn)(CGXWindow *, void (^)(CGXWindow *, bool), float, float);
-typedef void (*VNFadeFinishFn)(CGXWindow *, CGXConnection *);
-typedef void (*VNCommitContextVisibilityFn)(void *);
-typedef void (*VNStartOrderWindowFn)(CGXConnection *, void *);
 typedef void (*VNPostEventByConnectionFn)(CGXConnection *, void *);
 
 #endif /* SkyLightServer_h */
