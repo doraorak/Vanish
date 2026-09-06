@@ -1,3 +1,7 @@
+# Video
+
+https://github.com/user-attachments/assets/cf8e6938-5a9d-41a1-a600-24e61c895216
+
 # Vanish
 
 Smooth window close animations for macOS on Apple Silicon.
