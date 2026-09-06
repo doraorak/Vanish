@@ -68,8 +68,6 @@ static void vn_log_to_file(const char *fmt, ...) {
         body_len++;
     }
 
-    // Milliseconds matter: the behaviour being chased happens inside the first
-    // 100-300 ms of a close, which second resolution cannot show at all.
     struct timeval tv;
     gettimeofday(&tv, NULL);
     struct tm tm_buf;
@@ -168,12 +166,15 @@ static VNWSWindowReleaseShadowResourcesFn vn_window_release_shadow_resources;
 static VNSLSSetWindowShadowParametersFn   vn_set_window_shadow_parameters;
 static VNIsProcessEligibleForSetFrontFn    vn_orig_is_process_eligible;
 
+typedef bool (*VNDynWindowIsOrderedInFn)(const CGXWindow *win);
+static VNDynWindowIsOrderedInFn     vn_dyn_window_is_ordered_in = NULL;
+
 #pragma mark - Preferences
 
 typedef struct {
     bool  enabled;
     bool  shadows;
-    float refreshRate; // in Hz: e.g. 10.0 .. 120.0 (default 120.0)
+    float refreshRate;
     float duration;
     char  targetApp[256];
 } VNPreferences;
@@ -190,7 +191,6 @@ static void vn_reload_prefs_locked(void) {
     gPrefs.duration = 0.25f;
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
 
-    // 1. Read from /Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist
     const char *path = "/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist";
     struct stat st;
     if (stat(path, &st) == 0) {
@@ -293,7 +293,6 @@ static void vn_prefs_changed_callback(CFNotificationCenterRef center, void *obse
     os_unfair_lock_unlock(&gPrefsLock);
 }
 
-/// Animation duration in seconds.
 static float vn_duration(void) {
     VNPreferences prefs = vn_get_prefs();
     return prefs.duration;
@@ -301,9 +300,6 @@ static float vn_duration(void) {
 
 #pragma mark - Window Eligibility Filtering
 
-/// Safely retrieves the application name for `win`.
-/// Inside WindowServer, CGXGetConnectionAppName reads from the server's internal
-/// connection table (ProcessRecord), bypassing kernel proc_pidinfo EPERM restrictions.
 static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen, pid_t *out_pid) {
     if (!win || !out_name || maxlen == 0) return false;
     out_name[0] = '\0';
@@ -317,9 +313,6 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
     }
     if (out_pid) *out_pid = pid;
 
-    // 1. In WindowServer, connection ID is at win + 0x50.
-    // CGXGetConnectionAppName queries WindowServer's internal table (ProcessRecord),
-    // which works across all UIDs without kernel EPERM issues!
     if (vn_get_connection_app_name) {
         uint32_t cid = *(const uint32_t *)((const char *)win + 0x50);
         if (cid != 0) {
@@ -331,7 +324,6 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
         }
     }
 
-    // 2. Fallbacks using pid: proc_pidpath, proc_name
     if (pid > 0) {
         char path[1024] = {0};
         if (proc_pidpath(pid, path, sizeof(path)) > 0) {
@@ -349,7 +341,6 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
     return false;
 }
 
-/// Returns true if `win` is eligible for window close animation.
 static bool vn_is_target_window(CGXWindow *win) {
     if (!win) return false;
 
@@ -360,7 +351,6 @@ static bool vn_is_target_window(CGXWindow *win) {
     pid_t pid = 0;
     bool has_name = vn_get_window_app_name(win, name, sizeof(name), &pid);
 
-    // 1. If targetApp is "all" or empty (default), match all regular application windows
     if (prefs.targetApp[0] == '\0' || strcasecmp(prefs.targetApp, "all") == 0) {
         if (has_name) {
             if (strcasecmp(name, "WindowServer") == 0 ||
@@ -375,9 +365,6 @@ static bool vn_is_target_window(CGXWindow *win) {
                 return false;
             }
 
-            // Exclude Finder Get Info inspector panels (fixed width 400pt).
-            // Regular Finder folder browsing windows have min-width 510pt.
-            // This preserves Finder's native desktop icon-zoom close transition!
             if (strcasecmp(name, "Finder") == 0) {
                 CGRect content = vn_screen_rect ? vn_screen_rect(win) : CGRectZero;
                 if (content.size.width < 1.0 && vn_clipped_frame_bounds) {
@@ -388,7 +375,6 @@ static bool vn_is_target_window(CGXWindow *win) {
                 }
             }
         }
-        // Exclude system/special window levels (e.g. desktop level -2147483628, menu level 24, status level 25)
         int32_t lvl = vn_window_level(win);
         if (lvl != 0 && lvl != 3) {
             return false;
@@ -396,19 +382,14 @@ static bool vn_is_target_window(CGXWindow *win) {
         return true;
     }
 
-    // 2. Match standalone test harness if running
     if (has_name && strcasecmp(name, "VanishTest") == 0) return true;
-
-    // 3. Match specific configured application name or PID (if targetApp filter is set)
     if (has_name && strcasecmp(name, prefs.targetApp) == 0) return true;
 
-    // 4. Match specific PID if targetApp is numeric
     pid_t target_pid = (pid_t)atoi(prefs.targetApp);
     if (target_pid > 0 && pid == target_pid) return true;
 
     return false;
 }
-
 
 static uint64_t vn_now_ms(void) {
     struct timeval tv;
@@ -420,13 +401,13 @@ static uint64_t vn_now_ms(void) {
 
 typedef struct {
     uint64_t       anim_id;
-    uint32_t       orig_wid;        // Original application window ID being closed
-    uint32_t       clone_wid;       // Server-owned clone window ID
-    CGXWindow     *clone_win;       // Pointer to clone window instance
-    CGRect         bounds;          // Sampled frame geometry
-    double         start_time;      // SLSCurrentRealTime() when the animation began
-    double         duration;        // Configured duration in seconds
-    bool           is_animating;    // Active slot indicator
+    uint32_t       orig_wid;
+    uint32_t       clone_wid;
+    CGXWindow     *clone_win;
+    CGRect         bounds;
+    double         start_time;
+    double         duration;
+    bool           is_animating;
     pid_t          pid;
     uint64_t       psn;
     bool           is_whatsapp;
@@ -565,12 +546,6 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
 
 #pragma mark - Window Pre-Cloning & Surface Capture
 
-/// Pre-cloning captures the window backing store at mouse-down time on the close button,
-/// well before the client application receives mouse-up or executes window teardown.
-/// At mouse-down (t=0), the window is fully opaque, rendered, and undamaged.
-/// Creating and ordering the clone above the window gives the compositor ~100ms
-/// (physical click duration) to composite the clone. When the real close order arrives,
-/// the clone is already composited on screen, eliminating any 1-frame gaps or flashes.
 #define MAX_PRECLONES 32
 
 typedef struct {
@@ -603,12 +578,9 @@ static int vn_preclone_find_empty_slot_locked(void) {
     for (int i = 0; i < MAX_PRECLONES; i++) {
         if (gPreClones[i].orig_wid == 0) return i;
     }
-    return 0; // Overwrite slot 0 if table is saturated
+    return 0;
 }
 
-// Clears pre-clone for orig_wid under lock and returns the clone pointer to release/animate.
-// MUST be called with gPreCloneLock held.
-// NEVER calls any external or system functions.
 static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone_wid, CGRect *out_frame,
                                           pid_t *out_pid, uint64_t *out_psn, bool *out_is_wa, char *out_app, size_t app_len) {
     int idx = vn_preclone_find_slot_locked(orig_wid);
@@ -627,8 +599,6 @@ static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone
     return clone;
 }
 
-// Discards a specific window's pre-clone safely: extracts clone under lock, unlocks,
-// suppresses CA visibility, orders out the clone, and releases it.
 static void vn_preclone_discard_wid(uint32_t orig_wid) {
     if (orig_wid == 0) return;
     uint32_t clone_wid = 0;
@@ -665,12 +635,10 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 
         bool expired = false;
         if (gPreClones[i].mouseUpTime > 0.0) {
-            // Mouse was released: if AppKit/SwiftUI didn't close the window within 1.0s, clean up
             if ((now - gPreClones[i].mouseUpTime) >= 1.0) {
                 expired = true;
             }
         } else {
-            // Mouse is still held down: do not time out unless held for an extreme failsafe duration (30s)
             if ((now - gPreClones[i].created_at) >= 30.0) {
                 expired = true;
             }
@@ -705,11 +673,6 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 
 #pragma mark - Window Surface Cloning
 
-/// Creates an independent clone of `win` and orders it `place` relative to the original.
-///
-/// Because the clone is an internal window managed directly by WindowServer,
-/// transforms and warp meshes can be applied to it freely even after the client
-/// application orders out or releases its own window resources.
 static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
                                    uint32_t orig_wid, uint32_t *out_wid,
                                    CGRect *out_frame,
@@ -725,10 +688,6 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     const void *display = vn_window_get_display(win);
     if (!display) { VN_LOG("snapshot: no display for wid=%u", orig_wid); return NULL; }
 
-    // vn_clipped_frame_bounds(win) returns the window frame INCLUDING the full drop shadow
-    // in screen coordinates (e.g. bounds starts 56pt to the left and 38pt above the window content).
-    // It is ALREADY in screen coordinates. Do NOT add probe.origin or pass through screen_rect_from_rect,
-    // which would double the screen origin offset and push the clone hundreds of pixels into the middle of the app!
     CGRect bounds = vn_clipped_frame_bounds ? vn_clipped_frame_bounds(win) : CGRectZero;
     CGRect content = CGRectZero;
     if (vn_screen_rect) {
@@ -791,9 +750,6 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
 
 #pragma mark - Animations
 
-/// Mesh resolution. 2x2 would do for a plain scale, but the grid is the whole
-/// point: anything that can move a vertex can be drawn here, so start with
-/// enough vertices to bend.
 #define kVNMeshW 5
 #define kVNMeshH 5
 #define kVNMeshCount (kVNMeshW * kVNMeshH)
@@ -838,7 +794,7 @@ static double vn_get_display_refresh_interval(CGXWindow *win) {
         }
     }
 
-    return (1.0 / 120.0); // High-refresh ProMotion default (8.33ms)
+    return (1.0 / 120.0);
 }
 
 static double vn_get_refresh_interval(CGXWindow *win) {
@@ -849,15 +805,9 @@ static double vn_get_refresh_interval(CGXWindow *win) {
     return vn_get_display_refresh_interval(win);
 }
 
-/// Fills the mesh for one frame.
-///
-/// `t` runs 0 -> 1. `bounds` is the window's frame in screen coordinates. The
-/// local coordinates stay put -- they say which part of the window a vertex is
-/// -- and only the global ones move. Every future animation is a new function
-/// of exactly this shape.
 static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
     double s  = 1.0 - t;
-    if (s < 0.005) s = 0.005;  // Keep non-zero positive area to avoid GPU shader singularity
+    if (s < 0.005) s = 0.005;
     double cx = bounds.origin.x + bounds.size.width  * 0.5;
     double cy = bounds.origin.y + bounds.size.height * 0.5;
 
@@ -877,14 +827,6 @@ static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
     }
 }
 
-static void vn_finish_animation_for_id(uint64_t anim_id);
-/// Draws one frame of every running animation, from the server's timer pass.
-///
-/// The order-out is issued from here rather than from any completion callback:
-/// `start_order_window` force-finishes pending fades, so a completion runs
-/// *inside* the ordering machinery, and re-entering it from there corrupts the
-/// window list. The timer pass is a context the server itself orders windows
-/// from.
 static void vn_anim_tick(void *ctx, double when) {
     (void)ctx; (void)when;
 
@@ -921,12 +863,10 @@ static void vn_anim_tick(void *ctx, double when) {
     }
     os_unfair_lock_unlock(&gAnimsLock);
 
-    // 1. Finish any completed animations outside the lock
     for (int i = 0; i < finished_count; i++) {
         vn_finish_animation_for_id(finished[i]);
     }
 
-    // 2. Render warp mesh updates for all animating windows outside the lock
     for (int i = 0; i < snapshot_count; i++) {
         if (vn_set_mesh_warp && snapshots[i].clone_win) {
             VNPointWarp mesh[kVNMeshCount];
@@ -935,7 +875,6 @@ static void vn_anim_tick(void *ctx, double when) {
         }
     }
 
-    // 3. Reschedule single timer chain if more frames remain
     if (more && vn_schedule_callback) {
         double interval = vn_get_refresh_interval(first_active_win);
         vn_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
@@ -987,8 +926,6 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     uint64_t anim_id = 0;
 
     os_unfair_lock_lock(&gAnimsLock);
-    // Find the most recently registered animating clone so subsequent closes
-    // stack neatly UNDERNEATH ongoing animations (smooth matrushka nesting)
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_wid != 0 && gActiveAnims[i].clone_wid != clone_wid) {
             if (gActiveAnims[i].anim_id > max_anim_id) {
@@ -998,7 +935,6 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         }
     }
 
-    // Allocate animation slot under the same lock to avoid race conditions
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (!gActiveAnims[i].is_animating) {
             slot = i;
@@ -1026,9 +962,6 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     }
     os_unfair_lock_unlock(&gAnimsLock);
 
-    // Order the clone in WindowServer:
-    // If other clones are animating, order below the lowest one (matrushka nesting).
-    // If none are animating, order above to ensure clean visibility over background.
     if (clone_wid != 0) {
         CGSOrderOp op = lowest_clone_wid != 0 ? kVNOrderBelow : kVNOrderAbove;
         uint32_t rel = lowest_clone_wid;
@@ -1056,7 +989,131 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     }
 }
 
-static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win, pid_t pid) {
+#pragma mark - Window Visibility & Process Window Counting
+
+#define MAX_TRACKED_WINDOWS 512
+
+typedef struct {
+    uint32_t wid;
+    pid_t    pid;
+    bool     is_ordered_in;
+} VNTrackedWindow;
+
+static VNTrackedWindow gTrackedWindows[MAX_TRACKED_WINDOWS] = {0};
+static os_unfair_lock  gTrackedLock = OS_UNFAIR_LOCK_INIT;
+
+static bool vn_is_clone_wid(uint32_t wid, CGXWindow *win) {
+    if (wid == 0 && win == NULL) return false;
+
+    os_unfair_lock_lock(&gAnimsLock);
+    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
+        if (gActiveAnims[i].is_animating) {
+            if ((wid != 0 && gActiveAnims[i].clone_wid == wid) ||
+                (win != NULL && gActiveAnims[i].clone_win == win)) {
+                os_unfair_lock_unlock(&gAnimsLock);
+                return true;
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gAnimsLock);
+
+    os_unfair_lock_lock(&gPreCloneLock);
+    for (int i = 0; i < MAX_PRECLONES; i++) {
+        if (gPreClones[i].orig_wid != 0) {
+            if ((wid != 0 && gPreClones[i].clone_wid == wid) ||
+                (win != NULL && gPreClones[i].clone == win)) {
+                os_unfair_lock_unlock(&gPreCloneLock);
+                return true;
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gPreCloneLock);
+
+    return false;
+}
+
+static bool vn_check_window_is_ordered_in(uint32_t wid, CGXWindow *win) {
+    if (vn_dyn_window_is_ordered_in && win) {
+        return vn_dyn_window_is_ordered_in(win);
+    }
+
+    if (wid == 0) return false;
+    os_unfair_lock_lock(&gTrackedLock);
+    for (int i = 0; i < MAX_TRACKED_WINDOWS; i++) {
+        if (gTrackedWindows[i].wid == wid) {
+            bool state = gTrackedWindows[i].is_ordered_in;
+            os_unfair_lock_unlock(&gTrackedLock);
+            return state;
+        }
+    }
+    os_unfair_lock_unlock(&gTrackedLock);
+    return false;
+}
+
+static void vn_track_window_order(uint32_t wid, pid_t pid, CGSOrderOp op, CGXWindow *win) {
+    if (wid == 0 || pid == 0 || vn_is_clone_wid(wid, win)) return;
+
+    os_unfair_lock_lock(&gTrackedLock);
+    int empty_slot = -1;
+    int found_slot = -1;
+
+    for (int i = 0; i < MAX_TRACKED_WINDOWS; i++) {
+        if (gTrackedWindows[i].wid == wid) {
+            found_slot = i;
+            break;
+        }
+        if (empty_slot == -1 && gTrackedWindows[i].wid == 0) {
+            empty_slot = i;
+        }
+    }
+
+    int target_slot = found_slot >= 0 ? found_slot : empty_slot;
+    if (target_slot >= 0) {
+        gTrackedWindows[target_slot].wid = wid;
+        gTrackedWindows[target_slot].pid = pid;
+        gTrackedWindows[target_slot].is_ordered_in = (op != kVNOrderOut);
+    }
+    os_unfair_lock_unlock(&gTrackedLock);
+}
+
+static void vn_track_window_release(uint32_t wid) {
+    if (wid == 0) return;
+    os_unfair_lock_lock(&gTrackedLock);
+    for (int i = 0; i < MAX_TRACKED_WINDOWS; i++) {
+        if (gTrackedWindows[i].wid == wid) {
+            memset(&gTrackedWindows[i], 0, sizeof(VNTrackedWindow));
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&gTrackedLock);
+}
+
+static int vn_count_visible_windows_for_pid(pid_t pid, uint32_t exclude_wid) {
+    if (pid <= 0) return 0;
+    uint32_t candidate_wids[MAX_TRACKED_WINDOWS];
+    int candidate_count = 0;
+
+    os_unfair_lock_lock(&gTrackedLock);
+    for (int i = 0; i < MAX_TRACKED_WINDOWS; i++) {
+        if (gTrackedWindows[i].pid == pid &&
+            gTrackedWindows[i].is_ordered_in &&
+            gTrackedWindows[i].wid != 0 &&
+            gTrackedWindows[i].wid != exclude_wid) {
+            candidate_wids[candidate_count++] = gTrackedWindows[i].wid;
+        }
+    }
+    os_unfair_lock_unlock(&gTrackedLock);
+
+    int count = 0;
+    for (int i = 0; i < candidate_count; i++) {
+        if (!vn_is_clone_wid(candidate_wids[i], NULL)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win, pid_t pid, bool was_already_ordered_in) {
     if (pid == 0 && win && vn_window_get_owning_pid) {
         pid = vn_window_get_owning_pid(win);
     }
@@ -1068,6 +1125,8 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
         os_unfair_lock_unlock(&gPreCloneLock);
     }
 
+    int other_visible = vn_count_visible_windows_for_pid(pid, wid);
+
     CGXWindow *clones_to_release[MAX_ACTIVE_ANIMS] = {0};
     uint32_t clone_wids[MAX_ACTIVE_ANIMS] = {0};
     int release_count = 0;
@@ -1077,15 +1136,24 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
         if (!gActiveAnims[i].is_animating) continue;
 
         bool match = false;
-        // 1. Direct window match (orig_wid, clone_wid, or win instance)
         if ((wid != 0 && (gActiveAnims[i].clone_wid == wid || gActiveAnims[i].orig_wid == wid)) ||
             (win != NULL && gActiveAnims[i].clone_win == win)) {
             match = true;
         }
-        // 2. PID match for newly opened/reopened windows (e.g. Dock icon click or Cmd+N)
-        // Guarded: never cancel if the ordering-in window is being closed (has a pre-clone)!
         else if (pid != 0 && gActiveAnims[i].pid == pid && !has_preclone) {
-            match = true;
+            if (was_already_ordered_in) {
+                VN_LOG("Window wid=%u was already ordered in (AppKit sibling restack/focus) -> NOT canceling clone wid=%u",
+                       wid, gActiveAnims[i].clone_wid);
+            } else {
+                if (other_visible == 0) {
+                    VN_LOG("Process pid=%d had 0 other visible windows and wid=%u is newly ordering in -> Dock/launch reopen, canceling clone wid=%u",
+                           pid, wid, gActiveAnims[i].clone_wid);
+                    match = true;
+                } else {
+                    VN_LOG("Process pid=%d still has %d other visible window(s); wid=%u is a sibling -> NOT canceling clone wid=%u",
+                           pid, other_visible, wid, gActiveAnims[i].clone_wid);
+                }
+            }
         }
 
         if (match) {
@@ -1141,11 +1209,10 @@ static _Atomic(uint32_t) gNonCloseWid = 0;
 static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     uint32_t rel_wid = (win && vn_window_get_id) ? vn_window_get_id(win) : 0;
 
-    // If this window is currently in the active animation table, cancel the animation
-    // entry so our timer doesn't touch the window later.
-    // NOTE: When a clone is animating (is_clone == true), AppKit releasing the original window
-    // (orig_wid) is expected and normal! Do NOT cancel the clone animation. Only cancel if the
-    // window being released is the clone itself, OR if this is a live non-clone animation.
+    if (rel_wid != 0) {
+        vn_track_window_release(rel_wid);
+    }
+
     os_unfair_lock_lock(&gAnimsLock);
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (!gActiveAnims[i].is_animating) continue;
@@ -1169,17 +1236,6 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
     os_unfair_lock_unlock(&gAnimsLock);
 
-    // A pre-clone held for this window indicates an active close gesture.
-    //
-    // Framework ordering nuances:
-    // - AppKit windows are typically ordered out first and released afterwards,
-    //   allowing the order-out hook to consume the pre-clone.
-    // - SwiftUI and Catalyst windows frequently trigger release_window first,
-    //   followed immediately by order-out.
-    //
-    // To seamlessly support both lifecycles, the pre-clone is promoted to an
-    // active animation here if release arrives first, and subsequent duplicate
-    // order-out calls are safely dropped.
     CGXWindow     *clone_to_animate = NULL;
     uint32_t clone_wid = 0, orig_wid = 0;
     CGRect clone_frame = CGRectZero;
@@ -1191,7 +1247,6 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     os_unfair_lock_lock(&gPreCloneLock);
     for (int i = 0; i < MAX_PRECLONES; i++) {
         if (gPreClones[i].clone == win) {
-            // The clone itself is being released -- simply zero out without calling vn_system_window_release
             memset(&gPreClones[i], 0, sizeof(VNPreClone));
             break;
         }
@@ -1205,12 +1260,8 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
     os_unfair_lock_unlock(&gPreCloneLock);
 
-    // Call original release_window IMMEDIATELY! Never defer it.
-    // Deferring release_window causes deadlocks and use-after-free when a connection deallocates on quit.
     vn_orig_release_window(conn, win);
 
-    // After the release, not before: the original has to be off the screen for the
-    // clone sitting underneath it to be the thing the user sees warp.
     if (clone_to_animate) {
         VN_LOG(">>> Close seen at release_window for wid=%u (app='%s' pid=%d psn=0x%llx is_wa=%d) -- animating pre-clone wid=%u",
                orig_wid, anim_app, anim_pid, anim_psn, anim_is_wa, clone_wid);
@@ -1219,23 +1270,15 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
 }
 
 static inline bool vn_is_in_red_hitbox(double lx, double ly) {
-    // Cluster 1: Compact / Standard titlebars (Antigravity, Urban VPN, TweakInject, Chrome, WhatsApp)
-    // Red center ~ (17.0, 14.0), radius ~7.5pt
     bool in_c1 = (lx >= 9.0 && lx <= 26.0 && ly >= 4.5 && ly <= 25.0);
-
-    // Cluster 2: Tall Unified toolbars (System Settings, Calculator, Notes, Messages, Mail)
-    // Red center ~ (25.5, 26.0), radius ~7.5pt
     bool in_c2 = (lx >= 18.0 && lx <= 33.5 && ly >= 18.0 && ly <= 33.5);
-
     return in_c1 || in_c2;
 }
 
 static inline bool vn_is_in_yellow_or_green_hitbox(double lx, double ly) {
-    // Cluster 1: Compact / Standard titlebars
     if (lx >= 26.5 && lx <= 80.0 && ly >= 4.5 && ly <= 25.0) {
         return true;
     }
-    // Cluster 2: Tall Unified toolbars
     if (lx >= 34.0 && lx <= 88.0 && ly >= 18.0 && ly <= 33.5) {
         return true;
     }
@@ -1259,8 +1302,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
         pid = *(const pid_t *)((const char *)conn + 0x268);
     }
 
-    // Mouse click interception (Traffic lights: Red vs Yellow vs Green)
-    if (type == 1) { // kCGEventLeftMouseDown
+    if (type == 1) {
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
         if (wid != 0 && vn_window_by_id) {
             CGXWindow *win = vn_window_by_id(wid);
@@ -1272,11 +1314,6 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
                 uint64_t now_ms = vn_now_ms();
 
-                // Double-click check:
-                // If a second click occurs within 450ms and 8pt on the same window,
-                // it is a double-click gesture (e.g. zooming/maximizing via titlebar double-click).
-                // In macOS, closing via the red button is NEVER a double-click.
-                // Immediately discard any pre-clone, suppress pre-cloning for 600ms, and skip pre-cloning for this click.
                 bool is_double_click = false;
                 if (wid == gLastMouseDownWid && (now_ms - gLastMouseDownTimeMs) < 450) {
                     double dist = hypot(screen_pt->x - gLastMouseDownPt.x, screen_pt->y - gLastMouseDownPt.y);
@@ -1371,14 +1408,12 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                     atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
                     atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
                 } else {
-                    // Clicked elsewhere on the window: discard any pending pre-clone
                     vn_preclone_discard_wid(wid);
                 }
             }
         }
     }
-    // 3. Mouse release interception (kCGEventLeftMouseUp)
-    else if (type == 2) { // kCGEventLeftMouseUp
+    else if (type == 2) {
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
         int slot = -1;
         os_unfair_lock_lock(&gPreCloneLock);
@@ -1392,7 +1427,6 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
             double lx = local_pt->x;
             double ly = local_pt->y;
 
-            // Wide tracking leeway for mouse release (allows standard AppKit release margin)
             bool near_red = (lx >= 6.0 && lx <= 42.0 && ly >= 3.0 && ly <= 40.0);
             if (!near_red) {
                 VN_LOG("pre-clone: mouse up clearly outside button area (wid=%u pt=(%.1f, %.1f)) -- canceling pre-clone",
@@ -1411,8 +1445,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
             }
         }
     }
-    // 4. Mouse drag interception (kCGEventLeftMouseDragged)
-    else if (type == 6) { // kCGEventLeftMouseDragged
+    else if (type == 6) {
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
         int slot = -1;
         CGPoint down_scr = CGPointZero;
@@ -1433,14 +1466,10 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
             bool on_red = vn_is_in_red_hitbox(lx, ly);
             if (!on_red) {
-                // Dragged off the red button! User either dragged away to cancel the close,
-                // or is dragging/resizing the window.
                 VN_LOG("pre-clone: dragged off red button pt=(%.1f, %.1f) -- aborting pre-clone for wid=%u",
                        lx, ly, wid);
                 vn_preclone_discard_wid(wid);
             } else {
-                // Still within the red button hitbox.
-                // Guard against someone dragging the whole window by the traffic light area:
                 double d_scr = hypot(screen_pt->x - down_scr.x, screen_pt->y - down_scr.y);
                 if (d_scr >= 12.0) {
                     VN_LOG("pre-clone: window drag detected (d_scr=%.1f) -- aborting pre-clone for wid=%u",
@@ -1461,7 +1490,6 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                                  const CGSOrderOp *ops, const uint32_t *relativeTo,
                                  unsigned count, bool spaceSwitch) {
     if (ops && count >= 1) {
-        // Fast path for single-window operations
         if (count == 1) {
             uint32_t wid = wids ? wids[0] : 0;
             CGXWindow *win = vn_window_by_id(wid);
@@ -1471,11 +1499,13 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                 vn_get_window_app_name(win, app, sizeof(app), &pid);
 
                 if (ops[0] == kVNOrderOut) {
+                    vn_track_window_order(wid, pid, kVNOrderOut, win);
+
                     bool animating = vn_is_window_animating(wid, win);
                     if (animating) {
                         VN_LOG("Window wid=%u (%p, app: '%s') already animating; dropping duplicate order-out",
                                wid, win, app);
-                        return; // Dropped! Keep animation running undisturbed.
+                        return;
                     }
 
                     uint64_t now_ms = vn_now_ms();
@@ -1488,7 +1518,6 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         return;
                     }
 
-                    // 1. Check if we have an active pre-clone created at mouse-down time on the RED button
                     uint32_t clone_wid = 0;
                     CGXWindow *clone = NULL;
                     CGRect clone_frame = CGRectZero;
@@ -1514,27 +1543,23 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
                            wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
 
-                    // Order out the original window immediately (reveals the pre-clone right behind it)
                     vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-
-                    // Start shrink/warp animation on the clone, passing wid as orig_wid to block duplicates!
                     vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
                     return;
                 } else {
                     VN_LOG("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d",
                            app, pid, wid, ops[0], vn_window_level(win));
 
-                    // Window being ordered in: cancel animation if active
-                    vn_cancel_window_animation_if_ordering_in(wid, win, pid);
+                    bool was_already_ordered_in = vn_check_window_is_ordered_in(wid, win);
+                    vn_track_window_order(wid, pid, ops[0], win);
+                    vn_cancel_window_animation_if_ordering_in(wid, win, pid, was_already_ordered_in);
                 }
             }
 
-            // Single non-target or non-close op: pass through
             vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
             return;
         }
 
-        // Multi-window operations (count > 1)
         uint32_t pass_wids[count];
         CGSOrderOp pass_ops[count];
         uint32_t pass_rel[count];
@@ -1553,6 +1578,8 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                        app, pid, count, i, wid, ops[i], vn_window_level(win));
 
                 if (ops[i] == kVNOrderOut) {
+                    vn_track_window_order(wid, pid, kVNOrderOut, win);
+
                     if (vn_is_window_animating(wid, win)) {
                         VN_LOG("Window wid=%u (%p, app: '%s') already animating; dropping duplicate order-out",
                                wid, win, app);
@@ -1571,7 +1598,6 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         continue;
                     }
 
-                    // Same as single-window path: check active pre-clone
                     uint32_t clone_wid = 0;
                     CGXWindow *clone = NULL;
                     CGRect clone_frame = CGRectZero;
@@ -1608,7 +1634,9 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     pass_count++;
                     continue;
                 } else {
-                    vn_cancel_window_animation_if_ordering_in(wid, win, pid);
+                    bool was_already_ordered_in = vn_check_window_is_ordered_in(wid, win);
+                    vn_track_window_order(wid, pid, ops[i], win);
+                    vn_cancel_window_animation_if_ordering_in(wid, win, pid, was_already_ordered_in);
                 }
             }
 
@@ -1624,7 +1652,6 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
         return;
     }
 
-    // Default pass-through for all other windows.
     vn_orig_order(conn, wids, ops, relativeTo, count, spaceSwitch);
 }
 
@@ -1664,6 +1691,11 @@ static void vanish_init(void) {
     vn_set_window_shadow_parameters = (VNSLSSetWindowShadowParametersFn)vn_skylight_symbol(kVNSymSLSSetWindowShadowParameters);
 
     void *targetEligible = vn_skylight_symbol(kVNSymIsProcessEligibleForSetFront);
+
+    vn_dyn_window_is_ordered_in = (VNDynWindowIsOrderedInFn)vn_skylight_symbol("CGXWindowIsOrderedIn");
+    if (!vn_dyn_window_is_ordered_in) {
+        vn_dyn_window_is_ordered_in = (VNDynWindowIsOrderedInFn)vn_skylight_symbol("_CGXWindowIsOrderedIn");
+    }
 
     if (!targetOrder || !targetRelease || !vn_window_by_id ||
         !vn_schedule_callback || !vn_set_mesh_warp || !vn_clipped_frame_bounds) {
@@ -1705,4 +1737,3 @@ static void vanish_init(void) {
 
     VN_LOG("Vanish loaded successfully! Target window close hook active (duration: %.2fs)", (double)vn_duration());
 }
-
