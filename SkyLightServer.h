@@ -298,10 +298,6 @@ typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);
 typedef void (*VNWSWindowReleaseShadowResourcesFn)(CGXWindow *);
 typedef CGError (*VNSLSSetWindowShadowParametersFn)(uint32_t cid, uint32_t wid, float density, float radius, float xOffset, float yOffset);
 typedef void (*VNPostEventByConnectionFn)(CGXConnection *, void *);
-#define kVNSymSLSSetWindowTags "_SLSSetWindowTags"
-#define kVNSymSLSSetWindowLevel "_SLSSetWindowLevel"
-typedef CGError (*VNSLSSetWindowTagsFn)(uint32_t cid, uint32_t wid, const uint32_t *tags, int tagsize);
-typedef CGError (*VNSLSSetWindowLevelFn)(uint32_t cid, uint32_t wid, int32_t level);
 
 #ifdef __cplusplus
 }

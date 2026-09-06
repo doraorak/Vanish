@@ -166,8 +166,6 @@ static VNClearShadowDensityFn            vn_clear_shadow_density;
 static VNWSWindowSetShadowEnableFn        vn_window_set_shadow_enable;
 static VNWSWindowReleaseShadowResourcesFn vn_window_release_shadow_resources;
 static VNSLSSetWindowShadowParametersFn   vn_set_window_shadow_parameters;
-static VNSLSSetWindowTagsFn               vn_set_window_tags;
-static VNSLSSetWindowLevelFn              vn_set_window_level;
 static VNIsProcessEligibleForSetFrontFn    vn_orig_is_process_eligible;
 
 #pragma mark - Preferences
@@ -431,6 +429,7 @@ typedef struct {
     bool           is_animating;    // Active slot indicator
     pid_t          pid;
     uint64_t       psn;
+    bool           is_whatsapp;
     char           app[64];
 } VNCloneAnim;
 
@@ -440,25 +439,24 @@ static os_unfair_lock gAnimsLock = OS_UNFAIR_LOCK_INIT;
 static uint64_t       gNextAnimId = 1;
 static _Atomic bool   gAnimTimerRunning = false;
 
-static _Atomic(uint64_t) gLastClosedPSN = 0;
-static _Atomic(pid_t)    gLastClosedPID = 0;
-static _Atomic(uint64_t) gLastClosedTimeMs = 0;
+static _Atomic(uint64_t) gLastWhatsAppClosedPSN = 0;
+static _Atomic(uint64_t) gLastWhatsAppClosedTimeMs = 0;
 
-static bool vn_is_psn_closing_or_recently_closed(uint64_t psn) {
+static bool vn_is_whatsapp_closing_or_recently_closed(uint64_t psn) {
     if (psn == 0) return false;
 
     os_unfair_lock_lock(&gAnimsLock);
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating && gActiveAnims[i].psn == psn) {
+        if (gActiveAnims[i].is_animating && gActiveAnims[i].is_whatsapp && gActiveAnims[i].psn == psn) {
             os_unfair_lock_unlock(&gAnimsLock);
             return true;
         }
     }
     os_unfair_lock_unlock(&gAnimsLock);
 
-    uint64_t last_psn = atomic_load_explicit(&gLastClosedPSN, memory_order_relaxed);
+    uint64_t last_psn = atomic_load_explicit(&gLastWhatsAppClosedPSN, memory_order_relaxed);
     if (last_psn != 0 && last_psn == psn) {
-        uint64_t last_time = atomic_load_explicit(&gLastClosedTimeMs, memory_order_relaxed);
+        uint64_t last_time = atomic_load_explicit(&gLastWhatsAppClosedTimeMs, memory_order_relaxed);
         if ((vn_now_ms() - last_time) < 500) {
             return true;
         }
@@ -468,8 +466,8 @@ static bool vn_is_psn_closing_or_recently_closed(uint64_t psn) {
 }
 
 static bool vn_hooked_is_process_eligible(uint32_t sessionID, uint64_t psn, bool flag, bool *out) {
-    if (vn_is_psn_closing_or_recently_closed(psn)) {
-        VN_LOG("isProcessEligibleForSetFront: suppressing front eligibility for closing psn=0x%llx", psn);
+    if (vn_is_whatsapp_closing_or_recently_closed(psn)) {
+        VN_LOG("isProcessEligibleForSetFront: suppressing front eligibility for WhatsApp (psn=0x%llx)", psn);
         if (out) *out = false;
         return false;
     }
@@ -514,6 +512,7 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
     CGXWindow *clone_win = NULL;
     pid_t finished_pid = 0;
     uint64_t finished_psn = 0;
+    bool finished_is_wa = false;
     char finished_app[64] = {0};
     bool found = false;
 
@@ -524,6 +523,7 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
             clone_win = gActiveAnims[i].clone_win;
             finished_pid = gActiveAnims[i].pid;
             finished_psn = gActiveAnims[i].psn;
+            finished_is_wa = gActiveAnims[i].is_whatsapp;
             strlcpy(finished_app, gActiveAnims[i].app, sizeof(finished_app));
             gActiveAnims[i].is_animating = false;
             gActiveAnims[i].clone_wid = 0;
@@ -531,6 +531,7 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
             gActiveAnims[i].clone_win = NULL;
             gActiveAnims[i].pid = 0;
             gActiveAnims[i].psn = 0;
+            gActiveAnims[i].is_whatsapp = false;
             gActiveAnims[i].app[0] = '\0';
             found = true;
             break;
@@ -540,16 +541,13 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
 
     if (!found) return;
 
-    if (finished_psn != 0) {
-        atomic_store_explicit(&gLastClosedPSN, finished_psn, memory_order_relaxed);
+    if (finished_is_wa && finished_psn != 0) {
+        atomic_store_explicit(&gLastWhatsAppClosedPSN, finished_psn, memory_order_relaxed);
+        atomic_store_explicit(&gLastWhatsAppClosedTimeMs, vn_now_ms(), memory_order_relaxed);
     }
-    if (finished_pid != 0) {
-        atomic_store_explicit(&gLastClosedPID, finished_pid, memory_order_relaxed);
-    }
-    atomic_store_explicit(&gLastClosedTimeMs, vn_now_ms(), memory_order_relaxed);
 
-    VN_LOG("finish_animation: hiding and ordering out clone wid=%u win=%p (app='%s' pid=%d psn=0x%llx release deferred 100ms)",
-           clone_wid, clone_win, finished_app, finished_pid, finished_psn);
+    VN_LOG("finish_animation: hiding and ordering out clone wid=%u win=%p (app='%s' pid=%d psn=0x%llx is_wa=%d release deferred 100ms)",
+           clone_wid, clone_win, finished_app, finished_pid, finished_psn, finished_is_wa);
     if (clone_win && vn_update_ca_visibility) {
         vn_update_ca_visibility(clone_win, false);
     }
@@ -586,6 +584,7 @@ typedef struct {
     double         mouseUpTime;
     pid_t          pid;
     uint64_t       psn;
+    bool           is_whatsapp;
     char           app[64];
 } VNPreClone;
 
@@ -611,7 +610,7 @@ static int vn_preclone_find_empty_slot_locked(void) {
 // MUST be called with gPreCloneLock held.
 // NEVER calls any external or system functions.
 static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone_wid, CGRect *out_frame,
-                                          pid_t *out_pid, uint64_t *out_psn, char *out_app, size_t app_len) {
+                                          pid_t *out_pid, uint64_t *out_psn, bool *out_is_wa, char *out_app, size_t app_len) {
     int idx = vn_preclone_find_slot_locked(orig_wid);
     if (idx < 0) return NULL;
 
@@ -620,6 +619,7 @@ static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone
     if (out_frame) *out_frame = gPreClones[idx].frame;
     if (out_pid) *out_pid = gPreClones[idx].pid;
     if (out_psn) *out_psn = gPreClones[idx].psn;
+    if (out_is_wa) *out_is_wa = gPreClones[idx].is_whatsapp;
     if (out_app && app_len > 0) {
         strlcpy(out_app, gPreClones[idx].app, app_len);
     }
@@ -633,7 +633,7 @@ static void vn_preclone_discard_wid(uint32_t orig_wid) {
     if (orig_wid == 0) return;
     uint32_t clone_wid = 0;
     os_unfair_lock_lock(&gPreCloneLock);
-    CGXWindow *clone = vn_preclone_take_locked(orig_wid, &clone_wid, NULL, NULL, NULL, NULL, 0);
+    CGXWindow *clone = vn_preclone_take_locked(orig_wid, &clone_wid, NULL, NULL, NULL, NULL, NULL, 0);
     os_unfair_lock_unlock(&gPreCloneLock);
 
     if (clone) {
@@ -758,24 +758,11 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     CGXWindow *clone = vn_create_clone(win, frame, display, true);
     if (!clone) { VN_LOG("snapshot: CreateCloneOfWindow returned NULL"); return NULL; }
 
-    int32_t orig_lvl = vn_window_level(win);
-    *(int32_t *)((char *)clone + kVNWindowLevelOffset) = orig_lvl;
-
     uint32_t wid = vn_window_get_id(clone);
     if (wid != 0) {
-        if (vn_set_window_level) {
-            vn_set_window_level(0, wid, orig_lvl);
-        }
-        if (vn_set_window_tags) {
-            // AvoidsActivate (bit 15: 1U << 15) | IgnoreAsFront (bit 21: 1U << 21)
-            uint32_t tags[2] = { (1U << 15) | (1U << 21), 0 };
-            vn_set_window_tags(0, wid, tags, 64);
-        }
         CGSOrderOp op  = place;
         uint32_t   rel = orig_wid;
-        // Pass NULL as connection! Clones are server-owned and must NEVER be attributed
-        // to the client application (which triggers Catalyst window resurrection).
-        vn_orig_order(NULL, &wid, &op, &rel, 1, false);
+        vn_orig_order(conn, &wid, &op, &rel, 1, false);
         if (out_wid) *out_wid = wid;
         if (out_frame) *out_frame = frame;
     }
@@ -958,7 +945,7 @@ static void vn_anim_tick(void *ctx, double when) {
 }
 
 static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CGRect frame,
-                                     pid_t pid, uint64_t psn, const char *app_name) {
+                                     pid_t pid, uint64_t psn, bool is_wa, const char *app_name) {
     if (!clone_win) return;
     uint32_t clone_wid = vn_window_get_id ? vn_window_get_id(clone_win) : 0;
     float dur = vn_duration();
@@ -973,6 +960,10 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
                 if (psn == 0) psn = vn_conn_get_psn(c);
             }
         }
+    }
+
+    if (!is_wa && app_name && (strcasecmp(app_name, "WhatsApp") == 0)) {
+        is_wa = true;
     }
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
@@ -1028,6 +1019,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         .duration = (double)dur,
         .pid = pid,
         .psn = psn,
+        .is_whatsapp = is_wa,
     };
     if (app_name && app_name[0] != '\0') {
         strlcpy(gActiveAnims[slot].app, app_name, sizeof(gActiveAnims[slot].app));
@@ -1048,8 +1040,8 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     double interval = vn_get_refresh_interval(clone_win);
     double hz = interval > 0.0 ? (1.0 / interval) : 120.0;
 
-    VN_LOG("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx) win=%p duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
-           clone_wid, orig_wid, app_name ? app_name : "", pid, psn, clone_win, dur, interval * 1000.0, hz, anim_id);
+    VN_LOG("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx is_wa=%d) win=%p duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
+           clone_wid, orig_wid, app_name ? app_name : "", pid, psn, is_wa, clone_win, dur, interval * 1000.0, hz, anim_id);
 
     if (vn_schedule_callback) {
         bool expected = false;
@@ -1081,6 +1073,10 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
             gActiveAnims[i].clone_wid = 0;
             gActiveAnims[i].orig_wid = 0;
             gActiveAnims[i].clone_win = NULL;
+            gActiveAnims[i].pid = 0;
+            gActiveAnims[i].psn = 0;
+            gActiveAnims[i].is_whatsapp = false;
+            gActiveAnims[i].app[0] = '\0';
             break;
         }
     }
@@ -1161,6 +1157,7 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     CGRect clone_frame = CGRectZero;
     pid_t anim_pid = 0;
     uint64_t anim_psn = 0;
+    bool anim_is_wa = false;
     char anim_app[64] = {0};
 
     os_unfair_lock_lock(&gPreCloneLock);
@@ -1174,7 +1171,7 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
             ((rel_wid != 0 && gPreClones[i].orig_wid == rel_wid) ||
              (vn_window_by_id && vn_window_by_id(gPreClones[i].orig_wid) == win))) {
             orig_wid = gPreClones[i].orig_wid;
-            clone_to_animate = vn_preclone_take_locked(orig_wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, anim_app, sizeof(anim_app));
+            clone_to_animate = vn_preclone_take_locked(orig_wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
             break;
         }
     }
@@ -1187,9 +1184,9 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     // After the release, not before: the original has to be off the screen for the
     // clone sitting underneath it to be the thing the user sees warp.
     if (clone_to_animate) {
-        VN_LOG(">>> Close seen at release_window for wid=%u (app='%s' pid=%d psn=0x%llx) -- animating pre-clone wid=%u",
-               orig_wid, anim_app, anim_pid, anim_psn, clone_wid);
-        vn_start_clone_animation(clone_to_animate, orig_wid, clone_frame, anim_pid, anim_psn, anim_app);
+        VN_LOG(">>> Close seen at release_window for wid=%u (app='%s' pid=%d psn=0x%llx is_wa=%d) -- animating pre-clone wid=%u",
+               orig_wid, anim_app, anim_pid, anim_psn, anim_is_wa, clone_wid);
+        vn_start_clone_animation(clone_to_animate, orig_wid, clone_frame, anim_pid, anim_psn, anim_is_wa, anim_app);
     }
 }
 
@@ -1314,6 +1311,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                         os_unfair_lock_lock(&gPreCloneLock);
                         int slot = vn_preclone_find_slot_locked(wid);
                         if (slot < 0) slot = vn_preclone_find_empty_slot_locked();
+                        bool is_wa = (strcasecmp(app, "WhatsApp") == 0);
                         gPreClones[slot] = (VNPreClone){
                             .orig_wid = wid,
                             .clone_wid = clone_wid,
@@ -1325,6 +1323,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                             .mouseUpTime = 0.0,
                             .pid = pid,
                             .psn = psn,
+                            .is_whatsapp = is_wa,
                         };
                         strlcpy(gPreClones[slot].app, app, sizeof(gPreClones[slot].app));
                         os_unfair_lock_unlock(&gPreCloneLock);
@@ -1467,10 +1466,11 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     CGRect clone_frame = CGRectZero;
                     pid_t anim_pid = 0;
                     uint64_t anim_psn = 0;
+                    bool anim_is_wa = false;
                     char anim_app[64] = {0};
 
                     os_unfair_lock_lock(&gPreCloneLock);
-                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, anim_app, sizeof(anim_app));
+                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
@@ -1480,14 +1480,17 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     }
 
                     const char *final_app = anim_app[0] ? anim_app : app;
-                    VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx)",
-                           wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn);
+                    if (!anim_is_wa && (strcasecmp(final_app, "WhatsApp") == 0)) {
+                        anim_is_wa = true;
+                    }
+                    VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
+                           wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
 
                     // Order out the original window immediately (reveals the pre-clone right behind it)
                     vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
 
                     // Start shrink/warp animation on the clone, passing wid as orig_wid to block duplicates!
-                    vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, final_app);
+                    vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
                     return;
                 } else {
                     VN_LOG("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d",
@@ -1546,10 +1549,11 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     CGRect clone_frame = CGRectZero;
                     pid_t anim_pid = 0;
                     uint64_t anim_psn = 0;
+                    bool anim_is_wa = false;
                     char anim_app[64] = {0};
 
                     os_unfair_lock_lock(&gPreCloneLock);
-                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, anim_app, sizeof(anim_app));
+                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
@@ -1563,9 +1567,12 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
 
                     if (clone && clone_wid != 0) {
                         const char *final_app = anim_app[0] ? anim_app : app;
-                        VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx)",
-                               wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn);
-                        vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, final_app);
+                        if (!anim_is_wa && (strcasecmp(final_app, "WhatsApp") == 0)) {
+                            anim_is_wa = true;
+                        }
+                        VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
+                               wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
+                        vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
                     }
                     pass_wids[pass_count] = wid;
                     pass_ops[pass_count] = ops[i];
@@ -1627,15 +1634,6 @@ static void vanish_init(void) {
     vn_window_set_shadow_enable     = (VNWSWindowSetShadowEnableFn)vn_skylight_symbol(kVNSymWSWindowSetShadowEnable);
     vn_window_release_shadow_resources = (VNWSWindowReleaseShadowResourcesFn)vn_skylight_symbol(kVNSymWSWindowReleaseShadowResources);
     vn_set_window_shadow_parameters = (VNSLSSetWindowShadowParametersFn)vn_skylight_symbol(kVNSymSLSSetWindowShadowParameters);
-    vn_set_window_tags              = (VNSLSSetWindowTagsFn)vn_skylight_symbol(kVNSymSLSSetWindowTags);
-    vn_set_window_level             = (VNSLSSetWindowLevelFn)vn_skylight_symbol(kVNSymSLSSetWindowLevel);
-
-    if (!vn_set_window_tags) {
-        vn_set_window_tags = (VNSLSSetWindowTagsFn)dlsym(RTLD_DEFAULT, "SLSSetWindowTags");
-    }
-    if (!vn_set_window_level) {
-        vn_set_window_level = (VNSLSSetWindowLevelFn)dlsym(RTLD_DEFAULT, "SLSSetWindowLevel");
-    }
 
     void *targetEligible = vn_skylight_symbol(kVNSymIsProcessEligibleForSetFront);
 
