@@ -72,6 +72,9 @@ enum { kVNOrderBelow = -1, kVNOrderOut = 0, kVNOrderAbove = 1 };
 /// void CGXPostEventByConnection(CGXConnection *conn, void *event)
 #define kVNSymPostEventByConnection "_CGXPostEventByConnection"
 
+/// bool isProcessEligibleForSetFront(uint32_t sessionID, CPSProcessSerNum psn, bool flag, bool *out)
+#define kVNSymIsProcessEligibleForSetFront "__ZL28isProcessEligibleForSetFrontj16CPSProcessSerNumbPb"
+
 #pragma mark - Struct offsets
 
 /// Window level at offset 0x20.
@@ -144,6 +147,14 @@ static inline CGXConnection *vn_window_connection(const CGXWindow *win) {
     return conn;
 }
 
+/// ProcessSerialNumber at offset 0x124 of CGXConnection
+static inline uint64_t vn_conn_get_psn(const CGXConnection *conn) {
+    if (!conn) return 0;
+    uint64_t psn = 0;
+    __builtin_memcpy(&psn, (const char *)conn + 0x124, sizeof(psn));
+    return psn;
+}
+
 #pragma mark - Resolved function types
 
 typedef void (*VNOrderWindowListFn)(CGXConnection *, const uint32_t *, const CGSOrderOp *,
@@ -154,6 +165,7 @@ typedef void (*VNReleaseWindowFn)(CGXConnection *, CGXWindow *);
 typedef pid_t (*VNWindowGetOwningPIDFn)(CGXWindow *);
 typedef int (*VNGetConnectionAppNameFn)(uint32_t, char *, size_t);
 typedef void (*VNUpdateCAVisibilityFn)(CGXWindow *, bool);
+typedef bool (*VNIsProcessEligibleForSetFrontFn)(uint32_t, uint64_t, bool, bool *);
 
 
 #pragma mark - Server-Internal Operations
@@ -286,6 +298,10 @@ typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);
 typedef void (*VNWSWindowReleaseShadowResourcesFn)(CGXWindow *);
 typedef CGError (*VNSLSSetWindowShadowParametersFn)(uint32_t cid, uint32_t wid, float density, float radius, float xOffset, float yOffset);
 typedef void (*VNPostEventByConnectionFn)(CGXConnection *, void *);
+#define kVNSymSLSSetWindowTags "_SLSSetWindowTags"
+#define kVNSymSLSSetWindowLevel "_SLSSetWindowLevel"
+typedef CGError (*VNSLSSetWindowTagsFn)(uint32_t cid, uint32_t wid, const uint32_t *tags, int tagsize);
+typedef CGError (*VNSLSSetWindowLevelFn)(uint32_t cid, uint32_t wid, int32_t level);
 
 #ifdef __cplusplus
 }
