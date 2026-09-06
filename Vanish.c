@@ -886,27 +886,24 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         }
     }
 
-    // If another clone is already actively animating, order this clone BELOW that existing
-    // animating clone so ongoing foreground animations are never occluded!
-    // If no other clone is animating, order above to ensure it is cleanly on top of underlying content.
-    uint32_t existing_clone_wid = 0;
+    uint32_t lowest_clone_wid = 0;
+    uint64_t max_anim_id = 0;
+    int slot = -1;
+    uint64_t anim_id = 0;
+
     os_unfair_lock_lock(&gAnimsLock);
+    // Find the most recently registered animating clone so subsequent closes
+    // stack neatly UNDERNEATH ongoing animations (smooth matrushka nesting)
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_wid != 0 && gActiveAnims[i].clone_wid != clone_wid) {
-            existing_clone_wid = gActiveAnims[i].clone_wid;
-            break;
+            if (gActiveAnims[i].anim_id > max_anim_id) {
+                max_anim_id = gActiveAnims[i].anim_id;
+                lowest_clone_wid = gActiveAnims[i].clone_wid;
+            }
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
 
-    if (clone_wid != 0) {
-        CGSOrderOp op = existing_clone_wid != 0 ? kVNOrderBelow : kVNOrderAbove;
-        uint32_t rel = existing_clone_wid;
-        vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
-    }
-
-    os_unfair_lock_lock(&gAnimsLock);
-    int slot = -1;
+    // Allocate animation slot under the same lock to avoid race conditions
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (!gActiveAnims[i].is_animating) {
             slot = i;
@@ -915,7 +912,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     }
     if (slot == -1) slot = 0;
 
-    uint64_t anim_id = gNextAnimId++;
+    anim_id = gNextAnimId++;
     gActiveAnims[slot] = (VNCloneAnim){
         .clone_wid = clone_wid,
         .orig_wid = orig_wid,
@@ -927,6 +924,17 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         .duration = (double)dur,
     };
     os_unfair_lock_unlock(&gAnimsLock);
+
+    // Order the clone in WindowServer:
+    // If other clones are animating, order below the lowest one (matrushka nesting).
+    // If none are animating, order above to ensure clean visibility over background.
+    if (clone_wid != 0) {
+        CGSOrderOp op = lowest_clone_wid != 0 ? kVNOrderBelow : kVNOrderAbove;
+        uint32_t rel = lowest_clone_wid;
+        vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
+        VN_LOG("anim: clone wid=%u ordered %s rel=%u (anim_id=%llu)",
+               clone_wid, op == kVNOrderBelow ? "below" : "above", rel, anim_id);
+    }
 
     double interval = vn_get_refresh_interval(clone_win);
     double hz = interval > 0.0 ? (1.0 / interval) : 120.0;
