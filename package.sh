@@ -60,9 +60,8 @@ cp "$DIR/Filter.plist" "$DIR/$BUNDLE/Contents/Resources/Filter.plist"
 if [ -f "$PREFS_SRC/Root.plist" ]; then
     cp "$PREFS_SRC/Root.plist" "$DIR/$BUNDLE/Contents/Resources/Root.plist"
 fi
-if [ -f "$DIR/assets/icon.svg" ]; then
-    cp "$DIR/assets/icon.svg" "$DIR/$BUNDLE/Contents/Resources/icon.svg"
-    cp "$DIR/assets/icon.svg" "$PREFS_SRC/icon.svg"
+if [ -f "$PREFS_SRC/icon.svg" ]; then
+    cp "$PREFS_SRC/icon.svg" "$DIR/$BUNDLE/Contents/Resources/icon.svg"
 fi
 # Embed companion preference bundle inside the tweak bundle
 rm -rf "$DIR/$BUNDLE/Contents/Resources/$PREFS_BUNDLE"
