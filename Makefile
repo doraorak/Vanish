@@ -16,7 +16,7 @@ BUNDLE_NAME = Vanish
 
 Vanish_FILES = Vanish.c
 Vanish_INSTALL_PATH = /Library/TweakInject/Tweaks/Bundles
-Vanish_CFLAGS = -fblocks -std=c11
+Vanish_CFLAGS = -fblocks -std=c11 -fno-modules
 
 # MSHookFunction. Installed at /usr/local/lib/libellekit.dylib, which is also
 # its install name, so -L is a link-time concern only.
