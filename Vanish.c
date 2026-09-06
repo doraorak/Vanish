@@ -1056,18 +1056,42 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     }
 }
 
-static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win) {
-    CGXWindow *clone_to_release = NULL;
-    uint32_t clone_wid = 0;
+static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win, pid_t pid) {
+    if (pid == 0 && win && vn_window_get_owning_pid) {
+        pid = vn_window_get_owning_pid(win);
+    }
+
+    bool has_preclone = false;
+    if (wid != 0) {
+        os_unfair_lock_lock(&gPreCloneLock);
+        has_preclone = (vn_preclone_find_slot_locked(wid) >= 0);
+        os_unfair_lock_unlock(&gPreCloneLock);
+    }
+
+    CGXWindow *clones_to_release[MAX_ACTIVE_ANIMS] = {0};
+    uint32_t clone_wids[MAX_ACTIVE_ANIMS] = {0};
+    int release_count = 0;
 
     os_unfair_lock_lock(&gAnimsLock);
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating &&
-            ((wid != 0 && (gActiveAnims[i].clone_wid == wid || gActiveAnims[i].orig_wid == wid)) ||
-             (win != NULL && gActiveAnims[i].clone_win == win))) {
-            
-            clone_to_release = gActiveAnims[i].clone_win;
-            clone_wid = gActiveAnims[i].clone_wid;
+        if (!gActiveAnims[i].is_animating) continue;
+
+        bool match = false;
+        // 1. Direct window match (orig_wid, clone_wid, or win instance)
+        if ((wid != 0 && (gActiveAnims[i].clone_wid == wid || gActiveAnims[i].orig_wid == wid)) ||
+            (win != NULL && gActiveAnims[i].clone_win == win)) {
+            match = true;
+        }
+        // 2. PID match for newly opened/reopened windows (e.g. Dock icon click or Cmd+N)
+        // Guarded: never cancel if the ordering-in window is being closed (has a pre-clone)!
+        else if (pid != 0 && gActiveAnims[i].pid == pid && !has_preclone) {
+            match = true;
+        }
+
+        if (match) {
+            clones_to_release[release_count] = gActiveAnims[i].clone_win;
+            clone_wids[release_count] = gActiveAnims[i].clone_wid;
+            release_count++;
 
             gActiveAnims[i].is_animating = false;
             gActiveAnims[i].clone_wid = 0;
@@ -1077,15 +1101,17 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
             gActiveAnims[i].psn = 0;
             gActiveAnims[i].is_whatsapp = false;
             gActiveAnims[i].app[0] = '\0';
-            break;
         }
     }
     os_unfair_lock_unlock(&gAnimsLock);
 
-    if (clone_to_release) {
-        VN_LOG("Target window wid=%u ordered back in while clone wid=%u was animating; ordering out and destroying clone",
-               wid, clone_wid);
-        if (vn_update_ca_visibility) {
+    for (int j = 0; j < release_count; j++) {
+        CGXWindow *clone_to_release = clones_to_release[j];
+        uint32_t clone_wid = clone_wids[j];
+
+        VN_LOG("Target window wid=%u (pid=%d) ordered back in while clone wid=%u was animating; ordering out and destroying clone",
+               wid, pid, clone_wid);
+        if (vn_update_ca_visibility && clone_to_release) {
             vn_update_ca_visibility(clone_to_release, false);
         }
         if (clone_wid != 0) {
@@ -1093,10 +1119,12 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
             uint32_t rel = 0;
             vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
         }
-        if (vn_schedule_callback) {
-            vn_schedule_callback(vn_delayed_clone_release, clone_to_release, SLSCurrentRealTime() + 0.1);
-        } else if (vn_system_window_release) {
-            vn_system_window_release(clone_to_release);
+        if (clone_to_release) {
+            if (vn_schedule_callback) {
+                vn_schedule_callback(vn_delayed_clone_release, clone_to_release, SLSCurrentRealTime() + 0.1);
+            } else if (vn_system_window_release) {
+                vn_system_window_release(clone_to_release);
+            }
         }
     }
 
@@ -1497,7 +1525,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                            app, pid, wid, ops[0], vn_window_level(win));
 
                     // Window being ordered in: cancel animation if active
-                    vn_cancel_window_animation_if_ordering_in(wid, win);
+                    vn_cancel_window_animation_if_ordering_in(wid, win, pid);
                 }
             }
 
@@ -1580,7 +1608,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     pass_count++;
                     continue;
                 } else {
-                    vn_cancel_window_animation_if_ordering_in(wid, win);
+                    vn_cancel_window_animation_if_ordering_in(wid, win, pid);
                 }
             }
 
