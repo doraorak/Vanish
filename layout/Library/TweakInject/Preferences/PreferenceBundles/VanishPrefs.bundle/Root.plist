@@ -52,26 +52,6 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>Window Ordering</string>
-			<key>footerText</key>
-			<string>When enabled, closing windows are brought to the front of all windows so the animation is always visible. When disabled (default), closing windows animate at their natural depth in the window stack.</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSSwitchCell</string>
-			<key>default</key>
-			<false/>
-			<key>key</key>
-			<string>bringToFront</string>
-			<key>label</key>
-			<string>Bring to Front on Close</string>
-			<key>PostNotification</key>
-			<string>com.doraorak.vanish/prefsChanged</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSGroupCell</string>
-			<key>label</key>
 			<string>Refresh Rate</string>
 			<key>footerText</key>
 			<string>Frame rate for the vanish animation (default: 120 Hz, min: 10 Hz, max: 120 Hz). Lower values produce visible frame stepping.</string>

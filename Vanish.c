@@ -166,20 +166,18 @@ static VNClearShadowDensityFn            vn_clear_shadow_density;
 static VNWSWindowSetShadowEnableFn        vn_window_set_shadow_enable;
 static VNWSWindowReleaseShadowResourcesFn vn_window_release_shadow_resources;
 static VNSLSSetWindowShadowParametersFn   vn_set_window_shadow_parameters;
-static VNWSWindowSetLevelInternalFn       vn_set_level_internal;
 
 #pragma mark - Preferences
 
 typedef struct {
     bool  enabled;
     bool  shadows;
-    bool  bringToFront; // When true, hoists closing window above all normal windows
     float refreshRate; // in Hz: e.g. 10.0 .. 120.0 (default 120.0)
     float duration;
     char  targetApp[256];
 } VNPreferences;
 
-static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .bringToFront = false, .refreshRate = 120.0f, .duration = 0.25f, .targetApp = "all" };
+static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .refreshRate = 120.0f, .duration = 0.25f, .targetApp = "all" };
 static os_unfair_lock gPrefsLock = OS_UNFAIR_LOCK_INIT;
 static struct timespec gPrefsMtime = {0};
 static bool           gPrefsValid = false;
@@ -187,7 +185,6 @@ static bool           gPrefsValid = false;
 static void vn_reload_prefs_locked(void) {
     gPrefs.enabled = true;
     gPrefs.shadows = true;
-    gPrefs.bringToFront = false;
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
@@ -221,11 +218,6 @@ static void vn_reload_prefs_locked(void) {
                         CFBooleanRef shadowsVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("shadows"));
                         if (shadowsVal && CFGetTypeID(shadowsVal) == CFBooleanGetTypeID()) {
                             gPrefs.shadows = CFBooleanGetValue(shadowsVal);
-                        }
-
-                        CFBooleanRef btfVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("bringToFront"));
-                        if (btfVal && CFGetTypeID(btfVal) == CFBooleanGetTypeID()) {
-                            gPrefs.bringToFront = CFBooleanGetValue(btfVal);
                         }
 
                         CFTypeRef rrVal = CFDictionaryGetValue(dict, CFSTR("refreshRate"));
@@ -689,16 +681,6 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     if (!clone) { VN_LOG("snapshot: CreateCloneOfWindow returned NULL"); return NULL; }
 
     uint32_t wid = vn_window_get_id(clone);
-
-    int32_t orig_lvl = vn_window_level(win);
-    int16_t orig_sublvl = vn_window_sublevel(win);
-
-    if (!prefs.bringToFront && vn_set_level_internal) {
-        vn_set_level_internal(clone, NULL, orig_lvl, orig_sublvl);
-        VN_LOG("snapshot: adjusted clone wid=%u level from 25 to %d (sublevel=%d) to match orig=%u (level now=%d)",
-               wid, orig_lvl, orig_sublvl, orig_wid, vn_window_level(clone));
-    }
-
     if (wid != 0) {
         CGSOrderOp op  = place;
         uint32_t   rel = orig_wid;
@@ -904,45 +886,23 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         }
     }
 
-    VNPreferences prefs = vn_get_prefs();
-    if (prefs.bringToFront) {
-        // Preference: Bring closing window to top of the window stack.
-        if (vn_set_level_internal && clone_win && vn_window_level(clone_win) != 25) {
-            vn_set_level_internal(clone_win, NULL, 25, 0);
+    // If another clone is already actively animating, order this clone BELOW that existing
+    // animating clone so ongoing foreground animations are never occluded!
+    // If no other clone is animating, order above to ensure it is cleanly on top of underlying content.
+    uint32_t existing_clone_wid = 0;
+    os_unfair_lock_lock(&gAnimsLock);
+    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
+        if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_wid != 0 && gActiveAnims[i].clone_wid != clone_wid) {
+            existing_clone_wid = gActiveAnims[i].clone_wid;
+            break;
         }
+    }
+    os_unfair_lock_unlock(&gAnimsLock);
 
-        // Find the lowest/most-recently added animating clone so subsequent closes
-        // stack neatly UNDERNEATH ongoing animations instead of swallowing them!
-        uint32_t lowest_clone_wid = 0;
-        os_unfair_lock_lock(&gAnimsLock);
-        for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-            if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_wid != 0 && gActiveAnims[i].clone_wid != clone_wid) {
-                lowest_clone_wid = gActiveAnims[i].clone_wid;
-            }
-        }
-        os_unfair_lock_unlock(&gAnimsLock);
-
-        if (clone_wid != 0) {
-            CGSOrderOp op = (lowest_clone_wid != 0) ? kVNOrderBelow : kVNOrderAbove;
-            uint32_t rel = lowest_clone_wid;
-            vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
-        }
-    } else {
-        // Natural Z-Order (DEFAULT):
-        if (vn_set_level_internal && clone_win && vn_window_level(clone_win) == 25) {
-            CGXWindow *orig_win = (orig_wid != 0 && vn_window_by_id) ? vn_window_by_id(orig_wid) : NULL;
-            int32_t orig_lvl = orig_win ? vn_window_level(orig_win) : 0;
-            int16_t orig_sublvl = orig_win ? vn_window_sublevel(orig_win) : 0;
-            vn_set_level_internal(clone_win, NULL, orig_lvl, orig_sublvl);
-        }
-
-        // Do NOT re-order clone_wid!
-        // vn_make_snapshot already ordered the clone kVNOrderBelow orig_wid.
-        // When orig_wid orders out, the clone naturally occupies orig_wid's exact
-        // depth in the window stack. All windows in front stay in front; all windows
-        // behind stay behind. Ongoing animations never jump or swallow each other.
-        VN_LOG("anim: respecting natural z-order for clone wid=%u (orig=%u, level=%d)",
-               clone_wid, orig_wid, vn_window_level(clone_win));
+    if (clone_wid != 0) {
+        CGSOrderOp op = existing_clone_wid != 0 ? kVNOrderBelow : kVNOrderAbove;
+        uint32_t rel = existing_clone_wid;
+        vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
     }
 
     os_unfair_lock_lock(&gAnimsLock);
@@ -1028,23 +988,7 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
     }
 
     if (wid != 0) {
-        bool active_click = false;
-        os_unfair_lock_lock(&gPreCloneLock);
-        int slot = vn_preclone_find_slot_locked(wid);
-        if (slot >= 0) {
-            double age = SLSCurrentRealTime() - gPreClones[slot].created_at;
-            if (gPreClones[slot].mouseUpTime == 0.0 && age < 1.0) {
-                // User is actively pressing the close button (mouse is down)
-                // and the window is ordering in/raising as part of the focus change.
-                // Do NOT discard the pre-clone!
-                active_click = true;
-            }
-        }
-        os_unfair_lock_unlock(&gPreCloneLock);
-
-        if (!active_click) {
-            vn_preclone_discard_wid(wid);
-        }
+        vn_preclone_discard_wid(wid);
     }
 }
 
@@ -1552,7 +1496,6 @@ static void vanish_init(void) {
     vn_window_set_shadow_enable     = (VNWSWindowSetShadowEnableFn)vn_skylight_symbol(kVNSymWSWindowSetShadowEnable);
     vn_window_release_shadow_resources = (VNWSWindowReleaseShadowResourcesFn)vn_skylight_symbol(kVNSymWSWindowReleaseShadowResources);
     vn_set_window_shadow_parameters = (VNSLSSetWindowShadowParametersFn)vn_skylight_symbol(kVNSymSLSSetWindowShadowParameters);
-    vn_set_level_internal           = (VNWSWindowSetLevelInternalFn)vn_skylight_symbol(kVNSymWSWindowSetLevelInternal);
 
     if (!targetOrder || !targetRelease || !vn_window_by_id ||
         !vn_schedule_callback || !vn_set_mesh_warp || !vn_clipped_frame_bounds) {
