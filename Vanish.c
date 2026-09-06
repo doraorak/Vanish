@@ -544,6 +544,115 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
     }
 }
 
+#pragma mark - Missed-Close Audit
+
+// Every way a close can end up with the stock animation leaves through a
+// different branch, and they all converge on the same safe fallback: pass the
+// order-out through untouched. That is the right behaviour and it is why the
+// rare misses are hard to place -- by the time the pass-through is logged, the
+// decision that caused it happened hundreds of milliseconds earlier, buried in
+// other windows' traffic.
+//
+// This records the last decision taken for a wid so the pass-through line can
+// say why there was no pre-clone, instead of leaving it to be correlated by
+// hand. It changes no behaviour; it only makes the existing behaviour legible.
+
+typedef enum {
+    kVNAuditNone = 0,
+    kVNAuditSkippedAnimating,
+    kVNAuditDoubleClick,
+    kVNAuditDoubleClickSuppressed,
+    kVNAuditNoTrafficLight,
+    kVNAuditYellowGreen,
+    kVNAuditCloneFailed,
+    kVNAuditCloneReady,
+    kVNAuditTimedOut,
+} VNAuditKind;
+
+typedef struct {
+    uint32_t    wid;
+    VNAuditKind kind;
+    uint64_t    at_ms;
+    double      lx, ly;
+} VNAuditEntry;
+
+#define MAX_AUDITS 64
+static VNAuditEntry   gAudits[MAX_AUDITS] = {0};
+static os_unfair_lock gAuditLock = OS_UNFAIR_LOCK_INIT;
+
+static const char *vn_audit_kind_name(VNAuditKind kind) {
+    switch (kind) {
+        case kVNAuditSkippedAnimating:      return "mouse-down skipped, wid still claimed by a running animation";
+        case kVNAuditDoubleClick:           return "read as a double-click, pre-clone discarded";
+        case kVNAuditDoubleClickSuppressed: return "inside the 600ms double-click suppression window";
+        case kVNAuditNoTrafficLight:        return "click was not on a traffic light";
+        case kVNAuditYellowGreen:           return "click was on yellow/green";
+        case kVNAuditCloneFailed:           return "red button hit but the clone could not be built";
+        case kVNAuditCloneReady:            return "red button hit, pre-clone was ready";
+        case kVNAuditTimedOut:              return "pre-clone was swept by the cleanup timer";
+        default:                            return "no decision recorded";
+    }
+}
+
+static void vn_audit_record(uint32_t wid, VNAuditKind kind, double lx, double ly) {
+    if (wid == 0) return;
+    uint64_t now = vn_now_ms();
+
+    os_unfair_lock_lock(&gAuditLock);
+    int idx = -1;
+    for (int i = 0; i < MAX_AUDITS; i++) {
+        if (gAudits[i].wid == wid) { idx = i; break; }
+    }
+    if (idx < 0) {
+        for (int i = 0; i < MAX_AUDITS; i++) {
+            if (gAudits[i].wid == 0) { idx = i; break; }
+        }
+    }
+    if (idx < 0) {
+        int oldest = 0;
+        for (int i = 1; i < MAX_AUDITS; i++) {
+            if (gAudits[i].at_ms < gAudits[oldest].at_ms) oldest = i;
+        }
+        idx = oldest;
+    }
+    gAudits[idx] = (VNAuditEntry){ .wid = wid, .kind = kind, .at_ms = now, .lx = lx, .ly = ly };
+    os_unfair_lock_unlock(&gAuditLock);
+}
+
+// Fills `out` with a clause naming the last decision for `wid`, ready to be
+// appended to a pass-through line.
+static void vn_audit_describe(uint32_t wid, char *out, size_t n) {
+    if (!out || n == 0) return;
+    out[0] = '\0';
+    if (wid == 0) return;
+
+    VNAuditKind kind = kVNAuditNone;
+    uint64_t at_ms = 0;
+    double lx = 0.0, ly = 0.0;
+
+    os_unfair_lock_lock(&gAuditLock);
+    for (int i = 0; i < MAX_AUDITS; i++) {
+        if (gAudits[i].wid == wid) {
+            kind = gAudits[i].kind;
+            at_ms = gAudits[i].at_ms;
+            lx = gAudits[i].lx;
+            ly = gAudits[i].ly;
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&gAuditLock);
+
+    if (kind == kVNAuditNone) {
+        // No mouse-down was ever processed for this wid. Either the click landed
+        // on a different window than the one that closed, or this close did not
+        // come from a click at all.
+        snprintf(out, n, " [audit: no mouse-down ever recorded for this wid]");
+        return;
+    }
+    snprintf(out, n, " [audit: %llums ago at (%.1f,%.1f) -- %s]",
+             (unsigned long long)(vn_now_ms() - at_ms), lx, ly, vn_audit_kind_name(kind));
+}
+
 #pragma mark - Window Pre-Cloning & Surface Capture
 
 #define MAX_PRECLONES 32
@@ -644,8 +753,11 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
             }
         }
         if (expired) {
-            VN_LOG("pre-clone: slot %d (wid=%u, age=%.2fs) timed out without close -- cleaning up",
-                   i, gPreClones[i].orig_wid, now - gPreClones[i].created_at);
+            VN_LOG("pre-clone: slot %d (wid=%u, age=%.2fs, %.2fs since mouse-up) timed out without close -- cleaning up",
+                   i, gPreClones[i].orig_wid, now - gPreClones[i].created_at,
+                   gPreClones[i].mouseUpTime > 0.0 ? now - gPreClones[i].mouseUpTime : 0.0);
+            vn_audit_record(gPreClones[i].orig_wid, kVNAuditTimedOut,
+                            gPreClones[i].mouseDownLocalPt.x, gPreClones[i].mouseDownLocalPt.y);
             clones_to_free[free_count] = gPreClones[i].clone;
             wids_to_free[free_count]   = gPreClones[i].clone_wid;
             free_count++;
@@ -1306,11 +1418,30 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
         if (wid != 0 && vn_window_by_id) {
             CGXWindow *win = vn_window_by_id(wid);
-            if (win && vn_is_target_window(win) && !vn_is_window_animating(wid, win)) {
+            if (win && vn_is_target_window(win)) {
                 const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
                 const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
                 double lx = local_pt->x;
                 double ly = local_pt->y;
+
+                // The only exit that logged nothing at all. vn_is_window_animating
+                // matches on wid, orig_wid or the window pointer, and WindowServer
+                // recycles window IDs -- so a window created while an earlier clone
+                // is still running can inherit the wid that animation still claims,
+                // and every mouse-down on it, red button included, was dropped here
+                // in silence. The close that follows finds no pre-clone and falls
+                // back to the stock animation, which is exactly the symptom.
+                //
+                // Behaviour is unchanged: this branch does what falling past the
+                // old condition did. It just says so first.
+                if (vn_is_window_animating(wid, win)) {
+                    if (lx <= 150.0 && ly <= 60.0) {
+                        VN_LOG("hit-test: wid=%u pt=(%.1f, %.1f) SKIPPED -- a running animation "
+                               "still claims this wid, so no pre-clone will be made", wid, lx, ly);
+                        vn_audit_record(wid, kVNAuditSkippedAnimating, lx, ly);
+                    }
+                    goto dispatch;
+                }
 
                 uint64_t now_ms = vn_now_ms();
 
@@ -1331,6 +1462,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 if (is_double_click) {
                     VN_LOG("hit-test: double-click detected on wid=%u (pt=%.1f,%.1f) -- discarding pre-clone and suppressing for 600ms",
                            wid, lx, ly);
+                    vn_audit_record(wid, kVNAuditDoubleClick, lx, ly);
                     vn_preclone_discard_wid(wid);
                     gDoubleClickSuppressUntilMs = now_ms + 600;
                     goto dispatch;
@@ -1338,6 +1470,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
                 if (suppressed_by_double_click) {
                     VN_LOG("hit-test: click on wid=%u suppressed due to active double-click window", wid);
+                    vn_audit_record(wid, kVNAuditDoubleClickSuppressed, lx, ly);
                     vn_preclone_discard_wid(wid);
                     goto dispatch;
                 }
@@ -1354,6 +1487,11 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                            is_red ? "RED (close)"
                                   : is_yellow_or_green ? "yellow/green (no animation)"
                                                        : "no traffic light -- NO PRE-CLONE");
+                }
+                if (!is_red && !is_yellow_or_green) {
+                    vn_audit_record(wid, kVNAuditNoTrafficLight, lx, ly);
+                } else if (is_yellow_or_green) {
+                    vn_audit_record(wid, kVNAuditYellowGreen, lx, ly);
                 }
 
                 if (is_red) {
@@ -1394,12 +1532,14 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                         os_unfair_lock_unlock(&gPreCloneLock);
 
                         VN_LOG("pre-clone: ready! wid=%u clone_wid=%u in slot %d (ordered below original)", wid, clone_wid, slot);
+                        vn_audit_record(wid, kVNAuditCloneReady, lx, ly);
 
                         if (vn_schedule_callback) {
                             vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 30.0);
                         }
                     } else {
                         VN_LOG("pre-clone: failed to create clone for wid=%u", wid);
+                        vn_audit_record(wid, kVNAuditCloneFailed, lx, ly);
                     }
                 } else if (is_yellow_or_green) {
                     VN_LOG(">>> Mouse down in YELLOW/GREEN button of wid=%u (pt=(%.1f, %.1f)) -- ignoring close animation",
@@ -1512,8 +1652,10 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     uint64_t non_close_time = atomic_load_explicit(&gNonCloseTimeMs, memory_order_relaxed);
                     uint32_t non_close_wid = atomic_load_explicit(&gNonCloseWid, memory_order_relaxed);
                     if (non_close_wid == wid && (now_ms - non_close_time) < 2000) {
-                        VN_LOG("Window wid=%u orderOut is from Miniaturize/Fullscreen (non-close recorded %llu ms ago) -- passing through without animation",
-                               wid, (now_ms - non_close_time));
+                        char audit[192] = {0};
+                        vn_audit_describe(wid, audit, sizeof(audit));
+                        VN_LOG("Window wid=%u orderOut is from Miniaturize/Fullscreen (non-close recorded %llu ms ago) -- passing through without animation%s",
+                               wid, (now_ms - non_close_time), audit);
                         vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
                         return;
                     }
@@ -1531,7 +1673,10 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
-                        VN_LOG("Window wid=%u orderOut has no pre-clone (not closed via red button) -- passing through directly", wid);
+                        char audit[192] = {0};
+                        vn_audit_describe(wid, audit, sizeof(audit));
+                        VN_LOG("Window wid=%u orderOut has no pre-clone (not closed via red button) -- passing through directly%s",
+                               wid, audit);
                         vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
                         return;
                     }
@@ -1590,7 +1735,10 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     uint64_t non_close_time = atomic_load_explicit(&gNonCloseTimeMs, memory_order_relaxed);
                     uint32_t non_close_wid = atomic_load_explicit(&gNonCloseWid, memory_order_relaxed);
                     if (non_close_wid == wid && (now_ms - non_close_time) < 2000) {
-                        VN_LOG("Window wid=%u multi-orderOut is from Miniaturize/Fullscreen -- passing through without animation", wid);
+                        char audit[192] = {0};
+                        vn_audit_describe(wid, audit, sizeof(audit));
+                        VN_LOG("Window wid=%u multi-orderOut is from Miniaturize/Fullscreen -- passing through without animation%s",
+                               wid, audit);
                         pass_wids[pass_count] = wid;
                         pass_ops[pass_count] = ops[i];
                         pass_rel[pass_count] = relativeTo ? relativeTo[i] : 0;
@@ -1611,7 +1759,10 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
-                        VN_LOG("Window wid=%u multi-orderOut has no pre-clone (not closed via red button) -- passing through", wid);
+                        char audit[192] = {0};
+                        vn_audit_describe(wid, audit, sizeof(audit));
+                        VN_LOG("Window wid=%u multi-orderOut has no pre-clone (not closed via red button) -- passing through%s",
+                               wid, audit);
                         pass_wids[pass_count] = wid;
                         pass_ops[pass_count] = ops[i];
                         pass_rel[pass_count] = relativeTo ? relativeTo[i] : 0;
