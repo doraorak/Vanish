@@ -154,8 +154,11 @@ if [ -d "$DIR/layout/Library/TweakInject/Preferences/PreferenceBundles/VanishPre
     cp -R "$DIR/layout/Library/TweakInject/Preferences/PreferenceBundles/VanishPrefs.bundle" "$DIR/packages/VanishPrefs.bundle"
 fi
 
-echo "==> 5. Compiling VanishTest test app..."
-clang -arch arm64e -isysroot "$SDK_PATH" -framework Cocoa -o "$DIR/packages/VanishTest" "$DIR/tools/VanishTest.m"
-codesign -f -s - "$DIR/packages/VanishTest"
+if [ -f "$DIR/tools/VanishTest.m" ]; then
+    echo "==> 5. Compiling VanishTest test app..."
+    clang -arch arm64e -isysroot "$SDK_PATH" -framework Cocoa -o "$DIR/packages/VanishTest" "$DIR/tools/VanishTest.m"
+    codesign -f -s - "$DIR/packages/VanishTest"
+fi
 
-echo "==> Done: $OUTPUT_DEB, $DIR/packages/$BUNDLE, $DIR/packages/VanishPrefs.bundle, and $DIR/packages/VanishTest"
+echo "==> Done: $OUTPUT_DEB, $DIR/packages/$BUNDLE"
+

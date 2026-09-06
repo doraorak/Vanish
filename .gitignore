@@ -1,5 +1,10 @@
 .theos/
 packages/
-Vanish.bundle/
+*.bundle/
+*.deb
+.stage/
+tools/
 .DS_Store
+*.swp
+*~
 
