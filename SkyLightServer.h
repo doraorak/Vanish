@@ -17,6 +17,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef int SLSConnectionID;
+typedef uint32_t SLSWindowID;
+
+/// The window server connection for this process.
+extern SLSConnectionID SLSMainConnectionID(void);
+
+/// The server's clock, in seconds. Exported by SkyLight.
+extern double SLSCurrentRealTime(void);
 
 /// Opaque server-side types. Never dereferenced here: the field offsets are the
 /// part of this that Apple can change without renaming anything.
@@ -272,5 +286,9 @@ typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);
 typedef void (*VNWSWindowReleaseShadowResourcesFn)(CGXWindow *);
 typedef CGError (*VNSLSSetWindowShadowParametersFn)(uint32_t cid, uint32_t wid, float density, float radius, float xOffset, float yOffset);
 typedef void (*VNPostEventByConnectionFn)(CGXConnection *, void *);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SkyLightServer_h */

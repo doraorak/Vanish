@@ -43,13 +43,11 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach-o/dyld.h>
-
-#include "SLSPrivate.h"
-#include "SkyLightServer.h"
-
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <stdatomic.h>
+
+#include "SkyLightServer.h"
 
 #pragma mark - Logging
 
