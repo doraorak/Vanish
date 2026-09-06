@@ -72,6 +72,9 @@ enum { kVNOrderBelow = -1, kVNOrderOut = 0, kVNOrderAbove = 1 };
 /// void CGXPostEventByConnection(CGXConnection *conn, void *event)
 #define kVNSymPostEventByConnection "_CGXPostEventByConnection"
 
+/// void CGXWindow::set_level_internal(CGXConnection *conn, int level, short sublevel)
+#define kVNSymWSWindowSetLevelInternal "__ZN9CGXWindow18set_level_internalEP13CGXConnectionis"
+
 #pragma mark - Struct offsets
 
 /// Window level at offset 0x20.
@@ -84,6 +87,16 @@ static inline int32_t vn_window_level(const CGXWindow *win) {
     int32_t lvl = 0;
     __builtin_memcpy(&lvl, (const char *)win + kVNWindowLevelOffset, sizeof(lvl));
     return lvl;
+}
+
+/// Window sublevel at offset 0x28.
+#define kVNWindowSublevelOffset 0x28
+
+static inline int16_t vn_window_sublevel(const CGXWindow *win) {
+    if (!win) return 0;
+    int16_t sl = 0;
+    __builtin_memcpy(&sl, (const char *)win + kVNWindowSublevelOffset, sizeof(sl));
+    return sl;
 }
 
 /// Workspace data pointer at offset 0x258.
@@ -154,6 +167,7 @@ typedef void (*VNReleaseWindowFn)(CGXConnection *, CGXWindow *);
 typedef pid_t (*VNWindowGetOwningPIDFn)(CGXWindow *);
 typedef int (*VNGetConnectionAppNameFn)(uint32_t, char *, size_t);
 typedef void (*VNUpdateCAVisibilityFn)(CGXWindow *, bool);
+typedef void (*VNWSWindowSetLevelInternalFn)(CGXWindow *, CGXConnection *, int32_t, int16_t);
 
 
 #pragma mark - Server-Internal Operations
