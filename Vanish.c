@@ -54,7 +54,29 @@
 #define ENABLE_LOGS 1
 
 #if ENABLE_LOGS
+// Runtime kill switch, checked lock-free before any work: with logsEnabled=false
+// in prefs, a VN_LOG call costs one relaxed atomic load and a return. Wired from
+// vn_reload_prefs_locked() rather than read here via vn_get_prefs() -- that call
+// does its own stat() every time, and vn_is_target_window() already polls prefs
+// at high frequency in the hot path, so piggybacking on that existing poll avoids
+// adding a *new* per-log-call syscall on top of the one this flag is meant to let
+// us skip.
+static _Atomic bool gLogsEnabled = true;
+
+// Opened once in vanish_init() and kept open for the process's lifetime, instead
+// of the open+fchmod+write+close every call used to do. Measured ~12x cheaper per
+// call against the real log file (persistent fd: ~1.8us/call vs ~21-25us/call for
+// the open/close cycle, worst case 94us). Safe to share across threads with no
+// extra locking: POSIX O_APPEND guarantees each write() to a regular file lands
+// in a distinct, non-overlapping byte range at the current end-of-file atomically
+// -- that guarantee is about append positioning, not PIPE_BUF-style size limits,
+// so it holds for our ~1200-byte lines same as it held for the single-line writes
+// this replaces.
+static int gLogFd = -1;
+
 static void vn_log_to_file(const char *fmt, ...) {
+    if (!atomic_load_explicit(&gLogsEnabled, memory_order_relaxed)) return;
+
     char body[1024];
     va_list args;
     va_start(args, fmt);
@@ -81,17 +103,55 @@ static void vn_log_to_file(const char *fmt, ...) {
     int line_len = snprintf(line, sizeof(line), "[%s] [Vanish:%d] %s", time_str, getpid(), body);
     if (line_len <= 0) return;
 
-    int fd = open("/tmp/vanish_ws.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
-    if (fd >= 0) {
-        fchmod(fd, 0666);
-        write(fd, line, (size_t)line_len);
-        close(fd);
+    if (gLogFd >= 0) {
+        write(gLogFd, line, (size_t)line_len);
     }
 }
 #define VN_LOG(fmt, ...) vn_log_to_file(fmt, ##__VA_ARGS__)
 #else
 #define VN_LOG(fmt, ...) do {} while (0)
 #endif
+
+// Root-cause investigation for the Chrome-class close delay: brackets one
+// call with SLSCurrentRealTime() (already resolved, already used for
+// sub-millisecond animation timing elsewhere in this file -- no new symbol
+// needed) and logs the elapsed microseconds. Wraps the call rather than
+// replacing it, so this is purely additive and changes no behavior.
+//
+// Sampling WindowServer got this far and no further: it can show a thread
+// was somewhere inside a given call, but not cleanly separate "cost of this
+// one event" from ambient cost of everything else happening in the capture
+// window. This measures the one thing sampling couldn't: how long this
+// specific call takes, for this specific window, every single time -- which
+// is what actually lets Chrome and Calculator be compared in hard numbers
+// instead of inference.
+#define VN_TIME_CALL(label, wid_expr, app_expr, call_expr) do {                          \
+    double _vn_t0 = SLSCurrentRealTime();                                                \
+    call_expr;                                                                           \
+    double _vn_dt_us = (SLSCurrentRealTime() - _vn_t0) * 1e6;                            \
+    VN_LOG("timing: %s wid=%u app='%s' took %.1fus", label, (wid_expr), (app_expr), _vn_dt_us); \
+} while (0)
+
+// Whole-function safety net: catches TOTAL time in a hook from entry to
+// whichever return statement actually fires, without having to find and wrap
+// every individual return path by hand. Uses the compiler's `cleanup`
+// attribute (GCC/Clang extension, not a runtime dependency) -- the destructor
+// runs when the variable goes out of scope, i.e. at function exit, no matter
+// which `return` got there. This is the net under the per-call VN_TIME_CALL
+// sites: if something inside a hook is slow that isn't behind any of the
+// individually-wrapped calls (a lock held longer than expected, a loop, a
+// future code path nobody thought to wrap), the TOTAL number for that hook
+// invocation will still show it, even without knowing in advance where to
+// look.
+typedef struct { double t0; const char *label; uint32_t wid; } VNScopeTimer;
+static void vn_scope_timer_end(VNScopeTimer *t) {
+    double dt_us = (SLSCurrentRealTime() - t->t0) * 1e6;
+    VN_LOG("timing: %s-TOTAL wid=%u took %.1fus", t->label, t->wid, dt_us);
+}
+// One per function scope (not nested/repeated within the same function), so
+// a fixed name is fine -- each use lives in its own separate function body.
+#define VN_TIME_SCOPE(label, wid_expr) \
+    __attribute__((cleanup(vn_scope_timer_end))) VNScopeTimer _vn_scope_timer = { SLSCurrentRealTime(), (label), (uint32_t)(wid_expr) }
 
 #pragma mark - Symbol resolution
 
@@ -174,12 +234,14 @@ static VNDynWindowIsOrderedInFn     vn_dyn_window_is_ordered_in = NULL;
 typedef struct {
     bool  enabled;
     bool  shadows;
+    bool  logsEnabled;
+    bool  skipCloneCreation;
     float refreshRate;
     float duration;
     char  targetApp[256];
 } VNPreferences;
 
-static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .refreshRate = 120.0f, .duration = 0.25f, .targetApp = "all" };
+static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .logsEnabled = true, .skipCloneCreation = false, .refreshRate = 120.0f, .duration = 0.25f, .targetApp = "all" };
 static os_unfair_lock gPrefsLock = OS_UNFAIR_LOCK_INIT;
 static struct timespec gPrefsMtime = {0};
 static bool           gPrefsValid = false;
@@ -187,6 +249,8 @@ static bool           gPrefsValid = false;
 static void vn_reload_prefs_locked(void) {
     gPrefs.enabled = true;
     gPrefs.shadows = true;
+    gPrefs.logsEnabled = true;
+    gPrefs.skipCloneCreation = false;
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
@@ -219,6 +283,32 @@ static void vn_reload_prefs_locked(void) {
                         CFBooleanRef shadowsVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("shadows"));
                         if (shadowsVal && CFGetTypeID(shadowsVal) == CFBooleanGetTypeID()) {
                             gPrefs.shadows = CFBooleanGetValue(shadowsVal);
+                        }
+
+                        // For A/B-ing Vanish's own overhead against a close's perceived
+                        // latency: with this off, VN_LOG returns before doing any work
+                        // at all (see the gLogsEnabled check at the top of vn_log_to_file).
+                        CFBooleanRef logsVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("logsEnabled"));
+                        if (logsVal && CFGetTypeID(logsVal) == CFBooleanGetTypeID()) {
+                            gPrefs.logsEnabled = CFBooleanGetValue(logsVal);
+                        }
+
+                        // Root-cause isolation switch: with this on, every hook stays
+                        // fully installed and does all its normal work (app-name
+                        // resolution, hit-testing, locking, the timing instrumentation
+                        // itself) EXCEPT the one step that puts a second, real window
+                        // into WindowServer's window list -- CreateCloneOfWindow is
+                        // never called, vn_make_snapshot returns NULL as if cloning had
+                        // failed, and the close falls through to the existing "no
+                        // clone -- passing through directly" path, exactly like a
+                        // failed clone always has. This isolates "does the clone's
+                        // mere EXISTENCE change something in the closing app's own
+                        // processing" from "is Vanish's own code slow" -- the latter is
+                        // already measured at under 11ms in every case; this checks the
+                        // one variable that measuring call durations cannot see.
+                        CFBooleanRef skipCloneVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("skipCloneCreation"));
+                        if (skipCloneVal && CFGetTypeID(skipCloneVal) == CFBooleanGetTypeID()) {
+                            gPrefs.skipCloneCreation = CFBooleanGetValue(skipCloneVal);
                         }
 
                         CFTypeRef rrVal = CFDictionaryGetValue(dict, CFSTR("refreshRate"));
@@ -265,9 +355,15 @@ static void vn_reload_prefs_locked(void) {
     } else {
         gPrefsValid = false;
     }
+
+    // Keep the lock-free logging gate in sync regardless of which path above set
+    // gPrefs.logsEnabled -- the reset-to-defaults assignment at the top of this
+    // function already guarantees it has a value even when the plist is missing.
+    atomic_store_explicit(&gLogsEnabled, gPrefs.logsEnabled, memory_order_relaxed);
 }
 
 static VNPreferences vn_get_prefs(void) {
+    VN_TIME_SCOPE("get-prefs", 0);
     struct stat st;
     bool have_stat = (stat("/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist", &st) == 0);
 
@@ -300,7 +396,16 @@ static float vn_duration(void) {
 
 #pragma mark - Window Eligibility Filtering
 
-static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen, pid_t *out_pid) {
+// out_source, when non-NULL, records which path actually resolved the name:
+// 'c' = the cheap internal SkyLight connection-table lookup, 'p'/'n' = the
+// proc_pidpath/proc_name syscall fallbacks (only reached when the internal
+// lookup fails or cid==0), '-' = nothing resolved. This runs unconditionally
+// on every target-window ordering op system-wide -- added to find out, for
+// apps like Chrome specifically, whether the cheap path or the syscall
+// fallback is actually what's firing, since that's never been measured.
+static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen, pid_t *out_pid, char *out_source) {
+    VN_TIME_SCOPE("get-window-app-name", 0);
+    if (out_source) *out_source = '-';
     if (!win || !out_name || maxlen == 0) return false;
     out_name[0] = '\0';
 
@@ -319,6 +424,7 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
             char buf[256] = {0};
             if (vn_get_connection_app_name(cid, buf, sizeof(buf)) == 0 && buf[0] != '\0') {
                 strncpy(out_name, buf, maxlen - 1);
+                if (out_source) *out_source = 'c';
                 return true;
             }
         }
@@ -330,10 +436,12 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
             char *slash = strrchr(path, '/');
             if (slash && slash[1] != '\0') {
                 strncpy(out_name, slash + 1, maxlen - 1);
+                if (out_source) *out_source = 'p';
                 return true;
             }
         }
         if (proc_name(pid, out_name, (uint32_t)maxlen) > 0 && out_name[0] != '\0') {
+            if (out_source) *out_source = 'n';
             return true;
         }
     }
@@ -343,13 +451,14 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
 
 static bool vn_is_target_window(CGXWindow *win) {
     if (!win) return false;
+    VN_TIME_SCOPE("is-target-window", 0);
 
     VNPreferences prefs = vn_get_prefs();
     if (!prefs.enabled) return false;
 
     char name[256] = {0};
     pid_t pid = 0;
-    bool has_name = vn_get_window_app_name(win, name, sizeof(name), &pid);
+    bool has_name = vn_get_window_app_name(win, name, sizeof(name), &pid, NULL);
 
     if (prefs.targetApp[0] == '\0' || strcasecmp(prefs.targetApp, "all") == 0) {
         if (has_name) {
@@ -489,7 +598,9 @@ static void vn_delayed_clone_release(void *ctx, double when) {
 }
 
 static void vn_finish_animation_for_id(uint64_t anim_id) {
+    VN_TIME_SCOPE("finish-animation", (uint32_t)anim_id);
     uint32_t clone_wid = 0;
+    uint32_t finished_orig_wid = 0;
     CGXWindow *clone_win = NULL;
     pid_t finished_pid = 0;
     uint64_t finished_psn = 0;
@@ -501,6 +612,7 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
     for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
         if (gActiveAnims[i].is_animating && gActiveAnims[i].anim_id == anim_id) {
             clone_wid = gActiveAnims[i].clone_wid;
+            finished_orig_wid = gActiveAnims[i].orig_wid;
             clone_win = gActiveAnims[i].clone_win;
             finished_pid = gActiveAnims[i].pid;
             finished_psn = gActiveAnims[i].psn;
@@ -527,15 +639,22 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
         atomic_store_explicit(&gLastWhatsAppClosedTimeMs, vn_now_ms(), memory_order_relaxed);
     }
 
-    VN_LOG("finish_animation: hiding and ordering out clone wid=%u win=%p (app='%s' pid=%d psn=0x%llx is_wa=%d release deferred 100ms)",
-           clone_wid, clone_win, finished_app, finished_pid, finished_psn, finished_is_wa);
+    // Join key for "how long from mouseUp to visually complete": clone_wid ties
+    // back to the "starting fade animation for clone wid=%u (orig=%u...)" line
+    // logged at animation start, which has both wids together. orig_wid here is
+    // often already 0 by this point -- vn_hooked_release_window clears it once
+    // the original's own teardown is confirmed, well before a ~240ms animation
+    // finishes -- so it's included only as a bonus when still available, not
+    // relied on as the primary join key.
+    VN_LOG("finish_animation: hiding and ordering out clone wid=%u orig_wid=%u win=%p (app='%s' pid=%d psn=0x%llx is_wa=%d release deferred 100ms)",
+           clone_wid, finished_orig_wid, clone_win, finished_app, finished_pid, finished_psn, finished_is_wa);
     if (clone_win && vn_update_ca_visibility) {
         vn_update_ca_visibility(clone_win, false);
     }
     if (clone_wid != 0) {
         CGSOrderOp op = kVNOrderOut;
         uint32_t rel = 0;
-        vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
+        VN_TIME_CALL("order-clone-out-finish", clone_wid, finished_app, vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false));
     }
     if (vn_schedule_callback && clone_win) {
         vn_schedule_callback(vn_delayed_clone_release, clone_win, SLSCurrentRealTime() + 0.1);
@@ -601,6 +720,7 @@ static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone
 
 static void vn_preclone_discard_wid(uint32_t orig_wid) {
     if (orig_wid == 0) return;
+    VN_TIME_SCOPE("preclone-discard", orig_wid);
     uint32_t clone_wid = 0;
     os_unfair_lock_lock(&gPreCloneLock);
     CGXWindow *clone = vn_preclone_take_locked(orig_wid, &clone_wid, NULL, NULL, NULL, NULL, NULL, 0);
@@ -614,7 +734,7 @@ static void vn_preclone_discard_wid(uint32_t orig_wid) {
         if (clone_wid != 0) {
             CGSOrderOp op = kVNOrderOut;
             uint32_t rel = 0;
-            vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
+            VN_TIME_CALL("order-clone-out-discard", clone_wid, "?", vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false));
         }
         if (vn_system_window_release) {
             vn_system_window_release(clone);
@@ -662,7 +782,7 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
             if (wids_to_free[i] != 0) {
                 CGSOrderOp op = kVNOrderOut;
                 uint32_t rel = 0;
-                vn_orig_order(NULL, &wids_to_free[i], &op, &rel, 1, false);
+                VN_TIME_CALL("order-clone-out-sweep", wids_to_free[i], "?", vn_orig_order(NULL, &wids_to_free[i], &op, &rel, 1, false));
             }
             if (vn_system_window_release) {
                 vn_system_window_release(clones_to_free[i]);
@@ -677,6 +797,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
                                    uint32_t orig_wid, uint32_t *out_wid,
                                    CGRect *out_frame,
                                    CGSOrderOp place) {
+    VN_TIME_SCOPE("make-snapshot", orig_wid);
     if (!vn_create_clone || !vn_window_get_display || !vn_screen_rect_from_rect ||
         !vn_window_get_id) {
         VN_LOG("snapshot: symbols unresolved (clone=%p disp=%p rect=%p id=%p)",
@@ -714,14 +835,37 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         return NULL;
     }
 
+    if (prefs.skipCloneCreation) {
+        // Root-cause isolation: everything above this point (display lookup,
+        // bounds/content computation, the prefs fetch) ran identically to a
+        // normal close. The only thing skipped is the one step that puts a
+        // second, real window into WindowServer's window list. Falls through
+        // to the exact same "no clone" path a genuine CreateCloneOfWindow
+        // failure already takes -- the close proceeds with no animation, but
+        // every hook stays fully active and does all its normal work for it.
+        VN_LOG("snapshot: skipCloneCreation is on -- not calling CreateCloneOfWindow for wid=%u", orig_wid);
+        return NULL;
+    }
+
+    // The single biggest untimed opaque call before this pass: per
+    // SkyLightServer.h, CreateCloneOfWindow internally does new_window,
+    // set_level_internal, WSWindowSetTitle, set_window_list_tags,
+    // WSWindowSetDepth, WSWindowSetHasAlpha, WSWindowInternalSetSharedState,
+    // WSWindowSetResolution, WSWindowGetShape, WSWindowSetCapturedContent --
+    // by far the most complex single operation Vanish performs, and never
+    // measured on its own (only order-clone-in, the call *after* this one,
+    // was timed before).
+    double _vn_clone_t0 = SLSCurrentRealTime();
     CGXWindow *clone = vn_create_clone(win, frame, display, true);
+    double _vn_clone_dt_us = (SLSCurrentRealTime() - _vn_clone_t0) * 1e6;
+    VN_LOG("timing: create-clone wid=%u app='?' took %.1fus", orig_wid, _vn_clone_dt_us);
     if (!clone) { VN_LOG("snapshot: CreateCloneOfWindow returned NULL"); return NULL; }
 
     uint32_t wid = vn_window_get_id(clone);
     if (wid != 0) {
         CGSOrderOp op  = place;
         uint32_t   rel = orig_wid;
-        vn_orig_order(conn, &wid, &op, &rel, 1, false);
+        VN_TIME_CALL("order-clone-in", orig_wid, "?", vn_orig_order(conn, &wid, &op, &rel, 1, false));
         if (out_wid) *out_wid = wid;
         if (out_frame) *out_frame = frame;
     }
@@ -886,6 +1030,7 @@ static void vn_anim_tick(void *ctx, double when) {
 static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CGRect frame,
                                      pid_t pid, uint64_t psn, bool is_wa, const char *app_name) {
     if (!clone_win) return;
+    VN_TIME_SCOPE("start-clone-animation", orig_wid);
     uint32_t clone_wid = vn_window_get_id ? vn_window_get_id(clone_win) : 0;
     float dur = vn_duration();
 
@@ -965,7 +1110,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     if (clone_wid != 0) {
         CGSOrderOp op = lowest_clone_wid != 0 ? kVNOrderBelow : kVNOrderAbove;
         uint32_t rel = lowest_clone_wid;
-        vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
+        VN_TIME_CALL("order-clone-visible", clone_wid, app_name ? app_name : "?", vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false));
         VN_LOG("anim: clone wid=%u ordered %s rel=%u (anim_id=%llu)",
                clone_wid, op == kVNOrderBelow ? "below" : "above", rel, anim_id);
     }
@@ -1114,6 +1259,7 @@ static int vn_count_visible_windows_for_pid(pid_t pid, uint32_t exclude_wid) {
 }
 
 static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *win, pid_t pid, bool was_already_ordered_in) {
+    VN_TIME_SCOPE("cancel-animation-if-ordering-in", wid);
     if (pid == 0 && win && vn_window_get_owning_pid) {
         pid = vn_window_get_owning_pid(win);
     }
@@ -1185,7 +1331,7 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
         if (clone_wid != 0) {
             CGSOrderOp op = kVNOrderOut;
             uint32_t rel = 0;
-            vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
+            VN_TIME_CALL("order-clone-out-cancel", clone_wid, "?", vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false));
         }
         if (clone_to_release) {
             if (vn_schedule_callback) {
@@ -1208,6 +1354,7 @@ static _Atomic(uint32_t) gNonCloseWid = 0;
 
 static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     uint32_t rel_wid = (win && vn_window_get_id) ? vn_window_get_id(win) : 0;
+    VN_TIME_SCOPE("release-window-hook", rel_wid);
 
     if (rel_wid != 0) {
         vn_track_window_release(rel_wid);
@@ -1260,7 +1407,7 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
     os_unfair_lock_unlock(&gPreCloneLock);
 
-    vn_orig_release_window(conn, win);
+    VN_TIME_CALL("release-window", rel_wid, "?", vn_orig_release_window(conn, win));
 
     if (clone_to_animate) {
         VN_LOG(">>> Close seen at release_window for wid=%u (app='%s' pid=%d psn=0x%llx is_wa=%d) -- animating pre-clone wid=%u",
@@ -1337,6 +1484,12 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
     if (conn) {
         pid = *(const pid_t *)((const char *)conn + 0x268);
     }
+    // Hoisted so it's available at dispatch: below for the timing log,
+    // regardless of which branch (if any) ran. Every branch already reads
+    // this same event+0x3c field independently; this doesn't change that,
+    // it's a second, harmless read of the same value for a different use.
+    uint32_t dispatch_wid = *(const uint32_t *)((const char *)event + 0x3c);
+    VN_TIME_SCOPE("post-event-hook", dispatch_wid);
 
     if (type == 1) {
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
@@ -1384,7 +1537,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 if (lx <= 150.0 && ly <= 60.0) {
                     char hit_app[256] = {0};
                     pid_t hit_pid = 0;
-                    vn_get_window_app_name(win, hit_app, sizeof(hit_app), &hit_pid);
+                    vn_get_window_app_name(win, hit_app, sizeof(hit_app), &hit_pid, NULL);
                     VN_LOG("hit-test: app='%s' pid=%d wid=%u pt=(%.1f, %.1f) lvl=%d -> %s",
                            hit_app, hit_pid, wid, lx, ly, vn_window_level(win),
                            is_red ? "RED (close)"
@@ -1394,7 +1547,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
                 if (is_red) {
                     char app[256] = {0};
-                    vn_get_window_app_name(win, app, sizeof(app), &pid);
+                    vn_get_window_app_name(win, app, sizeof(app), &pid, NULL);
 
                     CGXConnection *c = conn ? conn : vn_window_connection(win);
                     uint64_t psn = vn_conn_get_psn(c);
@@ -1475,6 +1628,21 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 }
                 os_unfair_lock_unlock(&gPreCloneLock);
 
+                // The success path never logged mouseUp at all before -- only the
+                // abort path (near_red false) did. Without this there was no way
+                // to measure mouseUp-to-close-visually-complete, which is what a
+                // person actually experiences, as opposed to mousedown-to-close-
+                // signal, which includes the physical click duration and stops
+                // before any animation plays. This only fires when a genuine
+                // red-button pre-clone exists for this exact wid -- same rarity
+                // as the existing "Mouse down in RED CLOSE box" line, not a
+                // high-volume path, so resolving the app name here is fine.
+                char up_app[256] = {0};
+                pid_t up_pid = 0;
+                CGXWindow *up_win = vn_window_by_id ? vn_window_by_id(wid) : NULL;
+                if (up_win) vn_get_window_app_name(up_win, up_app, sizeof(up_app), &up_pid, NULL);
+                VN_LOG(">>> Mouse up on RED CLOSE box (app='%s' pid=%d wid=%u)", up_app, up_pid, wid);
+
                 if (vn_schedule_callback) {
                     vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.0);
                 }
@@ -1518,13 +1686,21 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
 dispatch:
     if (vn_orig_post_event) {
-        vn_orig_post_event(conn, event);
+        // Fires for every mouse/keyboard event system-wide, not just target
+        // windows -- deliberately no app-name resolution here (that's a
+        // syscall on the fallback path, per vn_get_window_app_name, and
+        // would add cost to the mouseUp/mouseDrag paths that today do zero
+        // syscalls of their own). Correlate by wid against the app name
+        // already logged in the surrounding "Intercepted close"/pre-clone
+        // lines for the same wid instead.
+        VN_TIME_CALL("post-event", dispatch_wid, "?", vn_orig_post_event(conn, event));
     }
 }
 
 static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                                  const CGSOrderOp *ops, const uint32_t *relativeTo,
                                  unsigned count, bool spaceSwitch) {
+    VN_TIME_SCOPE("order-window-list-hook", (wids && count > 0) ? wids[0] : 0);
     if (ops && count >= 1) {
         if (count == 1) {
             uint32_t wid = wids ? wids[0] : 0;
@@ -1532,7 +1708,8 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
             if (win && vn_is_target_window(win)) {
                 char app[256] = {0};
                 pid_t pid = 0;
-                vn_get_window_app_name(win, app, sizeof(app), &pid);
+                char name_src = '-';
+                vn_get_window_app_name(win, app, sizeof(app), &pid, &name_src);
 
                 if (ops[0] == kVNOrderOut) {
                     vn_track_window_order(wid, pid, kVNOrderOut, win);
@@ -1550,7 +1727,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     if (non_close_wid == wid && (now_ms - non_close_time) < 2000) {
                         VN_LOG("Window wid=%u orderOut is from Miniaturize/Fullscreen (non-close recorded %llu ms ago) -- passing through without animation",
                                wid, (now_ms - non_close_time));
-                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
+                        VN_TIME_CALL("order-passthrough-nonclose", wid, app, vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch));
                         return;
                     }
 
@@ -1568,7 +1745,7 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
 
                     if (!clone || clone_wid == 0) {
                         VN_LOG("Window wid=%u orderOut has no pre-clone (not closed via red button) -- passing through directly", wid);
-                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
+                        VN_TIME_CALL("order-passthrough-noclone", wid, app, vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch));
                         return;
                     }
 
@@ -1576,15 +1753,15 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     if (!anim_is_wa && (strcasecmp(final_app, "WhatsApp") == 0)) {
                         anim_is_wa = true;
                     }
-                    VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
-                           wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
+                    VN_LOG(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d name_src=%c)",
+                           wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, name_src);
 
-                    vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
+                    VN_TIME_CALL("order-out-close", wid, final_app, vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch));
                     vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
                     return;
                 } else {
-                    VN_LOG("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d",
-                           app, pid, wid, ops[0], vn_window_level(win));
+                    VN_LOG("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d name_src=%c",
+                           app, pid, wid, ops[0], vn_window_level(win), name_src);
 
                     bool was_already_ordered_in = vn_check_window_is_ordered_in(wid, win);
                     vn_track_window_order(wid, pid, ops[0], win);
@@ -1592,7 +1769,13 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
                 }
             }
 
-            vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
+            // The universal single-window fallback -- every non-close order op
+            // on every window system-wide, target or not, lands here. Highest
+            // volume of any wrapped call site; deliberately no app-name
+            // resolution added (win/app aren't in scope here for non-target
+            // windows without paying for another vn_get_window_app_name call,
+            // which would defeat the point of measuring this cheaply).
+            VN_TIME_CALL("order-passthrough-generic", wid, "?", vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch));
             return;
         }
 
@@ -1608,10 +1791,11 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
             if (win && vn_is_target_window(win)) {
                 char app[256] = {0};
                 pid_t pid = 0;
-                vn_get_window_app_name(win, app, sizeof(app), &pid);
+                char name_src = '-';
+                vn_get_window_app_name(win, app, sizeof(app), &pid, &name_src);
 
-                VN_LOG("Target order op: app='%s' pid=%d count=%u i=%u wid=%u op=%d lvl=%d",
-                       app, pid, count, i, wid, ops[i], vn_window_level(win));
+                VN_LOG("Target order op: app='%s' pid=%d count=%u i=%u wid=%u op=%d lvl=%d name_src=%c",
+                       app, pid, count, i, wid, ops[i], vn_window_level(win), name_src);
 
                 if (ops[i] == kVNOrderOut) {
                     vn_track_window_order(wid, pid, kVNOrderOut, win);
@@ -1683,12 +1867,13 @@ static void vn_order_window_list(CGXConnection *conn, const uint32_t *wids,
         }
 
         if (pass_count > 0) {
-            vn_orig_order(conn, pass_wids, pass_ops, pass_rel, pass_count, spaceSwitch);
+            // Batch call, no single wid -- pass_wids[0] as a representative tag.
+            VN_TIME_CALL("order-passthrough-batch", pass_wids[0], "?", vn_orig_order(conn, pass_wids, pass_ops, pass_rel, pass_count, spaceSwitch));
         }
         return;
     }
 
-    vn_orig_order(conn, wids, ops, relativeTo, count, spaceSwitch);
+    VN_TIME_CALL("order-passthrough-outer", (wids && count > 0) ? wids[0] : 0, "?", vn_orig_order(conn, wids, ops, relativeTo, count, spaceSwitch));
 }
 
 #pragma mark - Entry
@@ -1697,6 +1882,16 @@ extern void MSHookFunction(void *symbol, void *replace, void **result);
 
 __attribute__((constructor))
 static void vanish_init(void) {
+    // First thing, before anything else -- including the earliest VN_LOG calls
+    // below (e.g. the "not WindowServer" line), which need gLogFd already open
+    // to actually land anywhere. gLogsEnabled's own static initializer already
+    // defaults it true, so nothing else is needed to make early logging work
+    // before prefs have ever been loaded.
+    gLogFd = open("/tmp/vanish_ws.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
+    if (gLogFd >= 0) {
+        fchmod(gLogFd, 0666);
+    }
+
     char self[1024] = {0};
     uint32_t len = (uint32_t)sizeof(self);
     if (_NSGetExecutablePath(self, &len) != 0) return;

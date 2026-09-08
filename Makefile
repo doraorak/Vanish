@@ -10,13 +10,16 @@
 TARGET := macosx:clang:latest:15.0
 ARCHS = arm64e
 
+GO_EASY_ON_ME = 1
+
 include $(THEOS)/makefiles/common.mk
+
 
 BUNDLE_NAME = Vanish
 
 Vanish_FILES = Vanish.c
 Vanish_INSTALL_PATH = /Library/TweakInject/Tweaks/Bundles
-Vanish_CFLAGS = -fblocks -std=c11 -fno-modules
+Vanish_CFLAGS += -fblocks -std=c11 -fno-modules
 
 # MSHookFunction. Installed at /usr/local/lib/libellekit.dylib, which is also
 # its install name, so -L is a link-time concern only.
