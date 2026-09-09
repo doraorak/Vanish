@@ -1311,6 +1311,104 @@ static void vn_pending_red_invalidate(uint32_t wid, const char *why) {
     }
 }
 
+// Starting the animation on the app's fade, not on its order-out.
+//
+// Measured: an AppKit/Chromium window does not vanish when closed -- the app
+// fades its alpha 1.0 -> 0.0 over ~250ms and only calls order-out once that
+// fade has finished. So the order-out Vanish used to trigger on marks the
+// END of the close, not the start of it, and waiting for it meant sitting
+// through the whole fade first (~290ms for Chrome/Mail/Claude/Antigravity,
+// vs ~60ms for apps that destroy the window outright and never fade).
+//
+// The fade itself is the real signal, and it is visible server-side as the
+// window's alpha dropping below where it sat at mouse-up. Note this is not
+// the server's own timed fade: CGXWindow::fade_begin is never involved (the
+// fade-state pointer stays NULL throughout), the client pushes one alpha per
+// frame. So there is nothing to hook -- only something to watch.
+static uint32_t gAlphaProbeWid      = 0;
+static double   gAlphaProbeStart    = 0.0;
+static float    gAlphaProbeBaseline = 1.0f;
+
+// The original is hidden the moment we take over, so it cannot show through
+// behind the shrinking clone while it finishes its own fade. If the close
+// somehow never lands, this is what puts it back.
+static uint32_t gEarlyHiddenWid = 0;
+
+static void vn_early_restore_check(void *ctx, double when) {
+    (void)ctx; (void)when;
+    uint32_t wid = gEarlyHiddenWid;
+    if (wid == 0) return;
+    gEarlyHiddenWid = 0;
+
+    CGXWindow *win = vn_window_by_id ? vn_window_by_id(wid) : NULL;
+    if (win && vn_window_is_ordered_in(win) && vn_update_ca_visibility) {
+        VN_LOG("early-close: wid=%u never ordered out -- restoring visibility", wid);
+        vn_update_ca_visibility(win, true);
+    }
+}
+
+static void vn_close_watch_tick(void *ctx, double when) {
+    (void)ctx; (void)when;
+    uint32_t wid = gAlphaProbeWid;
+    if (wid == 0) return;
+
+    double elapsed = SLSCurrentRealTime() - gAlphaProbeStart;
+    CGXWindow *win = vn_window_by_id ? vn_window_by_id(wid) : NULL;
+    if (!win) { gAlphaProbeWid = 0; return; }
+
+    // Only while this window's pre-clone is still waiting to be used. If the
+    // order-out beat us to it, the normal path already consumed it.
+    os_unfair_lock_lock(&gPreCloneLock);
+    bool pending = (vn_preclone_find_slot_locked(wid) >= 0);
+    os_unfair_lock_unlock(&gPreCloneLock);
+    if (!pending) { gAlphaProbeWid = 0; return; }
+
+    // Relative to the alpha at mouse-up, not to 1.0: plenty of windows are
+    // legitimately translucent, and only a *drop* means a close.
+    float alpha = vn_window_alpha(win);
+    if (alpha < gAlphaProbeBaseline - 0.01f) {
+        gAlphaProbeWid = 0;
+
+        uint32_t clone_wid = 0;
+        CGRect   clone_frame = CGRectZero;
+        pid_t    anim_pid = 0;
+        uint64_t anim_psn = 0;
+        bool     anim_is_wa = false;
+        char     anim_app[64] = {0};
+
+        os_unfair_lock_lock(&gPreCloneLock);
+        CGXWindow *clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame,
+                                                   &anim_pid, &anim_psn, &anim_is_wa,
+                                                   anim_app, sizeof(anim_app));
+        os_unfair_lock_unlock(&gPreCloneLock);
+
+        if (!clone || clone_wid == 0) return;
+
+        VN_LOG(">>> Close detected via fade for wid=%u (app='%s' alpha=%.3f from %.3f) at +%.0fms -- animating now, %.0fms before order-out would have arrived",
+               wid, anim_app, (double)alpha, (double)gAlphaProbeBaseline,
+               elapsed * 1000.0, 250.0);
+
+        if (vn_update_ca_visibility) {
+            vn_update_ca_visibility(win, false);
+            gEarlyHiddenWid = wid;
+            if (vn_schedule_callback) {
+                vn_schedule_callback(vn_early_restore_check, NULL, SLSCurrentRealTime() + 2.0);
+            }
+        }
+
+        vn_start_clone_animation(clone, wid, clone_frame, anim_pid, anim_psn, anim_is_wa, anim_app);
+        return;
+    }
+
+    // Give up after a second: apps that destroy the window outright never
+    // fade, and their order-out arrives on its own well inside that.
+    if (elapsed < 1.0 && vn_schedule_callback) {
+        vn_schedule_callback(vn_close_watch_tick, NULL, SLSCurrentRealTime() + 0.008);
+    } else {
+        gAlphaProbeWid = 0;
+    }
+}
+
 // Builds the pre-clone for a red-button press that has now been confirmed by
 // a release still inside the button.
 static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn, uint32_t wid,
@@ -1360,6 +1458,13 @@ static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn, uint32_t wid
 
     if (vn_schedule_callback) {
         vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.0);
+    }
+
+    gAlphaProbeWid      = wid;
+    gAlphaProbeStart    = SLSCurrentRealTime();
+    gAlphaProbeBaseline = vn_window_alpha(win);
+    if (vn_schedule_callback) {
+        vn_schedule_callback(vn_close_watch_tick, NULL, SLSCurrentRealTime() + 0.008);
     }
     return true;
 }
