@@ -15,6 +15,7 @@
 #define SkyLightServer_h
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -32,10 +33,146 @@ extern SLSConnectionID SLSMainConnectionID(void);
 /// The server's clock, in seconds. Exported by SkyLight.
 extern double SLSCurrentRealTime(void);
 
-/// Opaque server-side types. Never dereferenced here: the field offsets are the
-/// part of this that Apple can change without renaming anything.
+/// Same layout as CATransform3D (16 doubles). Declared here so this header does
+/// not have to pull in QuartzCore to describe fields Vanish never touches.
+typedef struct { double m[16]; } VNTransform3D;
+
+/// CGXConnection stays opaque: unlike CGXWindow there is no recovered layout
+/// for it, and only one field is needed. Inventing a struct around a single
+/// verified offset would look more authoritative than the evidence supports.
 typedef struct CGXConnection CGXConnection;
-typedef struct CGXWindow CGXWindow;
+
+/// The server's window object. Field names come from a partial type recovery;
+/// every offset below is pinned by a _Static_assert, so a wrong padding size
+/// is a build error rather than a memory corruption bug at runtime.
+///
+/// Four offsets were independently confirmed by disassembly before the
+/// recovery existed, and all four line up with it exactly -- `level` against
+/// WSWindowGetLevel (`ldr w0, [x0, #0x20]`), `connection` at 0x30, `alpha`
+/// against CGXWindow::fade_begin (`ldr s0, [x0, #0x1e8]`), and the ordered-in
+/// bit against _XWindowIsOrderedIn (bit 46 of `flags`).
+typedef struct CGXWindow {
+    uint32_t       window_id;                           // 0x000
+    uint32_t       window_type;                         // 0x004
+    uint8_t        _pad_008[0x8];
+    void          *ca_backing;                          // 0x010
+    uint8_t        _pad_018[0x8];
+    int32_t        level;                               // 0x020
+    uint8_t        _pad_024[0xc];
+    CGXConnection *connection;                          // 0x030
+    uint8_t        _pad_038[0x18];
+    uint32_t       connection_id;                       // 0x050  cid for CGXGetConnectionAppName
+    uint8_t        _pad_054[0x70];
+    uint32_t       screen_geometry_seed;                // 0x0c4
+    uint8_t        _pad_0c8[0x20];
+    void          *clip_shape;                          // 0x0e8
+    uint8_t        _pad_0f0[0x30];
+    void          *global_clip_shape;                   // 0x120
+    void          *layer_clip_shape;                    // 0x128
+    uint8_t        _pad_130[0x50];
+    void          *shape;                               // 0x180
+    uint8_t        _pad_188[0x30];
+    void          *shape_data;                          // 0x1b8
+    uint8_t        _pad_1c0[0x28];
+    float          alpha;                               // 0x1e8
+    float          system_alpha;                        // 0x1ec
+    uint8_t        _pad_1f0[0x30];
+    float          backing_store_resolution;            // 0x220
+    uint8_t        _pad_224[0x4];
+    float          backing_store_override_resolution;   // 0x228
+    uint8_t        _pad_22c[0x4];
+    CGSize         backing_store_pixel_dimensions_hint; // 0x230
+    uint8_t        _pad_240[0x10];
+    void          *backing_store;                       // 0x250
+    void          *workspace_data;                      // 0x258
+    uint8_t        _pad_260[0x230];
+    void          *window_mask;                         // 0x490
+    void          *frozen_backing;                      // 0x498
+    uint8_t        _pad_4a0[0x8];
+    VNTransform3D  transform;                           // 0x4a8
+    VNTransform3D  system_transform;                    // 0x528
+    VNTransform3D  deformation_transform;               // 0x5a8
+    uint8_t        _pad_628[0x180];
+    void          *transform_stack;                     // 0x7a8
+    uint8_t        _pad_7b0[0xc];
+    uint32_t       event_mask;                          // 0x7bc
+    uint8_t        _pad_7c0[0x10];
+    double         sfx_corner_radius;                   // 0x7d0
+    uint8_t        _pad_7d8[0x10];
+    uint64_t       dominant_display_id;                 // 0x7e8
+    uint8_t        _pad_7f0[0x78];
+    double         corner_radius;                       // 0x868
+    double         debug_corner_radius;                 // 0x870
+    double         corner_radii[4];                     // 0x878
+    uint8_t        _pad_898[0x8];
+    void          *mask_path;                           // 0x8a0
+    uint8_t        _pad_8a8[0x8];
+    void          *mesh;                                // 0x8b0
+    void          *frame_mesh_cache;                    // 0x8b8
+    void          *fade_state;                          // 0x8c0
+    uint8_t        _pad_8c8[0x18];
+    int32_t        screen_state;                        // 0x8e0
+    uint8_t        _pad_8e4[0x7c];
+    uint64_t       flags;                               // 0x960
+} CGXWindow;
+
+#define VN_ASSERT_OFFSET(field, off) \
+    _Static_assert(offsetof(CGXWindow, field) == (off), \
+                   "CGXWindow." #field " is not at " #off)
+
+VN_ASSERT_OFFSET(window_id,           0x000);
+VN_ASSERT_OFFSET(window_type,         0x004);
+VN_ASSERT_OFFSET(ca_backing,          0x010);
+VN_ASSERT_OFFSET(level,               0x020);
+VN_ASSERT_OFFSET(connection,          0x030);
+VN_ASSERT_OFFSET(connection_id,       0x050);
+VN_ASSERT_OFFSET(screen_geometry_seed, 0x0c4);
+VN_ASSERT_OFFSET(clip_shape,          0x0e8);
+VN_ASSERT_OFFSET(global_clip_shape,   0x120);
+VN_ASSERT_OFFSET(layer_clip_shape,    0x128);
+VN_ASSERT_OFFSET(shape,               0x180);
+VN_ASSERT_OFFSET(shape_data,          0x1b8);
+VN_ASSERT_OFFSET(alpha,               0x1e8);
+VN_ASSERT_OFFSET(system_alpha,        0x1ec);
+VN_ASSERT_OFFSET(backing_store_resolution, 0x220);
+VN_ASSERT_OFFSET(backing_store_pixel_dimensions_hint, 0x230);
+VN_ASSERT_OFFSET(backing_store,       0x250);
+VN_ASSERT_OFFSET(workspace_data,      0x258);
+VN_ASSERT_OFFSET(window_mask,         0x490);
+VN_ASSERT_OFFSET(frozen_backing,      0x498);
+VN_ASSERT_OFFSET(transform,           0x4a8);
+VN_ASSERT_OFFSET(system_transform,    0x528);
+VN_ASSERT_OFFSET(deformation_transform, 0x5a8);
+VN_ASSERT_OFFSET(transform_stack,     0x7a8);
+VN_ASSERT_OFFSET(event_mask,          0x7bc);
+VN_ASSERT_OFFSET(sfx_corner_radius,   0x7d0);
+VN_ASSERT_OFFSET(dominant_display_id, 0x7e8);
+VN_ASSERT_OFFSET(corner_radius,       0x868);
+VN_ASSERT_OFFSET(debug_corner_radius, 0x870);
+VN_ASSERT_OFFSET(corner_radii,        0x878);
+VN_ASSERT_OFFSET(mask_path,           0x8a0);
+VN_ASSERT_OFFSET(mesh,                0x8b0);
+VN_ASSERT_OFFSET(frame_mesh_cache,    0x8b8);
+VN_ASSERT_OFFSET(fade_state,          0x8c0);
+VN_ASSERT_OFFSET(screen_state,        0x8e0);
+VN_ASSERT_OFFSET(flags,               0x960);
+
+/// The server's input event. Only the fields Vanish reads are named; the rest
+/// is padding, so this deliberately does not claim to be the whole struct.
+typedef struct {
+    uint8_t  _pad_000[0x8];
+    uint32_t type;       // 0x08  1 = mouse down, 2 = mouse up, 6 = mouse dragged
+    uint32_t _pad_00c;
+    CGPoint  screen_pt;  // 0x10
+    CGPoint  local_pt;   // 0x20  window-local, top-left origin, y down
+    uint8_t  _pad_030[0xc];
+    uint32_t window_id;  // 0x3c
+} VNEvent;
+
+_Static_assert(offsetof(VNEvent, type)      == 0x08, "VNEvent.type moved");
+_Static_assert(offsetof(VNEvent, screen_pt) == 0x10, "VNEvent.screen_pt moved");
+_Static_assert(offsetof(VNEvent, local_pt)  == 0x20, "VNEvent.local_pt moved");
+_Static_assert(offsetof(VNEvent, window_id) == 0x3c, "VNEvent.window_id moved");
 
 /// Same values as CGSWindowOrderingMode. A close reduces to kVNOrderOut.
 typedef int32_t CGSOrderOp;
@@ -75,79 +212,51 @@ enum { kVNOrderBelow = -1, kVNOrderOut = 0, kVNOrderAbove = 1 };
 /// bool isProcessEligibleForSetFront(uint32_t sessionID, CPSProcessSerNum psn, bool flag, bool *out)
 #define kVNSymIsProcessEligibleForSetFront "__ZL28isProcessEligibleForSetFrontj16CPSProcessSerNumbPb"
 
-#pragma mark - Struct offsets
+#pragma mark - Window field access
 
-/// Window level at offset 0x20.
-/// Read directly from `WSWindowGetLevel` (`ldr w0, [x0, #0x20]`).
 /// Normal application document windows have level 0 (kCGSNormalWindowLevel).
-#define kVNWindowLevelOffset 0x20
-
 static inline int32_t vn_window_level(const CGXWindow *win) {
-    if (!win) return -1;
-    int32_t lvl = 0;
-    __builtin_memcpy(&lvl, (const char *)win + kVNWindowLevelOffset, sizeof(lvl));
-    return lvl;
+    return win ? win->level : -1;
 }
 
-/// Workspace data pointer at offset 0x258.
-/// Initialized by `spaces_did_create_window_callback` and cleared to NULL by
-/// `spaces_did_terminate_window_callback` upon window termination / destruction.
-#define kVNWindowWorkspaceDataOffset 0x258
-
+/// Set by spaces_did_create_window_callback, cleared to NULL by
+/// spaces_did_terminate_window_callback when the window is torn down.
 static inline void *vn_window_workspace_data(const CGXWindow *win) {
-    if (!win) return NULL;
-    void *ws = NULL;
-    __builtin_memcpy(&ws, (const char *)win + kVNWindowWorkspaceDataOffset, sizeof(ws));
-    return ws;
+    return win ? win->workspace_data : NULL;
 }
-
-/// A window's current alpha, as a float.
-///
-/// `CGXWindow::fade_begin` reads exactly this at its `+36` (`ldr s0, [x0, #0x1e8]`).
-#define kVNWindowAlphaOffset 0x1e8
 
 static inline float vn_window_alpha(const CGXWindow *win) {
-    if (!win) return 0.0f;
-    float a = 0.0f;
-    __builtin_memcpy(&a, (const char *)win + kVNWindowAlphaOffset, sizeof(a));
-    return a;
+    return win ? win->alpha : 0.0f;
 }
 
-/// Whether the window is currently ordered in (bit 6 of byte 0x965, or bit 46 of uint64 at 0x960).
-/// Read directly from `_XWindowIsOrderedIn` and `start_order_window`.
-#define kVNWindowOrderedInOffset 0x965
-#define kVNWindowOrderedInMask   0x40
+/// Bit 46 of `flags`, read directly from _XWindowIsOrderedIn and
+/// start_order_window.
+#define kVNWindowOrderedInBit 46
 
 static inline bool vn_window_is_ordered_in(const CGXWindow *win) {
-    if (!win) return false;
-    uint8_t flags = 0;
-    __builtin_memcpy(&flags, (const char *)win + kVNWindowOrderedInOffset, sizeof(flags));
-    return (flags & kVNWindowOrderedInMask) != 0;
+    return win && (win->flags & (1ULL << kVNWindowOrderedInBit)) != 0;
 }
 
-/// Active fade state pointer at offset 0x8c0.
-/// Non-NULL while an animation is running via `CGXWindow::fade_begin`.
-/// Cleared to NULL by `CGXWindow::fade_finish`.
-#define kVNWindowFadeOffset 0x8c0
-
+/// Non-NULL while an animation is running via CGXWindow::fade_begin; cleared
+/// by CGXWindow::fade_finish.
 static inline bool vn_window_is_fading(const CGXWindow *win) {
-    if (!win) return false;
-    const void *fade = NULL;
-    __builtin_memcpy(&fade, (const char *)win + kVNWindowFadeOffset, sizeof(fade));
-    return fade != NULL;
+    return win && win->fade_state != NULL;
 }
-
-/// Owning connection pointer at offset 0x30.
-#define kVNWindowConnectionOffset 0x30
 
 static inline CGXConnection *vn_window_connection(const CGXWindow *win) {
-    if (!win) return NULL;
-    CGXConnection *conn = NULL;
-    __builtin_memcpy(&conn, (const char *)win + kVNWindowConnectionOffset, sizeof(conn));
-    return conn;
+    return win ? win->connection : NULL;
 }
 
-/// ProcessSerialNumber at offset 0x124 of CGXConnection
+static inline pid_t vn_conn_get_pid(const CGXConnection *conn) {
+    if (!conn) return 0;
+    pid_t pid = 0;
+    __builtin_memcpy(&pid, (const char *)conn + 0x268, sizeof(pid));
+    return pid;
+}
+
+/// ProcessSerialNumber at offset 0x124 of CGXConnection. Still raw offset
+/// math: CGXConnection has no recovered layout, and this is the only field
+/// anything here needs.
 static inline uint64_t vn_conn_get_psn(const CGXConnection *conn) {
     if (!conn) return 0;
     uint64_t psn = 0;
@@ -297,7 +406,7 @@ typedef void (*VNClearShadowDensityFn)(CGXWindow *);
 typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);
 typedef void (*VNWSWindowReleaseShadowResourcesFn)(CGXWindow *);
 typedef CGError (*VNSLSSetWindowShadowParametersFn)(uint32_t cid, uint32_t wid, float density, float radius, float xOffset, float yOffset);
-typedef void (*VNPostEventByConnectionFn)(CGXConnection *, void *);
+typedef void (*VNPostEventByConnectionFn)(CGXConnection *, VNEvent *);
 
 #ifdef __cplusplus
 }
