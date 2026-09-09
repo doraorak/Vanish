@@ -1269,6 +1269,101 @@ static void vn_hooked_release_window(CGXConnection *conn, CGXWindow *win) {
     }
 }
 
+#pragma mark - Deferred (mouse-up) pre-cloning
+
+// A red-button press that has not been released yet.
+//
+// The clone is deliberately NOT made at mouse-down. Vanish sees the press
+// before AppKit has decided whether the gesture is a click or the start of a
+// window drag, so a mouse-down clone can be left sitting at the original's
+// old position while the user drags the real window out from over it --
+// exposing both at once. No amount of hitbox precision fixes that, because
+// the ambiguity is in the timing, not the geometry. Waiting for mouse-up
+// means no clone exists during a drag at all. There is plenty of lead time:
+// the app's real order-out lands 40-300ms after mouse-up, far longer than a
+// clone takes to build.
+//
+// Only one mouse gesture can be in flight at a time, so one record is enough.
+typedef struct {
+    uint32_t orig_wid;
+    CGPoint  down_screen_pt;
+    CGPoint  down_local_pt;
+    bool     active;
+    bool     invalidated;   // a drag, or a move off the button, disqualified it
+} VNPendingRedClick;
+
+static VNPendingRedClick gPendingRed = {0};
+static os_unfair_lock    gPendingRedLock = OS_UNFAIR_LOCK_INIT;
+
+static void vn_pending_red_clear(void) {
+    os_unfair_lock_lock(&gPendingRedLock);
+    gPendingRed = (VNPendingRedClick){0};
+    os_unfair_lock_unlock(&gPendingRedLock);
+}
+
+static void vn_pending_red_invalidate(uint32_t wid, const char *why) {
+    os_unfair_lock_lock(&gPendingRedLock);
+    bool hit = (gPendingRed.active && gPendingRed.orig_wid == wid && !gPendingRed.invalidated);
+    if (hit) gPendingRed.invalidated = true;
+    os_unfair_lock_unlock(&gPendingRedLock);
+    if (hit) {
+        VN_LOG("pre-clone: pending red click on wid=%u invalidated (%s) -- not cloning on release", wid, why);
+    }
+}
+
+// Builds the pre-clone for a red-button press that has now been confirmed by
+// a release still inside the button.
+static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn, uint32_t wid,
+                               CGPoint down_screen_pt, CGPoint down_local_pt) {
+    char app[256] = {0};
+    pid_t pid = 0;
+    vn_get_window_app_name(win, app, sizeof(app), &pid);
+
+    CGXConnection *c = conn ? conn : vn_window_connection(win);
+    uint64_t psn = vn_conn_get_psn(c);
+
+    vn_preclone_discard_wid(wid);
+    atomic_store_explicit(&gNonCloseWid, 0, memory_order_relaxed);
+
+    uint32_t clone_wid = 0;
+    CGRect clone_frame = CGRectZero;
+    CGXWindow *clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderBelow);
+    if (!clone || clone_wid == 0) {
+        VN_LOG("pre-clone: failed to create clone for wid=%u", wid);
+        return false;
+    }
+
+    os_unfair_lock_lock(&gPreCloneLock);
+    int slot = vn_preclone_find_slot_locked(wid);
+    if (slot < 0) slot = vn_preclone_find_empty_slot_locked();
+    gPreClones[slot] = (VNPreClone){
+        .orig_wid = wid,
+        .clone_wid = clone_wid,
+        .clone = clone,
+        .frame = clone_frame,
+        .created_at = SLSCurrentRealTime(),
+        .mouseDownScreenPt = down_screen_pt,
+        .mouseDownLocalPt  = down_local_pt,
+        // Set now, not on a later mouse-up: the clone is born at release, so
+        // the cleanup timer's "released but no close ever came" 1s window
+        // starts here.
+        .mouseUpTime = SLSCurrentRealTime(),
+        .pid = pid,
+        .psn = psn,
+        .is_whatsapp = (strcasecmp(app, "WhatsApp") == 0),
+    };
+    strlcpy(gPreClones[slot].app, app, sizeof(gPreClones[slot].app));
+    os_unfair_lock_unlock(&gPreCloneLock);
+
+    VN_LOG(">>> Mouse up on RED CLOSE box of '%s' (pid=%d, psn=0x%llx, wid=%u) -- pre-clone ready! clone_wid=%u slot=%d",
+           app, pid, psn, wid, clone_wid, slot);
+
+    if (vn_schedule_callback) {
+        vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.0);
+    }
+    return true;
+}
+
 static inline bool vn_is_in_red_hitbox(double lx, double ly) {
     bool in_c1 = (lx >= 9.0 && lx <= 26.0 && ly >= 4.5 && ly <= 25.0);
     bool in_c2 = (lx >= 18.0 && lx <= 33.5 && ly >= 18.0 && ly <= 33.5);
@@ -1331,6 +1426,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 if (is_double_click) {
                     VN_LOG("hit-test: double-click detected on wid=%u (pt=%.1f,%.1f) -- discarding pre-clone and suppressing for 600ms",
                            wid, lx, ly);
+                    vn_pending_red_clear();
                     vn_preclone_discard_wid(wid);
                     gDoubleClickSuppressUntilMs = now_ms + 600;
                     goto dispatch;
@@ -1338,6 +1434,7 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
 
                 if (suppressed_by_double_click) {
                     VN_LOG("hit-test: click on wid=%u suppressed due to active double-click window", wid);
+                    vn_pending_red_clear();
                     vn_preclone_discard_wid(wid);
                     goto dispatch;
                 }
@@ -1357,57 +1454,32 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
                 }
 
                 if (is_red) {
-                    char app[256] = {0};
-                    vn_get_window_app_name(win, app, sizeof(app), &pid);
-
-                    CGXConnection *c = conn ? conn : vn_window_connection(win);
-                    uint64_t psn = vn_conn_get_psn(c);
-
-                    VN_LOG(">>> Mouse down in RED CLOSE box of '%s' (pid=%d, psn=0x%llx, wid=%u, pt=(%.1f, %.1f)) -- pre-cloning now!",
-                           app, pid, psn, wid, lx, ly);
+                    // Record the press only. The clone is built on release
+                    // (see vn_create_preclone), so a press that turns into a
+                    // drag never leaves a clone behind to be exposed.
+                    VN_LOG(">>> Mouse down in RED CLOSE box of wid=%u (pt=(%.1f, %.1f)) -- waiting for release before cloning",
+                           wid, lx, ly);
 
                     vn_preclone_discard_wid(wid);
-                    atomic_store_explicit(&gNonCloseWid, 0, memory_order_relaxed);
 
-                    uint32_t clone_wid = 0;
-                    CGRect clone_frame = CGRectZero;
-                    CGXWindow *clone = vn_make_snapshot(win, conn, wid, &clone_wid, &clone_frame, kVNOrderBelow);
-                    if (clone && clone_wid != 0) {
-                        os_unfair_lock_lock(&gPreCloneLock);
-                        int slot = vn_preclone_find_slot_locked(wid);
-                        if (slot < 0) slot = vn_preclone_find_empty_slot_locked();
-                        bool is_wa = (strcasecmp(app, "WhatsApp") == 0);
-                        gPreClones[slot] = (VNPreClone){
-                            .orig_wid = wid,
-                            .clone_wid = clone_wid,
-                            .clone = clone,
-                            .frame = clone_frame,
-                            .created_at = SLSCurrentRealTime(),
-                            .mouseDownScreenPt = *screen_pt,
-                            .mouseDownLocalPt  = *local_pt,
-                            .mouseUpTime = 0.0,
-                            .pid = pid,
-                            .psn = psn,
-                            .is_whatsapp = is_wa,
-                        };
-                        strlcpy(gPreClones[slot].app, app, sizeof(gPreClones[slot].app));
-                        os_unfair_lock_unlock(&gPreCloneLock);
-
-                        VN_LOG("pre-clone: ready! wid=%u clone_wid=%u in slot %d (ordered below original)", wid, clone_wid, slot);
-
-                        if (vn_schedule_callback) {
-                            vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 30.0);
-                        }
-                    } else {
-                        VN_LOG("pre-clone: failed to create clone for wid=%u", wid);
-                    }
+                    os_unfair_lock_lock(&gPendingRedLock);
+                    gPendingRed = (VNPendingRedClick){
+                        .orig_wid = wid,
+                        .down_screen_pt = *screen_pt,
+                        .down_local_pt  = *local_pt,
+                        .active = true,
+                        .invalidated = false,
+                    };
+                    os_unfair_lock_unlock(&gPendingRedLock);
                 } else if (is_yellow_or_green) {
                     VN_LOG(">>> Mouse down in YELLOW/GREEN button of wid=%u (pt=(%.1f, %.1f)) -- ignoring close animation",
                            wid, lx, ly);
+                    vn_pending_red_clear();
                     vn_preclone_discard_wid(wid);
                     atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
                     atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
                 } else {
+                    vn_pending_red_clear();
                     vn_preclone_discard_wid(wid);
                 }
             }
@@ -1415,68 +1487,76 @@ static void vn_hooked_post_event(CGXConnection *conn, void *event) {
     }
     else if (type == 2) {
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
-        int slot = -1;
-        os_unfair_lock_lock(&gPreCloneLock);
-        if (wid != 0) {
-            slot = vn_preclone_find_slot_locked(wid);
-        }
-        os_unfair_lock_unlock(&gPreCloneLock);
+        // The release is what commits a red-button press: consume the pending
+        // record (always -- a gesture ends here whatever its outcome) and, if
+        // it survived, build the clone now.
+        VNPendingRedClick pend;
+        os_unfair_lock_lock(&gPendingRedLock);
+        pend = gPendingRed;
+        gPendingRed = (VNPendingRedClick){0};
+        os_unfair_lock_unlock(&gPendingRedLock);
 
-        if (slot >= 0) {
+        if (pend.active && wid != 0 && pend.orig_wid == wid && vn_window_by_id) {
             const CGPoint *local_pt = (const CGPoint *)((const char *)event + 0x20);
             double lx = local_pt->x;
             double ly = local_pt->y;
 
-            bool near_red = (lx >= 6.0 && lx <= 42.0 && ly >= 3.0 && ly <= 40.0);
-            if (!near_red) {
-                VN_LOG("pre-clone: mouse up clearly outside button area (wid=%u pt=(%.1f, %.1f)) -- canceling pre-clone",
+            if (pend.invalidated) {
+                VN_LOG("pre-clone: release on wid=%u ignored -- press was invalidated (drag)", wid);
+            } else if (!vn_is_in_red_hitbox(lx, ly)) {
+                // Released off the button: AppKit's own button tracking would
+                // not close either, so not cloning is the correct outcome.
+                VN_LOG("pre-clone: release on wid=%u outside red hitbox (pt=(%.1f, %.1f)) -- not cloning",
                        wid, lx, ly);
-                vn_preclone_discard_wid(wid);
             } else {
-                os_unfair_lock_lock(&gPreCloneLock);
-                if (slot < MAX_PRECLONES && gPreClones[slot].orig_wid == wid) {
-                    gPreClones[slot].mouseUpTime = SLSCurrentRealTime();
-                }
-                os_unfair_lock_unlock(&gPreCloneLock);
-
-                if (vn_schedule_callback) {
-                    vn_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.0);
+                CGXWindow *win = vn_window_by_id(wid);
+                if (win && vn_is_target_window(win) && !vn_is_window_animating(wid, win)) {
+                    vn_create_preclone(win, conn, wid, pend.down_screen_pt, pend.down_local_pt);
                 }
             }
         }
     }
     else if (type == 6) {
         uint32_t wid = *(const uint32_t *)((const char *)event + 0x3c);
-        int slot = -1;
-        CGPoint down_scr = CGPointZero;
-        os_unfair_lock_lock(&gPreCloneLock);
-        if (wid != 0) {
-            slot = vn_preclone_find_slot_locked(wid);
-            if (slot >= 0) {
-                down_scr = gPreClones[slot].mouseDownScreenPt;
-            }
-        }
-        os_unfair_lock_unlock(&gPreCloneLock);
 
-        if (slot >= 0) {
+        // A drag while the button is still held disqualifies the press, so no
+        // clone is ever built for it.
+        uint32_t pend_wid = 0;
+        CGPoint  pend_down = CGPointZero;
+        bool     pend_live = false;
+        os_unfair_lock_lock(&gPendingRedLock);
+        pend_live = (gPendingRed.active && !gPendingRed.invalidated);
+        pend_wid  = gPendingRed.orig_wid;
+        pend_down = gPendingRed.down_screen_pt;
+        os_unfair_lock_unlock(&gPendingRedLock);
+
+        if (pend_live && wid != 0 && wid == pend_wid) {
             const CGPoint *local_pt  = (const CGPoint *)((const char *)event + 0x20);
             const CGPoint *screen_pt = (const CGPoint *)((const char *)event + 0x10);
-            double lx = local_pt->x;
-            double ly = local_pt->y;
 
-            bool on_red = vn_is_in_red_hitbox(lx, ly);
-            if (!on_red) {
-                VN_LOG("pre-clone: dragged off red button pt=(%.1f, %.1f) -- aborting pre-clone for wid=%u",
-                       lx, ly, wid);
-                vn_preclone_discard_wid(wid);
+            if (!vn_is_in_red_hitbox(local_pt->x, local_pt->y)) {
+                vn_pending_red_invalidate(wid, "moved off red button");
             } else {
-                double d_scr = hypot(screen_pt->x - down_scr.x, screen_pt->y - down_scr.y);
-                if (d_scr >= 12.0) {
-                    VN_LOG("pre-clone: window drag detected (d_scr=%.1f) -- aborting pre-clone for wid=%u",
-                           d_scr, wid);
-                    vn_preclone_discard_wid(wid);
+                // Local coordinates barely move during a window drag (the
+                // window follows the cursor), so screen distance is what
+                // actually distinguishes a drag from a held click.
+                double d_scr = hypot(screen_pt->x - pend_down.x, screen_pt->y - pend_down.y);
+                if (d_scr >= 4.0) {
+                    vn_pending_red_invalidate(wid, "window drag detected");
                 }
             }
+        }
+
+        // Defensive: a clone already exists only between release and the real
+        // close (40-300ms). A drag starting in that window could still expose
+        // it, so drop it if one somehow appears.
+        int slot = -1;
+        os_unfair_lock_lock(&gPreCloneLock);
+        if (wid != 0) slot = vn_preclone_find_slot_locked(wid);
+        os_unfair_lock_unlock(&gPreCloneLock);
+        if (slot >= 0) {
+            VN_LOG("pre-clone: drag on wid=%u while a clone exists -- discarding it", wid);
+            vn_preclone_discard_wid(wid);
         }
     }
 
