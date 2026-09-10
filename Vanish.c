@@ -229,6 +229,7 @@ static VNWindowSetFilterFn          vn_resolved_window_set_filter;
 static VNUpdateWindowFn             vn_resolved_update_window;
 static VNCreateShaderFn             vn_resolved_create_shader;
 static VNCreateSpecializedShaderFn  vn_orig_create_specialized_shader;
+static VNUberCompositeFn            vn_orig_uber_composite;
 
 /// Non-zero while at least one clone carries a shader animation's tag. The
 /// substitution hook tests this first: macOS's own Invert Colours accessibility
@@ -1013,6 +1014,29 @@ static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader) {
     vn_resolved_window_set_filter(clone, f);
     return true;
 }
+
+// Widening where a shader animation may draw: an open problem.
+//
+// A fragment shader can only write inside the layer's draw shape, and
+// generate_layers_for_window builds that from the WINDOW's own region -- so
+// flecks that drift past the window's edge are cut off. Two things have been
+// tried:
+//
+//   Inflating the clone's frame in CreateCloneOfWindow. No effect on the
+//   bound (the region does not follow the frame) and it misplaced the content.
+//
+//   A mesh warp mapping local -m..size+m onto a correspondingly larger screen
+//   rect. The destination shape IS built by running the region through the
+//   mesh -- that is how a warped clone draws outside its rect today -- but
+//   setting any mesh stopped the substituted shader from running: the close
+//   rendered through the stock colour-invert instead. generate_layers_for_window
+//   fills a layer down more than one branch, and the one a warped window takes
+//   appears not to carry the filter tag.
+//
+// Next test, cheapest first: an IDENTITY mesh (local 0..size onto the frame
+// unchanged). If that also breaks the shader, mesh and shader cannot coexist
+// and the room must come from somewhere else. If it survives, the mesh is fine
+// and the fault was in the margin mapping.
 
 /// The animation's progress, handed to the shader through the one per-window
 /// float the compositor already plumbs into UberComposite_FragmentArgs:
@@ -2984,6 +3008,12 @@ static const char *vn_shader_fragment_name(void) {
     return name ? name : "vn_uber_dissolve";
 }
 
+/// The ubershader's own library and vertex descriptor, taken from the first
+/// create_specialized_shader the compositor runs. Our pipelines are built
+/// against the same descriptor so Apple's quad and attribute layout still fit.
+static void *gUberLibrary;
+static void *gUberVertexDescriptor;
+
 /// Our compiled shaders, loaded once, on the device of the library Apple is
 /// building from -- a pipeline state is bound to the device that made it, and
 /// taking the device from the library we were handed removes the question.
@@ -3025,6 +3055,84 @@ static void *vn_shader_library(void *their_lib) {
     return s_library;
 }
 
+/// One built pipeline per fragment function, ours to keep.
+///
+/// Apple's own cache in UberComposite is keyed on the options value, and every
+/// shader animation we tag produces the same options -- so letting it cache our
+/// shader would lock the first effect in for the life of the process and make
+/// switching animations impossible. Keying on the fragment name instead means
+/// each effect is built once and switching between them is free.
+static void *vn_shader_for_fragment(const char *frag_name) {
+    static struct { const char *frag; void *shader; } cache[8];
+
+    if (!frag_name || !vn_resolved_create_shader || !gUberLibrary || !gUberVertexDescriptor) {
+        return NULL;
+    }
+
+    // Registry strings are static, so identity is enough and costs no strcmp on
+    // the frames that hit.
+    for (size_t i = 0; i < sizeof(cache) / sizeof(cache[0]); i++) {
+        if (cache[i].frag == frag_name) return cache[i].shader;
+    }
+
+    void *lib = vn_shader_library(gUberLibrary);
+    if (!lib) return NULL;
+
+    CFStringRef frag_str = CFStringCreateWithCString(NULL, frag_name, kCFStringEncodingUTF8);
+    void *shader = frag_str ? vn_resolved_create_shader(lib,
+                                                        (void *)CFSTR("vn_uber_vertex"),
+                                                        (void *)frag_str,
+                                                        gUberVertexDescriptor) : NULL;
+    if (frag_str) CFRelease(frag_str);
+
+    if (!shader) {
+        VN_ERROR("shader: create_shader refused '%s' -- the stock ubershader will run instead", frag_name);
+        return NULL;
+    }
+    VN_INFO("shader: built pipeline for '%s' -> %p", frag_name, shader);
+
+    for (size_t i = 0; i < sizeof(cache) / sizeof(cache[0]); i++) {
+        if (!cache[i].frag) { cache[i].frag = frag_name; cache[i].shader = shader; break; }
+    }
+    return shader;
+}
+
+/// The substitution, placed ahead of Apple's shader cache rather than inside it.
+///
+/// A clone tagged with filter type 2 makes DetermineShaderOptions set option bit
+/// 0x10, which arrives here as `options`. Answering with our own shader means
+/// the compositor's map is never consulted for our layers and never holds
+/// anything of ours -- so switching animations takes effect on the next close,
+/// with no cache to invalidate and no map internals to poke.
+///
+/// Everything else stays Apple's: their pixel formats, vertex descriptor, quad,
+/// texture binds and uniform buffer. Only the two functions differ.
+static void *vn_hook_uber_composite(void *composer, unsigned fmt, uint64_t options) {
+    if ((options & kVNUberOptionShaderTag) &&
+        atomic_load_explicit(&gShaderFilterCount, memory_order_acquire) > 0) {
+
+        void *shader = vn_shader_for_fragment(vn_shader_fragment_name());
+
+        if (!shader && vn_orig_uber_composite && (!gUberLibrary || !gUberVertexDescriptor)) {
+            // Nothing to build against yet: the library and vertex descriptor
+            // only arrive when the compositor builds an ubershader of its own,
+            // and our capture hook is what notices. Run the original once to
+            // make that happen, then build ours from what it left behind.
+            //
+            // Without this the first close of a session renders its opening
+            // frames through the stock colour-invert -- a dark window flashing
+            // white -- because the capture lands a few milliseconds after the
+            // clone starts compositing.
+            (void)vn_orig_uber_composite(composer, fmt, options);
+            shader = vn_shader_for_fragment(vn_shader_fragment_name());
+        }
+
+        if (shader) return shader;
+    }
+
+    return vn_orig_uber_composite ? vn_orig_uber_composite(composer, fmt, options) : NULL;
+}
+
 /// The whole substitution, and it is one call.
 ///
 /// A clone tagged with filter type 2 makes DetermineShaderOptions set option bit
@@ -3039,32 +3147,16 @@ static void *vn_shader_library(void *their_lib) {
 /// none supplied.
 static void *vn_hook_create_specialized_shader(void *library, void *vtx, void *frag,
                                                void *constants_fn, uint64_t options, void *vdesc) {
-    const int shader_clones = atomic_load_explicit(&gShaderFilterCount, memory_order_acquire);
-    if (options & kVNUberOptionShaderTag) {
-        VN_INFO("shader: create_specialized_shader(options=0x%llx, clones=%d)",
-                (unsigned long long)options, shader_clones);
-    }
-
-    if ((options & kVNUberOptionShaderTag) && shader_clones > 0 && vn_resolved_create_shader) {
-
-        void *lib = vn_shader_library(library);
-        if (lib) {
-            // One pipeline per process: UberComposite caches by options value and
-            // every shader animation produces the same options, so whichever
-            // fragment is built first is the one the cache keeps. Selecting
-            // between several effects has to ride on a uniform, not on this.
-            const char *frag_name = vn_shader_fragment_name();
-            CFStringRef frag_str  = CFStringCreateWithCString(NULL, frag_name, kCFStringEncodingUTF8);
-            void *shader = frag_str ? vn_resolved_create_shader(lib,
-                                                                (void *)CFSTR("vn_uber_vertex"),
-                                                                (void *)frag_str, vdesc) : NULL;
-            if (frag_str) CFRelease(frag_str);
-            if (shader) {
-                VN_INFO("shader: substituted our pair for options=0x%llx", (unsigned long long)options);
-                return shader;
-            }
-            VN_ERROR("shader: create_shader refused our library -- falling back to the stock ubershader");
-        }
+    // Capture, do not substitute. Apple's cache is keyed on the options value
+    // and every shader animation produces the same one, so a substitution here
+    // would be cached and freeze the effect for the life of the process. The
+    // swap happens in vn_hook_uber_composite instead, ahead of that cache; all
+    // this hook is for is the library and vertex descriptor to build against,
+    // taken from whatever the compositor builds first.
+    if (library && vdesc && !gUberLibrary) {
+        gUberLibrary = library;
+        gUberVertexDescriptor = vdesc;
+        VN_DEBUG("shader: captured ubershader library=%p vdesc=%p", library, vdesc);
     }
 
     return vn_orig_create_specialized_shader
@@ -3137,6 +3229,15 @@ static void vanish_init(void) {
         VN_DEBUG("hooked CGXPostEventByConnection -> orig %p", vn_orig_post_event);
     } else {
         VN_ERROR("WARNING: CGXPostEventByConnection unresolved");
+    }
+
+    void *targetUber = vn_skylight_symbol(kVNSymUberComposite);
+    if (targetUber && vn_resolved_create_shader) {
+        void *rawUber = ptrauth_strip(targetUber, ptrauth_key_function_pointer);
+        MSHookFunction(rawUber, (void *)vn_hook_uber_composite, (void **)&vn_orig_uber_composite);
+        VN_DEBUG("hooked ShaderComposer::UberComposite -> orig %p", (void *)vn_orig_uber_composite);
+    } else {
+        VN_ERROR("WARNING: ShaderComposer::UberComposite unresolved -- shader animations will not draw");
     }
 
     void *targetSpecialized = vn_skylight_symbol(kVNSymCreateSpecializedShader);

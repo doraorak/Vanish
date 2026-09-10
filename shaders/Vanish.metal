@@ -61,29 +61,82 @@ vertex VNUberStage vn_uber_vertex(VNUberIn in [[stage_in]],
     return out;
 }
 
-/// Dissolve: pixels drop out in a fixed random order as the close progresses.
+// Vanish warps the clone's quad outward (kVNShaderMargin in Vanish.c) so flecks
+// are not cut off at the window's edge. The interpolated texture coordinates
+// therefore run past [0,1], and anything outside that range is margin: no
+// window pixels live there. Nothing here needs to know how wide the margin is
+// -- "outside [0,1]" is the test either way -- so the two do not have to be
+// kept in step.
+
+static float vn_hash(float2 p) {
+    return fract(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+/// Dissolve: the window comes apart into drifting flecks of its own pixels.
 ///
-/// Chosen as the first shader deliberately -- it is the simplest effect a mesh
-/// warp cannot express at all. A warp only moves pixels it already has; this
-/// decides, per pixel, whether there is a pixel.
+/// Modelled on Aghajari's ThanosEffect, which is a real particle system: every
+/// particle carries a colour sampled from the source, spreads radially, gets
+/// accelerated upward by `pow(fraction * vy, 2)`, shrinks, fades out over
+/// `1.2 - fraction`, and is drawn as a round point.
 ///
-/// `brightness` is the phase, driven from CGXWindow::brightness each tick.
-/// Vanish sets it to 1 - t, so it starts at 1 and falls to 0. At phase 1 the
-/// threshold is below every hash value and nothing is removed, which is the
-/// registry's identity rule: the clone composites once with the tag attached
-/// before the animation starts.
+/// We cannot emit points -- the compositor gives us one quad and a fragment
+/// shader over it -- so the same effect is built inside out. For each output
+/// pixel we walk BACK along the drift to find which particle is covering it,
+/// then sample the window's real colour at that particle's origin. That is the
+/// part the first attempt was missing: it only punched alpha to zero, so pixels
+/// disappeared where they stood instead of travelling.
+///
+/// `brightness` is the phase, driven from CGXWindow::brightness each tick and
+/// running 1 -> 0. At 1 every particle's age is 0, the drift is zero and the
+/// cell mask covers whole cells, so the frame is byte-identical to the
+/// untouched window -- the registry's identity rule, which matters because the
+/// clone composites once with the tag attached before the animation starts.
 fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
                                  texture2d<float> tex2D [[texture(0)]],
                                  constant VNUberArgs &args [[buffer(0)]],
                                  sampler samp [[sampler(0)]]) {
-    float2 uv = in.tex.xy / max(in.tex.w, 1e-6);
-    float4 colour = tex2D.sample(samp, uv);
+    const float2 uv = in.tex.xy / max(in.tex.w, 1e-6);
+    const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
 
-    // Value hash on a coarse grid, so the dissolve reads as flecks rather than
-    // per-pixel noise at retina density.
-    float2 cell = floor(uv * 420.0);
-    float  n    = fract(sin(dot(cell, float2(12.9898, 78.233))) * 43758.5453);
+    // Fleck size fixed in screen pixels, not texture coordinates, so it does not
+    // scale with the window.
+    const float2 px    = max(fwidth(uv), float2(1e-6));
+    const float2 grain = px * 3.0;
 
-    colour *= step(1.0 - args.brightness, n);
+    // Two fixed-point steps are enough to invert the drift while it stays
+    // modest; the first guesses with the displacement at the output pixel, the
+    // second corrects it.
+    float2 src = uv;
+    float  age = 0.0;
+    for (int i = 0; i < 2; ++i) {
+        const float2 cell = floor(src / grain);
+        const float  r    = vn_hash(cell);
+
+        // Particles near the bottom leave first. The stagger is what makes a
+        // front sweep through the window instead of all of it going at once.
+        const float start = (1.0 - src.y) * 0.45 + r * 0.15;
+        age = clamp((t - start) / 0.55, 0.0, 1.0);
+
+        const float2 rel = src - float2(0.5);
+        float2 drift;
+        drift.x = rel.x * 0.35 * age + (r - 0.5) * 0.12 * age;
+        drift.y = rel.y * 0.15 * age - age * age * 0.45;   // rises, accelerating
+        src = uv - drift;
+    }
+
+    if (age >= 1.0) return float4(0.0);
+
+    // A fleck can drift into the margin, but it cannot originate there -- there
+    // is no window pixel to carry.
+    if (any(src < 0.0) || any(src > 1.0)) return float4(0.0);
+
+    // Round flecks, shrinking with age -- the reference's circular points. At
+    // age 0 the radius covers a whole cell (its far corner is at 1.41), so
+    // nothing is cut out of a window that has not started dissolving.
+    const float2 f = fract(src / grain) - 0.5;
+    if (length(f) * 2.0 > mix(1.5, 0.0, age)) return float4(0.0);
+
+    float4 colour = tex2D.sample(samp, src);
+    colour *= clamp(1.2 - age, 0.0, 1.0);
     return colour;
 }

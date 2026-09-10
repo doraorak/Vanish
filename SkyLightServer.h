@@ -136,6 +136,8 @@ _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.param
 
 #define kVNSymCreateSpecializedShader \
     "__ZN14ShaderComposer25create_specialized_shaderEPU21objcproto10MTLLibrary11objc_objectP8NSStringS3_PFP25MTLFunctionConstantValuesyEyP19MTLVertexDescriptor"
+#define kVNSymUberComposite \
+    "__ZN14ShaderComposer13UberCompositeE14MTLPixelFormaty"
 #define kVNSymCreateShader \
     "__ZN14ShaderComposer13create_shaderEPU21objcproto10MTLLibrary11objc_objectP8NSStringS3_P19MTLVertexDescriptor"
 
@@ -533,6 +535,9 @@ typedef void   (*VNUpdateWindowFn)(CGXConnection *, CGXWindow *);
 /// MTLLibrary and objc_msgSend authenticates its C++ vtable as an isa:
 /// PAC_EXCEPTION, WindowServer dead. It has happened once already.
 typedef void  *(*VNCreateShaderFn)(void *library, void *vtx, void *frag, void *vdesc);
+
+/// NON-static -- x0 is the ShaderComposer, unlike its create_* siblings.
+typedef void  *(*VNUberCompositeFn)(void *composer, unsigned fmt, uint64_t options);
 typedef void  *(*VNCreateSpecializedShaderFn)(void *library, void *vtx, void *frag,
                                               void *constants_fn, uint64_t options, void *vdesc);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);
