@@ -316,6 +316,21 @@ static void vn_reload_prefs_locked(void) {
 }
 
 static VNPreferences vn_get_prefs(void) {
+    // The stat() below is only a fallback for edits that arrive without the
+    // Darwin notification (editing the plist directly, say). Rate-limit it so
+    // that a caller on a hot path cannot turn prefs reads into a syscall per
+    // frame; the notification still applies real changes immediately.
+    static double s_last_stat = 0.0;
+    double now = SLSCurrentRealTime();
+    bool skip_stat = gPrefsValid && (now - s_last_stat) < 0.25;
+    if (skip_stat) {
+        os_unfair_lock_lock(&gPrefsLock);
+        VNPreferences cached = gPrefs;
+        os_unfair_lock_unlock(&gPrefsLock);
+        return cached;
+    }
+    s_last_stat = now;
+
     struct stat st;
     bool have_stat = (stat("/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist", &st) == 0);
 
@@ -348,6 +363,53 @@ static float vn_duration(void) {
 
 #pragma mark - Window Eligibility Filtering
 
+// Resolved app names, keyed by the window's connection id.
+//
+// Also found while chasing the resize flash, and also kept on its own merits
+// rather than as a fix for it: this is called from vn_is_target_window, which
+// runs on every order operation for every window -- and the order path sees
+// real bursts (15 ops in 3ms from Chrome).
+// Uncached, each of those could reach a proc_pidpath syscall. A connection
+// belongs to one process for its whole life, so the name never changes under
+// a live cid. A cid outliving its process and being reissued is guarded
+// against by also matching the owning pid, which comes from a cheap server
+// field read rather than the syscall this cache exists to avoid.
+#define kVNAppNameCacheSlots 64
+
+typedef struct {
+    uint32_t cid;
+    pid_t    pid;
+    char     name[64];
+    bool     valid;
+} VNAppNameEntry;
+
+static VNAppNameEntry gAppNameCache[kVNAppNameCacheSlots];
+static os_unfair_lock gAppNameCacheLock = OS_UNFAIR_LOCK_INIT;
+
+static bool vn_app_name_cache_get(uint32_t cid, pid_t pid, char *out_name, size_t maxlen) {
+    if (cid == 0) return false;
+    bool hit = false;
+    os_unfair_lock_lock(&gAppNameCacheLock);
+    VNAppNameEntry *e = &gAppNameCache[cid % kVNAppNameCacheSlots];
+    if (e->valid && e->cid == cid && e->pid == pid) {
+        strlcpy(out_name, e->name, maxlen);
+        hit = true;
+    }
+    os_unfair_lock_unlock(&gAppNameCacheLock);
+    return hit;
+}
+
+static void vn_app_name_cache_put(uint32_t cid, const char *name, pid_t pid) {
+    if (cid == 0 || !name || !name[0]) return;
+    os_unfair_lock_lock(&gAppNameCacheLock);
+    VNAppNameEntry *e = &gAppNameCache[cid % kVNAppNameCacheSlots];
+    e->cid = cid;
+    e->pid = pid;
+    strlcpy(e->name, name, sizeof(e->name));
+    e->valid = true;
+    os_unfair_lock_unlock(&gAppNameCacheLock);
+}
+
 static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen, pid_t *out_pid) {
     if (!win || !out_name || maxlen == 0) return false;
     out_name[0] = '\0';
@@ -361,12 +423,17 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
     }
     if (out_pid) *out_pid = pid;
 
+    if (vn_app_name_cache_get(win->connection_id, pid, out_name, maxlen)) {
+        return true;
+    }
+
     if (vn_resolved_get_connection_app_name) {
         uint32_t cid = win->connection_id;
         if (cid != 0) {
             char buf[256] = {0};
             if (vn_resolved_get_connection_app_name(cid, buf, sizeof(buf)) == 0 && buf[0] != '\0') {
                 strncpy(out_name, buf, maxlen - 1);
+                vn_app_name_cache_put(cid, out_name, pid);
                 return true;
             }
         }
@@ -378,10 +445,12 @@ static bool vn_get_window_app_name(CGXWindow *win, char *out_name, size_t maxlen
             char *slash = strrchr(path, '/');
             if (slash && slash[1] != '\0') {
                 strncpy(out_name, slash + 1, maxlen - 1);
+                vn_app_name_cache_put(win->connection_id, out_name, pid);
                 return true;
             }
         }
         if (proc_name(pid, out_name, (uint32_t)maxlen) > 0 && out_name[0] != '\0') {
+            vn_app_name_cache_put(win->connection_id, out_name, pid);
             return true;
         }
     }
@@ -724,6 +793,25 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 /// `conn` is the connection making the request, which is not necessarily the
 /// window's own (win->connection) -- see the fallback below -- so it stays an
 /// explicit parameter. The window id does not: it is win->window_id.
+/// Mesh geometry and the shrink solver both live further down with the
+/// animation; declared here so a freshly built clone can be pre-warmed.
+// Kept with the same caveat as gAnimNextDeadline: this reduces per-frame
+// compositor work, but it was never measured in isolation and the "hang" it
+// was chasing had another cause. The equivalence argument below is exact
+// regardless, so the change is free even if it buys nothing.
+//
+// The shrink is a uniform scale about the window's centre -- a pure affine
+// map. Bilinear interpolation of a quad's corners reproduces an affine map
+// exactly, so the four corners carry the same image a 5x5 grid did, and the
+// compositor resamples 4 points per frame instead of 25. Raise this if the
+// animation ever becomes non-affine (a bend, a ripple, per-point easing);
+// interpolation would no longer be exact and the extra points would matter.
+#define kVNMeshW 2
+#define kVNMeshH 2
+#define kVNMeshCount (kVNMeshW * kVNMeshH)
+static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t);
+
+
 static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
                                    uint32_t *out_wid, CGRect *out_frame,
                                    CGSOrderOp place) {
@@ -736,6 +824,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         return NULL;
     }
 
+    double t_snap0 = SLSCurrentRealTime();
     const void *display = vn_resolved_window_get_display(win);
     if (!display) { VN_ERROR("snapshot: no display for wid=%u", orig_wid); return NULL; }
 
@@ -765,7 +854,9 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         return NULL;
     }
 
+    double t_clone0 = SLSCurrentRealTime();
     CGXWindow *clone = vn_resolved_create_clone(win, frame, display, true);
+    double clone_ms = (SLSCurrentRealTime() - t_clone0) * 1000.0;
     if (!clone) { VN_ERROR("snapshot: CreateCloneOfWindow returned NULL"); return NULL; }
 
     uint32_t wid = vn_resolved_window_get_id(clone);
@@ -775,6 +866,25 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         vn_orig_order(conn, &wid, &op, &rel, 1, false);
         if (out_wid) *out_wid = wid;
         if (out_frame) *out_frame = frame;
+    }
+
+    // Pre-warm the warp path.
+    //
+    // Kept with the same caveat as gAnimNextDeadline: measured real, but the
+    // "hang" it was chasing turned out to be the transpose collision.
+    //
+    // Measured: the first frame of an animation
+    // arrives up to 18.5ms late -- over twice its 8.33ms budget, and by far
+    // the worst frame in a run -- because the first set_mesh_warp on a clone
+    // has to realize that window's surface and allocate mesh state. Doing it
+    // here, tens of milliseconds before the animation starts and while the
+    // clone is still hidden behind the original, moves that cost off the
+    // first frame. At t=0 the shrink solver is an identity warp (s = 1.0), so
+    // this cannot change what is on screen.
+    if (vn_resolved_set_mesh_warp) {
+        VNPointWarp warm[kVNMeshCount];
+        vn_anim_shrink(warm, frame, 0.0);
+        vn_resolved_set_mesh_warp(clone, NULL, kVNMeshW, kVNMeshH, (const float *)warm);
     }
 
     if (!prefs.shadows) {
@@ -792,18 +902,18 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         VN_DEBUG("snapshot: disabled shadow property on clone wid=%u win=%p", wid, clone);
     }
 
-    VN_DEBUG("snapshot: clone=%p wid=%u %s %u frame=(%.1f,%.1f %.1fx%.1f) display=%p",
+    // The clone is built synchronously in the event hook, before the app is
+    // even handed the mouse-up, so anything slow here is felt as a hitch at
+    // the click itself rather than as a dropped animation frame.
+    VN_DEBUG("snapshot: clone=%p wid=%u %s %u frame=(%.1f,%.1f %.1fx%.1f) display=%p build=%.2fms total=%.2fms",
            clone, wid, place == kVNOrderBelow ? "below" : "above", orig_wid,
            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-           display);
+           display, clone_ms, (SLSCurrentRealTime() - t_snap0) * 1000.0);
     return clone;
 }
 
 #pragma mark - Animations
 
-#define kVNMeshW 5
-#define kVNMeshH 5
-#define kVNMeshCount (kVNMeshW * kVNMeshH)
 
 static double vn_get_display_refresh_interval(CGXWindow *win) {
     static int (*vn_resolved_display_get_current_mode)(const void *, void *) = NULL;
@@ -878,6 +988,26 @@ static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
     }
 }
 
+/// Frame interval for the running animation, sampled once at start. See the
+/// note in vn_anim_tick for why this is not recomputed per frame.
+static double gAnimFrameInterval = 1.0 / 120.0;
+
+/// When the next frame is due, in absolute time. The timer fires roughly
+/// 0.8ms late every frame; rescheduling from "now" folded that lateness into
+/// the period (measured: 9.17ms per frame against an 8.33ms target, ~109Hz
+/// on a 120Hz display, 7.6% of frames landing a whole vsync late). Advancing
+/// a fixed deadline instead keeps the cadence locked to the display.
+///
+/// Measured before/after: gap p50 9.17ms -> 8.30ms against an 8.33ms target,
+/// and frames landing a whole vsync late 7.6% -> 1.3%.
+///
+/// Kept, with a caveat: the user-visible "hang" turned out to be a collision
+/// with the system's transpose-into-icon animation, not a frame-pacing
+/// problem, so this is not what fixed that. It stands on its own measurement
+/// rather than on that symptom, and it may or may not be doing perceptible
+/// work now. Removing it would need a fresh measurement, not an assumption.
+static double gAnimNextDeadline = 0.0;
+
 static void vn_anim_tick(void *ctx, double when) {
     (void)ctx; (void)when;
 
@@ -926,9 +1056,38 @@ static void vn_anim_tick(void *ctx, double when) {
         }
     }
 
+#if ENABLE_LOGS && VN_LOG_LEVEL >= VN_LOG_LEVEL_TRACE
+    // Late frames are what a dropped frame looks like from in here: the gap
+    // since the previous tick, and how long this tick's own work took.
+    {
+        static double s_prev_tick = 0.0;
+        double spent = (SLSCurrentRealTime() - now) * 1000.0;
+        double gap   = s_prev_tick > 0.0 ? (now - s_prev_tick) * 1000.0 : 0.0;
+        s_prev_tick = now;
+        VN_TRACE("anim_tick: %d clone(s) gap=%.2fms work=%.2fms", snapshot_count, gap, spent);
+    }
+#endif
+
     if (more && vn_resolved_schedule_callback) {
-        double interval = vn_get_refresh_interval(first_active_win);
-        vn_resolved_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
+        // Deliberately not vn_get_refresh_interval() here. That reads the
+        // prefs, which stat()s the plist and re-parses it when the mtime
+        // moves -- a syscall, and potentially a file read and CFPropertyList
+        // parse, on the compositor's timer thread once per frame. The refresh
+        // rate cannot meaningfully change inside a 240ms animation, so it is
+        // sampled once at the start and reused.
+        double interval = gAnimFrameInterval;
+        if (interval <= 0.0) interval = 1.0 / 120.0;
+
+        // Advance the deadline rather than measuring from now, so the timer's
+        // own lateness does not compound frame over frame. If we have fallen
+        // more than a whole frame behind -- a real stall, not ordinary
+        // jitter -- resync instead of firing a burst of catch-up frames.
+        double after = SLSCurrentRealTime();
+        gAnimNextDeadline += interval;
+        if (gAnimNextDeadline < after) {
+            gAnimNextDeadline = after + interval;
+        }
+        vn_resolved_schedule_callback(vn_anim_tick, NULL, gAnimNextDeadline);
     } else {
         atomic_store_explicit(&gAnimTimerRunning, false, memory_order_release);
     }
@@ -1023,6 +1182,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
 
     double interval = vn_get_refresh_interval(clone_win);
     double hz = interval > 0.0 ? (1.0 / interval) : 120.0;
+    gAnimFrameInterval = interval;
 
     VN_INFO("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx is_wa=%d) win=%p duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
            clone_wid, orig_wid, app_name ? app_name : "", pid, psn, is_wa, clone_win, dur, interval * 1000.0, hz, anim_id);
@@ -1031,13 +1191,71 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         bool expected = false;
         if (atomic_compare_exchange_strong_explicit(&gAnimTimerRunning, &expected, true,
                                                     memory_order_acq_rel, memory_order_acquire)) {
-            vn_resolved_schedule_callback(vn_anim_tick, NULL, SLSCurrentRealTime() + interval);
+            gAnimNextDeadline = SLSCurrentRealTime() + interval;
+            vn_resolved_schedule_callback(vn_anim_tick, NULL, gAnimNextDeadline);
         } else {
             VN_DEBUG("anim_tick timer loop already active -- clone wid=%u animating concurrently", clone_wid);
         }
     } else {
         vn_finish_animation_for_id(anim_id);
     }
+}
+
+
+#pragma mark - System close-animation detection
+
+// Some windows come with the system's own close animation, and running ours
+// on top of it looks broken. The clearest case: double-click a file in
+// Finder, and the app transposes the window back into the file's icon when
+// it closes.
+//
+// Measured, from an unfiltered order-op trace of the same file opened both
+// ways (log timestamps, one close each):
+//
+//   Finder double-click              open -a Preview <file>
+//   13.034 wid=77 in  16x11   <-icon 21.176 wid=93 in 895x358  <- full size
+//   15.368 mouse up on red           22.710 mouse up on red
+//   15.428 wid=82 in  458x458 <-proxy   (nothing)
+//   15.429 wid=81 in 1025x476 <-proxy
+//   15.433 our animation starts      22.770 our animation starts
+//   15.626 wid=81 out  14x9   <-icon    (nothing)
+//
+// So the app spawns brand-new proxy windows that fly into the icon while our
+// clone shrinks in place. Nothing about the closing window differs between
+// the two cases -- not its state, not its geometry, not our frame delivery
+// (both closes measured 32 frames, zero late) -- so the proxies are the only
+// thing that separates them.
+//
+// They appear ~60ms after the release and ~4ms before we animate, which is
+// why this cannot be decided at pre-clone time and has to be checked at the
+// moment we would start.
+#define kVNProxyWindowWindowMs 250
+
+static _Atomic uint64_t gLastNewWindowMs  = 0;
+static _Atomic int      gLastNewWindowPid = 0;
+static _Atomic uint32_t gLastNewWindowWid = 0;
+
+/// Records a window that genuinely appeared (not a restack of one already on
+/// screen). Called from the ordering hook, which the proxies do pass through.
+static void vn_note_new_window(uint32_t wid, pid_t pid) {
+    if (wid == 0 || pid == 0) return;
+    atomic_store_explicit(&gLastNewWindowWid, wid, memory_order_relaxed);
+    atomic_store_explicit(&gLastNewWindowPid, (int)pid, memory_order_relaxed);
+    atomic_store_explicit(&gLastNewWindowMs, vn_now_ms(), memory_order_relaxed);
+}
+
+/// True when the closing window's app has just put a new window on screen --
+/// i.e. it is mid-transpose and our animation would collide with it.
+static bool vn_system_close_animation_in_flight(uint32_t closing_wid, pid_t pid) {
+    if (pid == 0) return false;
+    if (atomic_load_explicit(&gLastNewWindowPid, memory_order_relaxed) != (int)pid) return false;
+
+    uint32_t nwid = atomic_load_explicit(&gLastNewWindowWid, memory_order_relaxed);
+    if (nwid == 0 || nwid == closing_wid) return false;
+
+    uint64_t at = atomic_load_explicit(&gLastNewWindowMs, memory_order_relaxed);
+    uint64_t now = vn_now_ms();
+    return (now >= at) && ((now - at) < kVNProxyWindowWindowMs);
 }
 
 #pragma mark - Window Visibility & Process Window Counting
@@ -1257,11 +1475,15 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
 static _Atomic(uint64_t) gNonCloseTimeMs = 0;
 static _Atomic(uint32_t) gNonCloseWid = 0;
 
+/// Defined further down with the early-hide state it clears.
+static void vn_early_hidden_forget(uint32_t wid);
+
 static void vn_hook_release_window(CGXConnection *conn, CGXWindow *win) {
     uint32_t rel_wid = (win && vn_resolved_window_get_id) ? vn_resolved_window_get_id(win) : 0;
 
     if (rel_wid != 0) {
         vn_track_window_release(rel_wid);
+        vn_early_hidden_forget(rel_wid);
     }
 
     os_unfair_lock_lock(&gAnimsLock);
@@ -1383,16 +1605,43 @@ static float    gAlphaProbeBaseline = 1.0f;
 // The original is hidden the moment we take over, so it cannot show through
 // behind the shrinking clone while it finishes its own fade. If the close
 // somehow never lands, this is what puts it back.
-static uint32_t gEarlyHiddenWid = 0;
+//
+// The window pointer is kept alongside the id because ids are recycled: by
+// the time the check runs that id may belong to an entirely different
+// window, and forcing a CA visibility update on a live window that was never
+// ours is simply wrong.
+//
+// This was found while chasing a one-frame flash during window resizes. That
+// flash turned out NOT to be ours -- it reproduces with Vanish fully
+// unloaded -- so this is not a fix for it. It is kept because touching a
+// window we no longer own is a real bug on its own, whatever it does or does
+// not render.
+//
+// Matching on both is not airtight (an allocation could reuse the address
+// too) but combined with the short window it is far tighter than the id
+// alone, and the normal path clears the record long before this runs.
+static uint32_t   gEarlyHiddenWid = 0;
+static CGXWindow *gEarlyHiddenWin = NULL;
+
+/// Called once the real close lands, so the restore below never fires for a
+/// window that closed normally.
+static void vn_early_hidden_forget(uint32_t wid) {
+    if (wid != 0 && gEarlyHiddenWid == wid) {
+        gEarlyHiddenWid = 0;
+        gEarlyHiddenWin = NULL;
+    }
+}
 
 static void vn_early_restore_check(void *ctx, double when) {
     (void)ctx; (void)when;
-    uint32_t wid = gEarlyHiddenWid;
+    uint32_t   wid = gEarlyHiddenWid;
+    CGXWindow *was = gEarlyHiddenWin;
     if (wid == 0) return;
     gEarlyHiddenWid = 0;
+    gEarlyHiddenWin = NULL;
 
     CGXWindow *win = vn_resolved_window_by_id ? vn_resolved_window_by_id(wid) : NULL;
-    if (win && vn_window_is_ordered_in(win) && vn_resolved_update_ca_visibility) {
+    if (win && win == was && vn_window_is_ordered_in(win) && vn_resolved_update_ca_visibility) {
         VN_ERROR("early-close: wid=%u never ordered out -- restoring visibility", wid);
         vn_resolved_update_ca_visibility(win, true);
     }
@@ -1427,6 +1676,16 @@ static void vn_close_watch_tick(void *ctx, double when) {
         bool     anim_is_wa = false;
         char     anim_app[64] = {0};
 
+        // Checked before taking the pre-clone, so discarding it goes through
+        // the normal path and nothing has to be released by hand.
+        pid_t owner = vn_resolved_window_get_owning_pid ? vn_resolved_window_get_owning_pid(win) : 0;
+        if (vn_system_close_animation_in_flight(wid, owner)) {
+            VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
+                    wid, owner);
+            vn_preclone_discard_wid(wid);
+            return;
+        }
+
         os_unfair_lock_lock(&gPreCloneLock);
         CGXWindow *clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame,
                                                    &anim_pid, &anim_psn, &anim_is_wa,
@@ -1442,6 +1701,7 @@ static void vn_close_watch_tick(void *ctx, double when) {
         if (vn_resolved_update_ca_visibility) {
             vn_resolved_update_ca_visibility(win, false);
             gEarlyHiddenWid = wid;
+            gEarlyHiddenWin = win;
             if (vn_resolved_schedule_callback) {
                 vn_resolved_schedule_callback(vn_early_restore_check, NULL, SLSCurrentRealTime() + 2.0);
             }
@@ -1664,7 +1924,25 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
             } else {
                 CGXWindow *win = vn_resolved_window_by_id(wid);
                 if (win && vn_is_target_window(win) && !vn_is_window_animating(wid, win)) {
+                    // Kept with the same caveat as gAnimNextDeadline, though this
+                    // one is input latency rather than frame pacing, so it is the
+                    // least likely of the four to be redundant.
+                    //
+                    // Forward the release BEFORE building the clone. Building
+                    // it costs 2ms on a light window but 16ms on a heavy one
+                    // (Preview), and doing that first put the whole cost
+                    // between the click and the app hearing about it.
+                    //
+                    // The app is a different process, so it cannot have acted
+                    // on the release by the time this returns, and its close
+                    // signal is at minimum 40ms out against a 16ms build. If
+                    // a request somehow did overtake us on another server
+                    // thread it would find no pre-clone and pass through as
+                    // an ordinary close -- the same graceful fallback as any
+                    // close we did not pre-clone.
+                    if (vn_orig_post_event) vn_orig_post_event(conn, event);
                     vn_create_preclone(win, conn, pend.down_screen_pt, pend.down_local_pt);
+                    return;
                 }
             }
         }
@@ -1733,6 +2011,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
 
                 if (ops[0] == kVNOrderOut) {
                     vn_track_window_order(wid, pid, kVNOrderOut, win);
+                    vn_early_hidden_forget(wid);
 
                     bool animating = vn_is_window_animating(wid, win);
                     if (animating) {
@@ -1759,6 +2038,12 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     bool anim_is_wa = false;
                     char anim_app[64] = {0};
 
+                    if (vn_system_close_animation_in_flight(wid, pid)) {
+                        VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
+                                wid, pid);
+                        vn_preclone_discard_wid(wid);
+                    }
+
                     os_unfair_lock_lock(&gPreCloneLock);
                     clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
                     os_unfair_lock_unlock(&gPreCloneLock);
@@ -1784,6 +2069,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                            app, pid, wid, ops[0], vn_window_level(win));
 
                     bool was_already_ordered_in = vn_check_window_is_ordered_in(wid, win);
+                    if (!was_already_ordered_in) vn_note_new_window(wid, pid);
                     vn_track_window_order(wid, pid, ops[0], win);
                     vn_cancel_window_animation_if_ordering_in(wid, win, pid, was_already_ordered_in);
                 }
@@ -1812,6 +2098,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
 
                 if (ops[i] == kVNOrderOut) {
                     vn_track_window_order(wid, pid, kVNOrderOut, win);
+                    vn_early_hidden_forget(wid);
 
                     if (vn_is_window_animating(wid, win)) {
                         VN_DEBUG("Window wid=%u (%p, app: '%s') already animating; dropping duplicate order-out",
@@ -1838,6 +2125,12 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     uint64_t anim_psn = 0;
                     bool anim_is_wa = false;
                     char anim_app[64] = {0};
+
+                    if (vn_system_close_animation_in_flight(wid, pid)) {
+                        VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
+                                wid, pid);
+                        vn_preclone_discard_wid(wid);
+                    }
 
                     os_unfair_lock_lock(&gPreCloneLock);
                     clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
@@ -1868,6 +2161,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     continue;
                 } else {
                     bool was_already_ordered_in = vn_check_window_is_ordered_in(wid, win);
+                    if (!was_already_ordered_in) vn_note_new_window(wid, pid);
                     vn_track_window_order(wid, pid, ops[i], win);
                     vn_cancel_window_animation_if_ordering_in(wid, win, pid, was_already_ordered_in);
                 }
