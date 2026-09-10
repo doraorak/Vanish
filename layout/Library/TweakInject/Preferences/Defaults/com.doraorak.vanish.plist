@@ -2,14 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>enabled</key>
-	<true/>
-	<key>shadows</key>
-	<true/>
-	<key>refreshRate</key>
-	<real>120</real>
+	<key>animation</key>
+	<string>shrink</string>
 	<key>duration</key>
 	<real>0.25</real>
+	<key>enabled</key>
+	<true/>
+	<key>refreshRate</key>
+	<real>120.0</real>
+	<key>shadows</key>
+	<true/>
 	<key>targetApp</key>
 	<string>all</string>
 </dict>

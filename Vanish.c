@@ -95,7 +95,7 @@
 #define VN_LOG_LEVEL_TRACE 4
 
 #ifndef VN_LOG_LEVEL
-#define VN_LOG_LEVEL VN_LOG_LEVEL_INFO
+#define VN_LOG_LEVEL VN_LOG_LEVEL_TRACE
 #endif
 
 #if ENABLE_LOGS
@@ -164,6 +164,10 @@ static void vn_log_to_file(const char *fmt, ...) {
 #else
 #define VN_TRACE(fmt, ...) do {} while (0)
 #endif
+
+/// Close animations are described by a registry further down; the structs
+/// that carry a chosen one are defined before it.
+typedef struct VNAnimation VNAnimation;
 
 #pragma mark - Symbol resolution
 
@@ -249,9 +253,10 @@ typedef struct {
     float refreshRate;
     float duration;
     char  targetApp[256];
+    char  animation[64];
 } VNPreferences;
 
-static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .refreshRate = 120.0f, .duration = 0.25f, .targetApp = "all" };
+static VNPreferences  gPrefs = { .enabled = true, .shadows = true, .refreshRate = 120.0f, .duration = 0.25f, .targetApp = "all", .animation = "shrink" };
 static os_unfair_lock gPrefsLock = OS_UNFAIR_LOCK_INIT;
 static struct timespec gPrefsMtime = {0};
 static bool           gPrefsValid = false;
@@ -262,6 +267,7 @@ static void vn_reload_prefs_locked(void) {
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
+    strlcpy(gPrefs.animation, "shrink", sizeof(gPrefs.animation));
 
     const char *path = "/Library/TweakInject/Preferences/Defaults/com.doraorak.vanish.plist";
     struct stat st;
@@ -324,6 +330,14 @@ static void vn_reload_prefs_locked(void) {
                             char s[sizeof(gPrefs.targetApp)] = {0};
                             if (CFStringGetCString(targetVal, s, sizeof(s), kCFStringEncodingUTF8) && s[0] != '\0') {
                                 strlcpy(gPrefs.targetApp, s, sizeof(gPrefs.targetApp));
+                            }
+                        }
+
+                        CFStringRef animVal = (CFStringRef)CFDictionaryGetValue(dict, CFSTR("animation"));
+                        if (animVal && CFGetTypeID(animVal) == CFStringGetTypeID()) {
+                            char s[sizeof(gPrefs.animation)] = {0};
+                            if (CFStringGetCString(animVal, s, sizeof(s), kCFStringEncodingUTF8) && s[0] != '\0') {
+                                strlcpy(gPrefs.animation, s, sizeof(gPrefs.animation));
                             }
                         }
 
@@ -553,6 +567,7 @@ typedef struct {
     uint64_t       psn;
     bool           is_whatsapp;
     char           app[64];
+    const VNAnimation *anim;
 } VNCloneAnim;
 
 #define MAX_ACTIVE_ANIMS 32
@@ -603,6 +618,7 @@ typedef struct {
     CGXWindow *clone_win;
     CGRect     bounds;
     double     p;
+    const VNAnimation *anim;
 } VNAnimSnapshot;
 
 static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
@@ -655,6 +671,7 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
             gActiveAnims[i].psn = 0;
             gActiveAnims[i].is_whatsapp = false;
             gActiveAnims[i].app[0] = '\0';
+            gActiveAnims[i].anim = NULL;
             found = true;
             break;
         }
@@ -702,6 +719,10 @@ typedef struct {
     uint64_t       psn;
     bool           is_whatsapp;
     char           app[64];
+    // Resolved once, when the clone is built, and carried to the running
+    // animation: no preference read or string compare per frame, and the
+    // choice cannot change halfway through a close.
+    const VNAnimation *anim;
 } VNPreClone;
 
 static VNPreClone     gPreClones[MAX_PRECLONES] = {0};
@@ -723,6 +744,7 @@ static int vn_preclone_find_empty_slot_locked(void) {
 }
 
 static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone_wid, CGRect *out_frame,
+                                          const VNAnimation **out_anim,
                                           pid_t *out_pid, uint64_t *out_psn, bool *out_is_wa, char *out_app, size_t app_len) {
     int idx = vn_preclone_find_slot_locked(orig_wid);
     if (idx < 0) return NULL;
@@ -730,6 +752,7 @@ static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone
     CGXWindow *clone = gPreClones[idx].clone;
     if (out_clone_wid) *out_clone_wid = gPreClones[idx].clone_wid;
     if (out_frame) *out_frame = gPreClones[idx].frame;
+    if (out_anim) *out_anim = gPreClones[idx].anim;
     if (out_pid) *out_pid = gPreClones[idx].pid;
     if (out_psn) *out_psn = gPreClones[idx].psn;
     if (out_is_wa) *out_is_wa = gPreClones[idx].is_whatsapp;
@@ -744,7 +767,7 @@ static void vn_preclone_discard_wid(uint32_t orig_wid) {
     if (orig_wid == 0) return;
     uint32_t clone_wid = 0;
     os_unfair_lock_lock(&gPreCloneLock);
-    CGXWindow *clone = vn_preclone_take_locked(orig_wid, &clone_wid, NULL, NULL, NULL, NULL, NULL, 0);
+    CGXWindow *clone = vn_preclone_take_locked(orig_wid, &clone_wid, NULL, NULL, NULL, NULL, NULL, NULL, 0);
     os_unfair_lock_unlock(&gPreCloneLock);
 
     if (clone) {
@@ -830,14 +853,74 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 // compositor resamples 4 points per frame instead of 25. Raise this if the
 // animation ever becomes non-affine (a bend, a ripple, per-point easing);
 // interpolation would no longer be exact and the extra points would matter.
-#define kVNMeshW 2
-#define kVNMeshH 2
-#define kVNMeshCount (kVNMeshW * kVNMeshH)
-static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t);
+#pragma mark - Animation registry
 
+// Each animation deforms the clone by filling a warp mesh: for every point,
+// where it sits in the window and where to draw it on screen. Progress `t`
+// runs 0 -> 1 across the animation's duration.
+//
+// Two rules for anything added here:
+//
+//   At t = 0 the mesh MUST be the identity (every point drawn where it
+//   lives). vn_make_snapshot primes the warp path with a t = 0 fill so the
+//   first animated frame does not also have to realize the clone's surface,
+//   and that priming is only invisible if t = 0 changes nothing.
+//
+//   Pick the smallest mesh that is exact. Points between mesh vertices are
+//   interpolated, which reproduces an affine map (scale, rotation, shear)
+//   exactly from its corners alone -- so a uniform shrink needs 2x2 and
+//   gains nothing from more. Only genuinely non-affine motion, where
+//   different parts of the window move on different curves, needs a denser
+//   grid, and every extra vertex is per-frame work for the compositor.
+#define kVNMeshMaxDim   16
+#define kVNMeshMaxCount (kVNMeshMaxDim * kVNMeshMaxDim)
+
+// Swirl grid. Dense both ways: the twist carries horizontal and vertical
+// phases plus two ripple harmonics travelling across the window, so extra
+// rows AND columns both add real shape. 168 points at 16 bytes each is ~2.7KB
+// of the 4KB stack budget in vn_anim_tick.
+#define kVNMeshSwirlW 12
+#define kVNMeshSwirlH 14
+
+typedef enum {
+    VN_ANIM_MESH   = 0,
+    VN_ANIM_SHADER = 1,   // reserved; nothing implements this yet
+} VNAnimKind;
+
+struct VNAnimation {
+    const char *key;      // stored in prefs -- stable, do not rename
+    const char *title;    // shown in the preferences pane
+    VNAnimKind  kind;
+    unsigned    mesh_w, mesh_h;
+    void      (*fill_mesh)(VNPointWarp *mesh, CGRect bounds, double t);
+};
+
+static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t);
+static void vn_anim_squish(VNPointWarp *mesh, CGRect bounds, double t);
+static void vn_anim_fall(VNPointWarp *mesh, CGRect bounds, double t);
+static void vn_anim_swirl(VNPointWarp *mesh, CGRect bounds, double t);
+
+// The first entry is the fallback for a missing or unrecognised preference.
+static const VNAnimation gAnimations[] = {
+    { "shrink", "Shrink", VN_ANIM_MESH, 2, 2, vn_anim_shrink },
+    { "squish", "Squish", VN_ANIM_MESH, 2, 3, vn_anim_squish },
+    { "fall",   "Fall",   VN_ANIM_MESH, 2, 2, vn_anim_fall   },
+    { "swirl",  "Swirl",  VN_ANIM_MESH, kVNMeshSwirlW, kVNMeshSwirlH, vn_anim_swirl  },
+};
+#define kVNAnimationCount (sizeof(gAnimations) / sizeof(gAnimations[0]))
+
+static const VNAnimation *vn_animation_for_key(const char *key) {
+    if (key && key[0]) {
+        for (size_t i = 0; i < kVNAnimationCount; i++) {
+            if (strcasecmp(gAnimations[i].key, key) == 0) return &gAnimations[i];
+        }
+    }
+    return &gAnimations[0];
+}
 
 static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
                                    uint32_t *out_wid, CGRect *out_frame,
+                                   const VNAnimation **out_anim,
                                    CGSOrderOp place) {
     const uint32_t orig_wid = win->window_id;
     if (!vn_resolved_create_clone || !vn_resolved_window_get_display || !vn_resolved_screen_rect_from_rect ||
@@ -878,6 +961,8 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         return NULL;
     }
 
+    const VNAnimation *anim = vn_animation_for_key(prefs.animation);
+
     double t_clone0 = SLSCurrentRealTime();
     CGXWindow *clone = vn_resolved_create_clone(win, frame, display, true);
     double clone_ms = (SLSCurrentRealTime() - t_clone0) * 1000.0;
@@ -890,6 +975,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         vn_orig_order(conn, &wid, &op, &rel, 1, false);
         if (out_wid) *out_wid = wid;
         if (out_frame) *out_frame = frame;
+        if (out_anim) *out_anim = anim;
     }
 
     // Pre-warm the warp path.
@@ -905,10 +991,10 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     // clone is still hidden behind the original, moves that cost off the
     // first frame. At t=0 the shrink solver is an identity warp (s = 1.0), so
     // this cannot change what is on screen.
-    if (vn_resolved_set_mesh_warp) {
-        VNPointWarp warm[kVNMeshCount];
-        vn_anim_shrink(warm, frame, 0.0);
-        vn_resolved_set_mesh_warp(clone, NULL, kVNMeshW, kVNMeshH, (const float *)warm);
+    if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->fill_mesh) {
+        VNPointWarp warm[kVNMeshMaxCount];
+        anim->fill_mesh(warm, frame, 0.0);
+        vn_resolved_set_mesh_warp(clone, NULL, anim->mesh_w, anim->mesh_h, (const float *)warm);
     }
 
     if (!prefs.shadows) {
@@ -990,24 +1076,131 @@ static double vn_get_refresh_interval(CGXWindow *win) {
     return vn_get_display_refresh_interval(win);
 }
 
+// Uniform scale about the centre. Affine, so 2x2 is exact.
 static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t) {
     double s  = 1.0 - t;
     if (s < 0.005) s = 0.005;
     double cx = bounds.origin.x + bounds.size.width  * 0.5;
     double cy = bounds.origin.y + bounds.size.height * 0.5;
 
-    for (unsigned row = 0; row < kVNMeshH; row++) {
-        for (unsigned col = 0; col < kVNMeshW; col++) {
-            double lx = bounds.size.width  * ((double)col / (kVNMeshW - 1));
-            double ly = bounds.size.height * ((double)row / (kVNMeshH - 1));
+    for (unsigned row = 0; row < 2; row++) {
+        for (unsigned col = 0; col < 2; col++) {
+            double lx = bounds.size.width  * (double)col;
+            double ly = bounds.size.height * (double)row;
             double gx = bounds.origin.x + lx;
             double gy = bounds.origin.y + ly;
 
-            VNPointWarp *pt = &mesh[row * kVNMeshW + col];
+            VNPointWarp *pt = &mesh[row * 2 + col];
             pt->local.x  = (float)lx;
             pt->local.y  = (float)ly;
             pt->global.x = (float)(cx + (gx - cx) * s);
             pt->global.y = (float)(cy + (gy - cy) * s);
+        }
+    }
+}
+
+// Collapse toward the horizontal centre line, like a blind snapping shut.
+// Affine in each axis; the middle row exists so the fold is visible rather
+// than a plain vertical scale.
+static void vn_anim_squish(VNPointWarp *mesh, CGRect bounds, double t) {
+    double vs = 1.0 - t;
+    if (vs < 0.005) vs = 0.005;
+    double hs = 1.0 - t * 0.15;   // a touch of horizontal draw-in
+    double cx = bounds.origin.x + bounds.size.width  * 0.5;
+    double cy = bounds.origin.y + bounds.size.height * 0.5;
+
+    for (unsigned row = 0; row < 3; row++) {
+        for (unsigned col = 0; col < 2; col++) {
+            double v  = (double)row * 0.5;
+            double lx = bounds.size.width  * (double)col;
+            double ly = bounds.size.height * v;
+            double gx = bounds.origin.x + lx;
+            double gy = bounds.origin.y + ly;
+
+            VNPointWarp *pt = &mesh[row * 2 + col];
+            pt->local.x  = (float)lx;
+            pt->local.y  = (float)ly;
+            pt->global.x = (float)(cx + (gx - cx) * hs);
+            pt->global.y = (float)(cy + (gy - cy) * vs);
+        }
+    }
+}
+
+// Rotate about the bottom-left corner and drop away. A rotation plus a
+// translation is affine, so the four corners carry it exactly.
+static void vn_anim_fall(VNPointWarp *mesh, CGRect bounds, double t) {
+    double ease  = t * t;                       // accelerate, like gravity
+    double ang   = ease * 1.15;                 // radians of tip-over
+    double drop  = ease * bounds.size.height * 1.6;
+    double shrink = 1.0 - t * 0.25;
+    double ca = cos(ang), sa = sin(ang);
+
+    // Pivot at the bottom-left of the window, in screen coordinates.
+    double px = bounds.origin.x;
+    double py = bounds.origin.y + bounds.size.height;
+
+    for (unsigned row = 0; row < 2; row++) {
+        for (unsigned col = 0; col < 2; col++) {
+            double lx = bounds.size.width  * (double)col;
+            double ly = bounds.size.height * (double)row;
+            double dx = (bounds.origin.x + lx - px) * shrink;
+            double dy = (bounds.origin.y + ly - py) * shrink;
+
+            VNPointWarp *pt = &mesh[row * 2 + col];
+            pt->local.x  = (float)lx;
+            pt->local.y  = (float)ly;
+            pt->global.x = (float)(px + dx * ca - dy * sa);
+            pt->global.y = (float)(py + dx * sa + dy * ca + drop);
+        }
+    }
+}
+
+// Rotate about the centre while shrinking, with the twist increasing from
+// the centre outward so the corners trail. Horizontal and vertical phases
+// bend that twist across the window, and two ripple harmonics (one per axis)
+// travel through it mid-flight -- that per-row AND per-column variation is
+// the non-affine part that needs the dense kVNMeshSwirlW x kVNMeshSwirlH
+// grid. Every extra term scales with t, so t = 0 is still the identity.
+static void vn_anim_swirl(VNPointWarp *mesh, CGRect bounds, double t) {
+    double s = 1.0 - t;
+    if (s < 0.005) s = 0.005;
+    double cx = bounds.origin.x + bounds.size.width  * 0.5;
+    double cy = bounds.origin.y + bounds.size.height * 0.5;
+    double half = hypot(bounds.size.width, bounds.size.height) * 0.5;
+    if (half < 1.0) half = 1.0;
+
+    for (unsigned row = 0; row < kVNMeshSwirlH; row++) {
+        for (unsigned col = 0; col < kVNMeshSwirlW; col++) {
+            double u  = (double)col / (double)(kVNMeshSwirlW - 1);
+            double v  = (double)row / (double)(kVNMeshSwirlH - 1);
+            double lx = bounds.size.width  * u;
+            double ly = bounds.size.height * v;
+            double dx = bounds.origin.x + lx - cx;
+            double dy = bounds.origin.y + ly - cy;
+
+            // Twist scales with distance from the centre, so the middle
+            // barely turns and the corners sweep a full ~185 degrees; the
+            // u/v phases fold that sweep across the window.
+            double r    = hypot(dx, dy) / half;
+            double ang  = t * 3.2 * r
+                        + t * 1.1 * sin(v * M_PI)
+                        + t * 0.6 * sin(u * M_PI * 2.0);
+            double ca   = cos(ang), sa = sin(ang);
+
+            // Ripples travelling along each axis, ramped in by t and scaled
+            // by r so the centre stays put. Die with s as the window
+            // collapses.
+            double ripple_x = (sin(v * M_PI * 2.0 + t * 9.42477796076938)
+                             + 0.5 * sin(v * M_PI * 4.0 - t * 6.283185307179586))
+                            * t * 0.05 * half * r;
+            double ripple_y = cos(u * M_PI * 2.0 + t * 6.283185307179586)
+                            * t * 0.04 * half * r;
+
+            VNPointWarp *pt = &mesh[row * kVNMeshSwirlW + col];
+            pt->local.x  = (float)lx;
+            pt->local.y  = (float)ly;
+            pt->global.x = (float)(cx + (dx * ca - dy * sa) * s + ripple_x * s);
+            pt->global.y = (float)(cy + (dx * sa + dy * ca) * s + ripple_y * s);
         }
     }
 }
@@ -1062,6 +1255,7 @@ static void vn_anim_tick(void *ctx, double when) {
                     .clone_win = gActiveAnims[i].clone_win,
                     .bounds = gActiveAnims[i].bounds,
                     .p = p,
+                    .anim = gActiveAnims[i].anim,
                 };
             }
         }
@@ -1073,10 +1267,22 @@ static void vn_anim_tick(void *ctx, double when) {
     }
 
     for (int i = 0; i < snapshot_count; i++) {
-        if (vn_resolved_set_mesh_warp && snapshots[i].clone_win) {
-            VNPointWarp mesh[kVNMeshCount];
-            vn_anim_shrink(mesh, snapshots[i].bounds, snapshots[i].p);
-            vn_resolved_set_mesh_warp(snapshots[i].clone_win, NULL, kVNMeshW, kVNMeshH, (const float *)mesh);
+        const VNAnimation *anim = snapshots[i].anim ? snapshots[i].anim : &gAnimations[0];
+        if (!snapshots[i].clone_win) continue;
+
+        // Dispatch on kind rather than assuming a mesh, so a shader animation
+        // can be added here without disturbing this path.
+        switch (anim->kind) {
+        case VN_ANIM_MESH:
+            if (vn_resolved_set_mesh_warp && anim->fill_mesh) {
+                VNPointWarp mesh[kVNMeshMaxCount];
+                anim->fill_mesh(mesh, snapshots[i].bounds, snapshots[i].p);
+                vn_resolved_set_mesh_warp(snapshots[i].clone_win, NULL,
+                                          anim->mesh_w, anim->mesh_h, (const float *)mesh);
+            }
+            break;
+        case VN_ANIM_SHADER:
+            break;   // nothing implements this yet
         }
     }
 
@@ -1118,6 +1324,7 @@ static void vn_anim_tick(void *ctx, double when) {
 }
 
 static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CGRect frame,
+                                    const VNAnimation *anim,
                                      pid_t pid, uint64_t psn, bool is_wa, const char *app_name) {
     if (!clone_win) return;
     uint32_t clone_wid = vn_resolved_window_get_id ? vn_resolved_window_get_id(clone_win) : 0;
@@ -1178,6 +1385,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     if (slot == -1) slot = 0;
 
     anim_id = gNextAnimId++;
+    if (!anim) anim = &gAnimations[0];
     gActiveAnims[slot] = (VNCloneAnim){
         .clone_wid = clone_wid,
         .orig_wid = orig_wid,
@@ -1190,6 +1398,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
         .pid = pid,
         .psn = psn,
         .is_whatsapp = is_wa,
+        .anim = anim,
     };
     if (app_name && app_name[0] != '\0') {
         strlcpy(gActiveAnims[slot].app, app_name, sizeof(gActiveAnims[slot].app));
@@ -1208,8 +1417,8 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     double hz = interval > 0.0 ? (1.0 / interval) : 120.0;
     gAnimFrameInterval = interval;
 
-    VN_INFO("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx is_wa=%d) win=%p duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
-           clone_wid, orig_wid, app_name ? app_name : "", pid, psn, is_wa, clone_win, dur, interval * 1000.0, hz, anim_id);
+    VN_INFO("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx is_wa=%d) win=%p anim='%s' duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
+            clone_wid, orig_wid, app_name ? app_name : "", pid, psn, is_wa, clone_win, anim ? anim->key : "?", dur, interval * 1000.0, hz, anim_id);
 
     if (vn_resolved_schedule_callback) {
         bool expected = false;
@@ -1462,6 +1671,7 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
             gActiveAnims[i].psn = 0;
             gActiveAnims[i].is_whatsapp = false;
             gActiveAnims[i].app[0] = '\0';
+            gActiveAnims[i].anim = NULL;
         }
     }
     os_unfair_lock_unlock(&gAnimsLock);
@@ -1523,6 +1733,7 @@ static void vn_hook_release_window(CGXConnection *conn, CGXWindow *win) {
             gActiveAnims[i].clone_wid = 0;
             gActiveAnims[i].orig_wid = 0;
             gActiveAnims[i].clone_win = NULL;
+            gActiveAnims[i].anim = NULL;
             break;
         } else if (rel_wid != 0 && gActiveAnims[i].orig_wid == rel_wid) {
             VN_DEBUG("release_window arrived for orig_wid=%u while clone wid=%u is animating (normal AppKit teardown); clone continues",
@@ -1540,6 +1751,7 @@ static void vn_hook_release_window(CGXConnection *conn, CGXWindow *win) {
     uint64_t anim_psn = 0;
     bool anim_is_wa = false;
     char anim_app[64] = {0};
+    const VNAnimation *anim_desc = NULL;
 
     os_unfair_lock_lock(&gPreCloneLock);
     for (int i = 0; i < MAX_PRECLONES; i++) {
@@ -1551,7 +1763,7 @@ static void vn_hook_release_window(CGXConnection *conn, CGXWindow *win) {
             ((rel_wid != 0 && gPreClones[i].orig_wid == rel_wid) ||
              (vn_resolved_window_by_id && vn_resolved_window_by_id(gPreClones[i].orig_wid) == win))) {
             orig_wid = gPreClones[i].orig_wid;
-            clone_to_animate = vn_preclone_take_locked(orig_wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
+            clone_to_animate = vn_preclone_take_locked(orig_wid, &clone_wid, &clone_frame, &anim_desc, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
             break;
         }
     }
@@ -1562,7 +1774,7 @@ static void vn_hook_release_window(CGXConnection *conn, CGXWindow *win) {
     if (clone_to_animate) {
         VN_INFO(">>> Close seen at release_window for wid=%u (app='%s' pid=%d psn=0x%llx is_wa=%d) -- animating pre-clone wid=%u",
                orig_wid, anim_app, anim_pid, anim_psn, anim_is_wa, clone_wid);
-        vn_start_clone_animation(clone_to_animate, orig_wid, clone_frame, anim_pid, anim_psn, anim_is_wa, anim_app);
+        vn_start_clone_animation(clone_to_animate, orig_wid, clone_frame, anim_desc, anim_pid, anim_psn, anim_is_wa, anim_app);
     }
 }
 
@@ -1702,6 +1914,7 @@ static void vn_close_watch_tick(void *ctx, double when) {
 
         // Checked before taking the pre-clone, so discarding it goes through
         // the normal path and nothing has to be released by hand.
+        const VNAnimation *anim_desc = NULL;
         pid_t owner = vn_resolved_window_get_owning_pid ? vn_resolved_window_get_owning_pid(win) : 0;
         if (vn_system_close_animation_in_flight(wid, owner)) {
             VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
@@ -1711,7 +1924,7 @@ static void vn_close_watch_tick(void *ctx, double when) {
         }
 
         os_unfair_lock_lock(&gPreCloneLock);
-        CGXWindow *clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame,
+        CGXWindow *clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_desc,
                                                    &anim_pid, &anim_psn, &anim_is_wa,
                                                    anim_app, sizeof(anim_app));
         os_unfair_lock_unlock(&gPreCloneLock);
@@ -1731,7 +1944,7 @@ static void vn_close_watch_tick(void *ctx, double when) {
             }
         }
 
-        vn_start_clone_animation(clone, wid, clone_frame, anim_pid, anim_psn, anim_is_wa, anim_app);
+        vn_start_clone_animation(clone, wid, clone_frame, anim_desc, anim_pid, anim_psn, anim_is_wa, anim_app);
         return;
     }
 
@@ -1761,7 +1974,8 @@ static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn,
 
     uint32_t clone_wid = 0;
     CGRect clone_frame = CGRectZero;
-    CGXWindow *clone = vn_make_snapshot(win, conn, &clone_wid, &clone_frame, kVNOrderBelow);
+    const VNAnimation *anim = NULL;
+    CGXWindow *clone = vn_make_snapshot(win, conn, &clone_wid, &clone_frame, &anim, kVNOrderBelow);
     if (!clone || clone_wid == 0) {
         VN_ERROR("pre-clone: failed to create clone for wid=%u", wid);
         return false;
@@ -1785,6 +1999,7 @@ static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn,
         .pid = pid,
         .psn = psn,
         .is_whatsapp = (strcasecmp(app, "WhatsApp") == 0),
+        .anim = anim,
     };
     strlcpy(gPreClones[slot].app, app, sizeof(gPreClones[slot].app));
     os_unfair_lock_unlock(&gPreCloneLock);
@@ -2061,6 +2276,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     uint64_t anim_psn = 0;
                     bool anim_is_wa = false;
                     char anim_app[64] = {0};
+                    const VNAnimation *anim_desc = NULL;
 
                     if (vn_system_close_animation_in_flight(wid, pid)) {
                         VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
@@ -2069,7 +2285,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     }
 
                     os_unfair_lock_lock(&gPreCloneLock);
-                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
+                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_desc, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
@@ -2086,7 +2302,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                            wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
 
                     vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-                    vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
+                    vn_start_clone_animation(clone, wid, clone_frame, anim_desc, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
                     return;
                 } else {
                     VN_TRACE("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d",
@@ -2149,6 +2365,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     uint64_t anim_psn = 0;
                     bool anim_is_wa = false;
                     char anim_app[64] = {0};
+                    const VNAnimation *anim_desc = NULL;
 
                     if (vn_system_close_animation_in_flight(wid, pid)) {
                         VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
@@ -2157,7 +2374,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     }
 
                     os_unfair_lock_lock(&gPreCloneLock);
-                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
+                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_desc, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
                     os_unfair_lock_unlock(&gPreCloneLock);
 
                     if (!clone || clone_wid == 0) {
@@ -2176,7 +2393,7 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         }
                         VN_INFO(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
                                wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
-                        vn_start_clone_animation(clone, wid, clone_frame, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
+                        vn_start_clone_animation(clone, wid, clone_frame, anim_desc, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
                     }
                     pass_wids[pass_count] = wid;
                     pass_ops[pass_count] = ops[i];
