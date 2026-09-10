@@ -124,9 +124,23 @@ fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
         const float2 cell = floor(src / grain);
         const float  r    = vn_hash(cell);
 
-        // Particles near the bottom leave first. The stagger is what makes a
-        // front sweep through the window instead of all of it going at once.
-        const float start = (1.0 - src.y) * 0.45 + r * 0.15;
+        // The dissolve begins at the top-left and spreads outward. That corner
+        // is where the close button is, so it is where the pointer is and where
+        // the eye already is -- the effect starts under the cursor and sweeps
+        // away from it.
+        //
+        // Starting anywhere else costs far more than it looks. A front that
+        // begins at the far edge leaves the region being watched untouched for
+        // its whole spread, which reads as lag even though the animation is
+        // already running.
+        //
+        // Distance is measured in pixels, not texture coordinates, so the front
+        // is a circle on screen rather than an ellipse in a window that is not
+        // square. 1/px is the window's size in pixels; its length is the
+        // diagonal, which normalises the distance to 0..1.
+        const float2 size  = 1.0 / px;
+        const float  reach = length(src * size) / length(size);
+        const float  start = reach * 0.50 + r * 0.15;
         age = clamp((t - start) / 0.55, 0.0, 1.0);
 
         const float2 rel = src - float2(0.5);
