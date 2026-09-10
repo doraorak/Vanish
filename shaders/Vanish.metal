@@ -61,12 +61,24 @@ vertex VNUberStage vn_uber_vertex(VNUberIn in [[stage_in]],
     return out;
 }
 
-// Vanish warps the clone's quad outward (kVNShaderMargin in Vanish.c) so flecks
-// are not cut off at the window's edge. The interpolated texture coordinates
-// therefore run past [0,1], and anything outside that range is margin: no
-// window pixels live there. Nothing here needs to know how wide the margin is
-// -- "outside [0,1]" is the test either way -- so the two do not have to be
-// kept in step.
+// Must match kVNShaderMargin in Vanish.c.
+//
+// Vanish gives the clone a shape that much larger than the window on each side
+// so flecks are not cut off at its edge. The texture coordinates that arrive
+// here are normalised to the TEXTURE, not to the quad -- so across a quad
+// (1 + 2m) times wider they run 0 .. (1 + 2m), and the window's own pixels are
+// exactly the [0,1] part. Nothing needs rescaling; texel-to-pixel is already
+// 1:1.
+//
+// What does need correcting is the origin: coordinate 0 sits at the quad's
+// top-left corner, which the widened shape moved up and left by m. Subtracting
+// m puts the window back where it was, centred in the quad with margin all
+// round, and makes anything outside [0,1] the margin.
+constant float kVNShaderMargin = 0.35;
+
+static float2 vn_window_uv(float2 tex) {
+    return tex - kVNShaderMargin;
+}
 
 static float vn_hash(float2 p) {
     return fract(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453);
@@ -95,7 +107,7 @@ fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
                                  texture2d<float> tex2D [[texture(0)]],
                                  constant VNUberArgs &args [[buffer(0)]],
                                  sampler samp [[sampler(0)]]) {
-    const float2 uv = in.tex.xy / max(in.tex.w, 1e-6);
+    const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
     const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
 
     // Fleck size fixed in screen pixels, not texture coordinates, so it does not

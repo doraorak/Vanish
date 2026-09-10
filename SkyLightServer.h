@@ -136,6 +136,31 @@ _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.param
 
 #define kVNSymCreateSpecializedShader \
     "__ZN14ShaderComposer25create_specialized_shaderEPU21objcproto10MTLLibrary11objc_objectP8NSStringS3_PFP25MTLFunctionConstantValuesyEyP19MTLVertexDescriptor"
+/// `CGXWindow::shape_window_with_rect(CGRect, CGSWindowSaveWeighting)`
+///
+/// Sets a window's shape from a plain rect -- it builds the region itself, so
+/// no CGSRegionObject has to be constructed. x0 is `this`, the rect arrives in
+/// d0-d3 and the weighting in x1.
+///
+/// This is the only lever we have on where a shader animation may draw. A
+/// fragment shader can only write inside the layer's draw shape, and
+/// generate_layers_for_window builds that from the window's own region, so
+/// flecks drifting past the window's edge are cut off. Inflating the clone's
+/// frame does not move that bound, and a mesh warp cannot: the compositor
+/// treats mesh and filter as mutually exclusive --
+///
+///     +8192: ldr  x9, [win, #0x8a8]   ; the filter
+///     +8196: cbz  x9, skip            ; none -> nothing to apply
+///     +8200: tbnz x8, #0x26, apply    ; flag bit 38 -> ignore the mesh
+///     +8204: ldr  x10, [win, #0x8b0]  ; the mesh
+///     +8208: cbnz x10, skip           ; mesh present -> skip the filter
+///
+/// and bit 38 is not an escape hatch: every site that tests it treats it as
+/// "behave as though there were no mesh", so setting it would buy the filter
+/// back by discarding the warp.
+#define kVNSymShapeWindowWithRect \
+    "__ZN9CGXWindow22shape_window_with_rectE6CGRect22CGSWindowSaveWeighting"
+
 #define kVNSymUberComposite \
     "__ZN14ShaderComposer13UberCompositeE14MTLPixelFormaty"
 #define kVNSymCreateShader \
@@ -538,6 +563,7 @@ typedef void  *(*VNCreateShaderFn)(void *library, void *vtx, void *frag, void *v
 
 /// NON-static -- x0 is the ShaderComposer, unlike its create_* siblings.
 typedef void  *(*VNUberCompositeFn)(void *composer, unsigned fmt, uint64_t options);
+typedef void   (*VNShapeWindowWithRectFn)(CGXWindow *, CGRect, uint32_t);
 typedef void  *(*VNCreateSpecializedShaderFn)(void *library, void *vtx, void *frag,
                                               void *constants_fn, uint64_t options, void *vdesc);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);

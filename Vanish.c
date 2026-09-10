@@ -230,6 +230,7 @@ static VNUpdateWindowFn             vn_resolved_update_window;
 static VNCreateShaderFn             vn_resolved_create_shader;
 static VNCreateSpecializedShaderFn  vn_orig_create_specialized_shader;
 static VNUberCompositeFn            vn_orig_uber_composite;
+static VNShapeWindowWithRectFn      vn_resolved_shape_window_with_rect;
 
 /// Non-zero while at least one clone carries a shader animation's tag. The
 /// substitution hook tests this first: macOS's own Invert Colours accessibility
@@ -896,6 +897,12 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 //   gains nothing from more. Only genuinely non-affine motion, where
 //   different parts of the window move on different curves, needs a denser
 //   grid, and every extra vertex is per-frame work for the compositor.
+// How far past the window a shader animation may draw, as a fraction of the
+// window's size on each side. Purely a C-side number: the shader needs no
+// matching constant, because texture coordinates outside [0,1] are margin
+// whatever its width.
+#define kVNShaderMargin 0.35
+
 #define kVNMeshMaxDim   16
 #define kVNMeshMaxCount (kVNMeshMaxDim * kVNMeshMaxDim)
 
@@ -1038,6 +1045,51 @@ static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader) {
 // and the room must come from somewhere else. If it survives, the mesh is fine
 // and the fault was in the margin mapping.
 
+/// Widens where a shader animation may draw, by giving the clone a shape larger
+/// than the window it copied. The draw shape the compositor clips us to is
+/// built from this region, so growing it is what buys room for flecks that
+/// drift past the window's edge.
+///
+/// The rect sizes and positions the clone, so its texture ends up stretched
+/// across a quad larger than the window. The shader puts the content back at
+/// 1:1 in the middle -- see vn_window_uv there, which has to agree with
+/// kVNShaderMargin.
+static void vn_shader_widen_bounds(CGXWindow *clone, CGRect frame) {
+    if (!clone || !vn_resolved_shape_window_with_rect) return;
+
+    const double mx = frame.size.width  * kVNShaderMargin;
+    const double my = frame.size.height * kVNShaderMargin;
+
+    // Screen coordinates, not window-local: the rect positions the window as
+    // well as sizing it, so a (-mx, -my) origin does not widen the shape in
+    // place, it teleports the clone to the top-left of the display.
+    const CGRect shape = CGRectMake(frame.origin.x - mx, frame.origin.y - my,
+                                    frame.size.width  + mx * 2.0,
+                                    frame.size.height + my * 2.0);
+
+    // Measure, rather than assume. Two attempts at this rect have moved the
+    // clone instead of widening it in place, so log what the window actually
+    // becomes: asked-for rect, and the screen rect and frame bounds the server
+    // reports afterwards.
+    CGRect before_screen = vn_resolved_screen_rect ? vn_resolved_screen_rect(clone) : CGRectZero;
+    CGRect before_bounds = vn_resolved_clipped_frame_bounds ? vn_resolved_clipped_frame_bounds(clone) : CGRectZero;
+
+    vn_resolved_shape_window_with_rect(clone, shape, 0);
+
+    CGRect after_screen = vn_resolved_screen_rect ? vn_resolved_screen_rect(clone) : CGRectZero;
+    CGRect after_bounds = vn_resolved_clipped_frame_bounds ? vn_resolved_clipped_frame_bounds(clone) : CGRectZero;
+
+    VN_INFO("shader bounds: frame=(%.0f,%.0f %.0fx%.0f) asked=(%.0f,%.0f %.0fx%.0f)",
+            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+            shape.origin.x, shape.origin.y, shape.size.width, shape.size.height);
+    VN_INFO("shader bounds: screen %.0f,%.0f %.0fx%.0f -> %.0f,%.0f %.0fx%.0f",
+            before_screen.origin.x, before_screen.origin.y, before_screen.size.width, before_screen.size.height,
+            after_screen.origin.x,  after_screen.origin.y,  after_screen.size.width,  after_screen.size.height);
+    VN_INFO("shader bounds: bounds %.0f,%.0f %.0fx%.0f -> %.0f,%.0f %.0fx%.0f",
+            before_bounds.origin.x, before_bounds.origin.y, before_bounds.size.width, before_bounds.size.height,
+            after_bounds.origin.x,  after_bounds.origin.y,  after_bounds.size.width,  after_bounds.size.height);
+}
+
 /// The animation's progress, handed to the shader through the one per-window
 /// float the compositor already plumbs into UberComposite_FragmentArgs:
 /// CGXWindow::brightness -> layer->[0x224] -> args._brightness.
@@ -1151,6 +1203,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     // this cannot change what is on screen.
     if (anim->kind == VN_ANIM_SHADER) {
         vn_filter_attach(clone, anim->shader.type, true);
+        vn_shader_widen_bounds(clone, frame);
         vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
         VNPointWarp warm[kVNMeshMaxCount];
@@ -3190,6 +3243,7 @@ static void vanish_init(void) {
     vn_resolved_window_set_filter            = (VNWindowSetFilterFn)vn_skylight_symbol(kVNSymWindowSetFilter);
     vn_resolved_update_window                = (VNUpdateWindowFn)vn_skylight_symbol(kVNSymUpdateWindow);
     vn_resolved_create_shader                = (VNCreateShaderFn)vn_skylight_symbol(kVNSymCreateShader);
+    vn_resolved_shape_window_with_rect       = (VNShapeWindowWithRectFn)vn_skylight_symbol(kVNSymShapeWindowWithRect);
     vn_resolved_create_clone                 = (VNCreateCloneFn)vn_skylight_symbol(kVNSymCreateCloneOfWindow);
     vn_resolved_system_window_release        = (VNSystemWindowReleaseFn)vn_skylight_symbol(kVNSymSystemWindowRelease);
     vn_resolved_window_get_display           = (VNWindowGetDisplayFn)vn_skylight_symbol(kVNSymWindowGetDisplay);
