@@ -1766,6 +1766,118 @@ static bool vn_system_close_animation_in_flight(uint32_t closing_wid, pid_t pid)
     return (now >= at) && ((now - at) < kVNProxyWindowWindowMs);
 }
 
+// The proxy-window signal above misses the other half of the same behaviour.
+// Double-click a *folder* on the desktop and Finder spawns nothing: it zooms
+// the real window out of the folder icon, and on close it flies that same
+// window back into it. From an unfiltered order-op trace of one such open
+// (log timestamps, ms):
+//
+//   37.801  wid=81 out  296,127 920x492   <- created at its final geometry
+//   37.855  wid=81 in   933,376 193x130   <- moved onto the icon, zoom starts
+//   38.815  wid=81 in   296,127 920x492   <- arrived
+//
+// so the whole transpose happens on one window id. vn_system_close_animation_
+// in_flight() cannot see it: there is no second window, and its own guard
+// (nwid == closing_wid) rejects the only one there is. The 193x130 order-in
+// is also invisible to everything downstream, because vn_is_target_window()
+// drops Finder windows under 450pt wide.
+//
+// The fingerprint is the pair of wildly different frames within a few tens of
+// ms of the window first being seen. Nothing a settled window does looks like
+// that: a user resize is gradual and arrives long after birth, and the Dock's
+// genie (which also flashes a 52x52 frame near the Dock) only ever happens to
+// a window that has been on screen for a while. Hence the birth window --
+// it is what separates "opened by zooming" from "minimised at some point".
+//
+// A window flagged here never gets a pre-clone, so the close runs stock and
+// the system's own transpose plays alone. Suppressing *their* animation and
+// keeping ours is the better end state, but it needs a way to cancel a
+// transpose already committed to; this is the half that stops the collision.
+#define kVNZoomBirthWindowMs 750
+#define kVNZoomAreaRatio     4.0
+#define MAX_ZOOM_TRACKED     128
+
+typedef struct {
+    uint32_t wid;
+    uint64_t birth_ms;
+    double   ref_area;   // largest frame seen so far, the one to compare against
+    bool     zoom_opened;
+} VNZoomRecord;
+
+static VNZoomRecord   gZoomWindows[MAX_ZOOM_TRACKED] = {0};
+static os_unfair_lock gZoomLock = OS_UNFAIR_LOCK_INIT;
+
+/// Feeds one observed frame for a window. Called for every window the ordering
+/// hook sees -- including the ones vn_is_target_window() rejects, which is
+/// where the small transpose frames live.
+static void vn_note_window_frame(uint32_t wid, CGRect frame) {
+    if (wid == 0) return;
+    double area = frame.size.width * frame.size.height;
+    if (area <= 0.0) return;
+
+    uint64_t now = vn_now_ms();
+
+    os_unfair_lock_lock(&gZoomLock);
+    int slot = -1, empty = -1, oldest = 0;
+    for (int i = 0; i < MAX_ZOOM_TRACKED; i++) {
+        if (gZoomWindows[i].wid == wid) { slot = i; break; }
+        if (empty < 0 && gZoomWindows[i].wid == 0) empty = i;
+        if (gZoomWindows[i].birth_ms < gZoomWindows[oldest].birth_ms) oldest = i;
+    }
+    if (slot < 0) {
+        slot = (empty >= 0) ? empty : oldest;
+        gZoomWindows[slot] = (VNZoomRecord){ .wid = wid, .birth_ms = now, .ref_area = area };
+        os_unfair_lock_unlock(&gZoomLock);
+        return;
+    }
+
+    VNZoomRecord *rec = &gZoomWindows[slot];
+    if (rec->zoom_opened || (now - rec->birth_ms) > kVNZoomBirthWindowMs) {
+        os_unfair_lock_unlock(&gZoomLock);
+        return;
+    }
+
+    bool zoomed = (area * kVNZoomAreaRatio <= rec->ref_area) ||
+                  (rec->ref_area * kVNZoomAreaRatio <= area);
+    if (zoomed) {
+        rec->zoom_opened = true;
+    } else if (area > rec->ref_area) {
+        rec->ref_area = area;
+    }
+    double   ref = rec->ref_area;
+    uint64_t age = now - rec->birth_ms;
+    os_unfair_lock_unlock(&gZoomLock);
+
+    if (zoomed) {
+        VN_INFO(">>> wid=%u opened by zooming out of an icon (%.0fx%.0f vs ref area %.0f, %llums after first seen) -- its close is the system's to animate",
+                wid, frame.size.width, frame.size.height, ref, age);
+    }
+}
+
+static bool vn_window_was_zoom_opened(uint32_t wid) {
+    if (wid == 0) return false;
+    bool flagged = false;
+    os_unfair_lock_lock(&gZoomLock);
+    for (int i = 0; i < MAX_ZOOM_TRACKED; i++) {
+        if (gZoomWindows[i].wid == wid) { flagged = gZoomWindows[i].zoom_opened; break; }
+    }
+    os_unfair_lock_unlock(&gZoomLock);
+    return flagged;
+}
+
+/// Window ids are recycled, so a record must not outlive its window.
+static void vn_zoom_forget(uint32_t wid) {
+    if (wid == 0) return;
+    os_unfair_lock_lock(&gZoomLock);
+    for (int i = 0; i < MAX_ZOOM_TRACKED; i++) {
+        if (gZoomWindows[i].wid == wid) {
+            memset(&gZoomWindows[i], 0, sizeof(VNZoomRecord));
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&gZoomLock);
+}
+
 #pragma mark - Window Visibility & Process Window Counting
 
 #define MAX_TRACKED_WINDOWS 512
@@ -1855,6 +1967,7 @@ static void vn_track_window_order(uint32_t wid, pid_t pid, CGSOrderOp op, CGXWin
 
 static void vn_track_window_release(uint32_t wid) {
     if (wid == 0) return;
+    vn_zoom_forget(wid);
     os_unfair_lock_lock(&gTrackedLock);
     for (int i = 0; i < MAX_TRACKED_WINDOWS; i++) {
         if (gTrackedWindows[i].wid == wid) {
@@ -2241,6 +2354,12 @@ static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn,
     pid_t pid = 0;
     vn_get_window_app_name(win, app, sizeof(app), &pid);
 
+    if (vn_window_was_zoom_opened(wid)) {
+        VN_INFO(">>> Skipping pre-clone for wid=%u (app='%s') -- it zoomed out of an icon and will transpose back into one; ours would collide",
+                wid, app);
+        return false;
+    }
+
     CGXConnection *c = conn ? conn : vn_window_connection(win);
     uint64_t psn = vn_conn_get_psn(c);
 
@@ -2514,6 +2633,25 @@ dispatch:
 static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                                  const CGSOrderOp *ops, const uint32_t *relativeTo,
                                  unsigned count, bool spaceSwitch) {
+    // Every window the server orders, not just the ones vn_is_target_window()
+    // keeps: the frames that give away a zoom-out-of-an-icon open belong to
+    // windows that filter rejects.
+    for (unsigned pi = 0; ops && pi < count; pi++) {
+        uint32_t pwid = wids ? wids[pi] : 0;
+        CGXWindow *pwin = pwid ? vn_resolved_window_by_id(pwid) : NULL;
+        if (!pwin || vn_is_clone_wid(pwid, pwin)) continue;
+        CGRect pr = vn_resolved_screen_rect ? vn_resolved_screen_rect(pwin) : CGRectZero;
+        vn_note_window_frame(pwid, pr);
+#if ENABLE_LOGS && VN_LOG_LEVEL >= VN_LOG_LEVEL_TRACE
+        char papp[256] = {0};
+        pid_t ppid = 0;
+        vn_get_window_app_name(pwin, papp, sizeof(papp), &ppid);
+        VN_TRACE("raw-order: app='%s' pid=%d wid=%u op=%d lvl=%d type=%u frame=%.0f,%.0f %.0fx%.0f target=%d",
+                 papp, ppid, pwid, ops[pi], vn_window_level(pwin), pwin->window_type,
+                 pr.origin.x, pr.origin.y, pr.size.width, pr.size.height,
+                 vn_is_target_window(pwin));
+#endif
+    }
     if (ops && count >= 1) {
         if (count == 1) {
             uint32_t wid = wids ? wids[0] : 0;
