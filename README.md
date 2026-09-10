@@ -6,34 +6,45 @@ https://github.com/user-attachments/assets/cf8e6938-5a9d-41a1-a600-24e61c895216
 
 Smooth window close animations for macOS on Apple Silicon.
 
-Vanish hooks directly into the macOS window server compositor (`SkyLight` / `WindowServer`) via **[TweakInject](https://github.com/doraorak/TweakInject)** to provide fluid, interactive window close animations whenever you click a window's red traffic light button or close a window.
+Vanish replaces the close animation for every window on the system. It runs **inside `WindowServer` itself**, injected through **[TweakInject](https://github.com/doraorak/TweakInject)** — so it works with any application, with no plugins, no injection into apps, and no cooperation from the window being closed.
 
 ---
 
 ## ✨ Features
 
-- **WindowServer-Level Compositor Hooking**: Hooks the server's own routines — `CGXOrderWindowListSpaceSwitchOptions` (every window-ordering path converges there), `CGXWindow::release_window`, and `CGXPostEventByConnection` — so closing windows animate without app-specific plugins. None of these are exported; they are resolved by name at runtime from the symbol table.
-- **Fully server-side**: Traffic-light hit testing is done on the event stream inside WindowServer. Vanish never talks to the closing application and relies on nothing client-side.
-- **Starts on the fade, not the order-out**: AppKit and Chromium windows don't vanish when closed — the app fades its alpha to zero over ~250ms and only *then* orders the window out. Vanish watches the alpha and takes over the moment it starts dropping, roughly 250ms earlier than the order-out would allow.
-- **Hardware-Accelerated Warp Mesh**: Clones the closing window's surface and drives a uniform shrink through `CGXWindow::set_mesh_warp`. The mesh is 2×2 — the shrink is affine, and bilinear interpolation of a quad's corners reproduces an affine map exactly, so four points carry the same image 25 did.
-- **ProMotion-aware frame pacing**: Frames are scheduled on an absolute deadline rather than relative to the previous callback, so the server timer's ~0.8ms lateness cannot accumulate. Measured on a 120 Hz display: 8.30ms mean frame interval against an 8.33ms target, with 1.3% of frames arriving late.
-- **Defers to system close animations**: Some windows already have one — double-click a file in Finder and the app transposes the window back into its icon on close. Vanish detects that and stays out of the way rather than animating on top of it.
-- **Preferences Pane**:
+- **Runs inside the compositor.** Vanish hooks WindowServer's own window-ordering, teardown and event-delivery routines. None of them are exported — they're located by walking the symbol table at load time and pointer-signed before they're ever called.
+
+- **Nothing client-side.** Traffic-light hit testing happens on the raw event stream inside the server. Vanish never loads into applications and never links AppKit. An app cannot tell it's there.
+
+- **Starts when *you* click, not when the app gets around to it.** An AppKit or Chromium window doesn't disappear when you hit the red button — the app spends about a quarter of a second fading it out before it ever asks the server to remove it. Waiting for that request means the animation begins after the close is visually over. Vanish watches the window's own alpha instead and takes over the moment it starts to drop.
+
+- **Hardware-accelerated warp.** The closing window's surface is cloned inside the server and driven through `CGXWindow::set_mesh_warp`. The shrink is an affine transform, so it's expressed with four mesh points and resampled on the GPU.
+
+- **Locked to the display.** Frames are scheduled against an absolute deadline rather than chained off one another, keeping the animation in step with the panel — a full 120 Hz on ProMotion.
+
+- **Knows when not to run.** Some windows already come with a close animation: double-click a file in Finder and the app transposes the window back into its icon. Vanish detects those and stays out of the way instead of animating over them. System surfaces — Dock, menu bar, Notification Centre, wallpaper, Finder's Get Info panel — pass through untouched.
+
+- **Drag-safe by construction.** The clone is built when you *release* the button, not when you press it. A press that turns into a window drag never creates one, so there is no stale clone to be uncovered when the window moves.
+
+- **Preferences pane**:
   - **Master Enable/Disable**: Instant toggling of animations.
   - **Animation Duration Slider**: Fine-tune duration from 0.05s up to 1.0s.
   - **Refresh Rate Slider**: Adjust cadence from 10 Hz up to 120 Hz with live feedback.
   - **Shadow Toggle**: Choose whether to render the window shadow during the shrink animation.
-- **No clone left behind**: The clone is only built once a press is confirmed by a release still on the button — a press that turns into a window drag never creates one, so dragging can never expose a stale clone. Anything that does get built is discarded on a timeout if the close never arrives.
 
 ---
 
 ## 🔍 How a close plays out
 
-1. **Intent.** A mouse-down inside the red button's region is recorded, but nothing happens yet. A drag off the button, or more than 4pt of movement while held, cancels it. Only the release commits.
-2. **Pre-clone.** On release, the window's surface is cloned and ordered below the original — after the release has been forwarded, so the clone build (2ms on a light window, 16ms on a heavy one) stays off the input path.
-3. **Takeover.** Vanish watches the original's alpha and starts the moment the app begins fading it, hiding the original so it can't show through behind the clone.
-4. **Shrink.** A uniform scale about the window's centre, on an absolute frame deadline. Despite the internal log wording, nothing fades — only geometry is animated.
-5. **Cleanup.** The clone is hidden, ordered out and released; if the close never lands, a timeout discards it.
+1. **Intent.** A mouse-down inside the red button's region is noted, but nothing happens yet. Moving off the button, or dragging while held, cancels it. Only the release commits.
+
+2. **Clone.** On release, the window's surface is cloned and ordered beneath the original — after the release has been handed on, so the work never sits between your click and the app hearing about it. The warp path is primed at the same time, so the first animated frame doesn't have to set itself up.
+
+3. **Takeover.** Vanish watches the original's alpha and starts the moment the app begins fading it out, hiding the original so it can't show through from behind.
+
+4. **Shrink.** A uniform scale about the window's centre, on a fixed frame cadence. Only geometry is animated.
+
+5. **Cleanup.** The clone is hidden, ordered out and released. If the close never actually arrives, it's discarded on a timeout.
 
 ---
 
@@ -105,16 +116,18 @@ Preferences are stored in:
 
 ## 🧭 Logging
 
-Logging is compile-time levelled (`VN_LOG_LEVEL`, default `INFO`) and writes to `/tmp/vanish_ws.log`. Anything above the configured level compiles out entirely — no call, no format string in the binary.
+Vanish writes to `/tmp/vanish_ws.log`. Verbosity is set at compile time via `VN_LOG_LEVEL`; anything above the configured level is compiled out entirely, leaving no call and no format string in the binary.
 
-| level | what it covers |
+| level | covers |
 |---|---|
-| `ERROR` | unresolved symbols, a clone that failed to build, safety backstops firing |
-| `INFO` | one line per close: which path it took and when |
-| `DEBUG` | per-gesture detail — hit tests, pre-clone lifecycle, ordering decisions |
-| `TRACE` | firehose: every order operation, every animation frame's timing |
+| `ERROR` | unresolved symbols, a clone that failed to build |
+| `INFO` | one line per close (default) |
+| `DEBUG` | hit tests, clone lifecycle, ordering decisions |
+| `TRACE` | every order operation and every animation frame |
 
-Rebuild at a different level with `-DVN_LOG_LEVEL=VN_LOG_LEVEL_TRACE`.
+```bash
+clang ... -DVN_LOG_LEVEL=VN_LOG_LEVEL_TRACE
+```
 
 ---
 
