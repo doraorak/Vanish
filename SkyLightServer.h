@@ -51,6 +51,53 @@ typedef struct CGXConnection CGXConnection;
 /// WSWindowGetLevel (`ldr w0, [x0, #0x20]`), `connection` at 0x30, `alpha`
 /// against CGXWindow::fade_begin (`ldr s0, [x0, #0x1e8]`), and the ordered-in
 /// bit against _XWindowIsOrderedIn (bit 46 of `flags`).
+/// A window's Core Image filter, hung off CGXWindow::filter.
+///
+/// This is the compositor's per-window effect slot, and it is a closed set:
+/// _XNewCIFilter string-compares the requested name against exactly
+/// @"CIShapedWaterRipple" (type 1) and @"CIColorInvert" (type 2) and rejects
+/// everything else with error 1006. There is no way to name a filter of one's
+/// own through it.
+///
+/// What makes it worth having anyway is where the type ends up.
+/// generate_layers_for_window copies type and the five parameter floats
+/// straight onto the composite layer every frame:
+///
+///     ldr x8, [win, #0x8a8]        ; this struct
+///     ldr w9, [x8, #0xc]   -> str w9, [layer, #0x228]    ; type
+///     ldr d0, [x8, #0x18]  -> str d0, [layer, #0x230]    ; params[0..1]
+///     ldr d0, [x8, #0x20]  -> str d0, [layer, #0x238]    ; params[2..3]
+///     ldr s0, [x8, #0x28]  -> str s0, [layer, #0x240]    ; params[4]
+///
+/// and MetalCompositeLayer's *first* branch is `layer->[0x228] == 1`, which
+/// tail-calls metal_composite_ripple. So setting this field routes a window
+/// into a dedicated composite function, with five per-frame floats carried
+/// along for free -- and the check costs nothing when no window has a filter,
+/// because it is the compositor's own code.
+///
+/// Teardown is safe for an instance we allocate ourselves.
+/// CGXReleaseWindowCIFilters is a no-op on a NULL slot, and CGXReleaseCIFilter
+/// decrements refcount, walks the server's global filter list to unlink, and
+/// frees -- and an object that was never in that list simply walks to the end
+/// and falls through to the free(). Set refcount to 1 so it is freed once.
+typedef struct VNWindowFilter {
+    struct VNWindowFilter *next;      // 0x00  server list link; ours stays out of it
+    uint32_t               refcount;  // 0x08
+    uint32_t               type;      // 0x0c  1 = ripple, 2 = colour invert
+    uint32_t               _unknown10;// 0x10
+    uint32_t               filter_id; // 0x14
+    float                  params[5]; // 0x18, 0x20 (two floats each), 0x28
+    uint32_t               _pad_2c;
+} VNWindowFilter;
+
+_Static_assert(sizeof(VNWindowFilter) == 0x30, "VNWindowFilter must be the 0x30 bytes _XNewCIFilter allocates");
+_Static_assert(offsetof(VNWindowFilter, refcount) == 0x08, "VNWindowFilter.refcount is not at 0x08");
+_Static_assert(offsetof(VNWindowFilter, type)     == 0x0c, "VNWindowFilter.type is not at 0x0c");
+_Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.params is not at 0x18");
+
+#define kVNFilterTypeRipple       1
+#define kVNFilterTypeColorInvert  2
+
 typedef struct CGXWindow {
     uint32_t       window_id;                           // 0x000
     uint32_t       window_type;                         // 0x004
@@ -106,7 +153,7 @@ typedef struct CGXWindow {
     double         corner_radii[4];                     // 0x878
     uint8_t        _pad_898[0x8];
     void          *mask_path;                           // 0x8a0
-    uint8_t        _pad_8a8[0x8];
+    VNWindowFilter *filter;                             // 0x8a8
     void          *mesh;                                // 0x8b0
     void          *frame_mesh_cache;                    // 0x8b8
     void          *fade_state;                          // 0x8c0
@@ -151,6 +198,7 @@ VN_ASSERT_OFFSET(corner_radius,       0x868);
 VN_ASSERT_OFFSET(debug_corner_radius, 0x870);
 VN_ASSERT_OFFSET(corner_radii,        0x878);
 VN_ASSERT_OFFSET(mask_path,           0x8a0);
+VN_ASSERT_OFFSET(filter,              0x8a8);
 VN_ASSERT_OFFSET(mesh,                0x8b0);
 VN_ASSERT_OFFSET(frame_mesh_cache,    0x8b8);
 VN_ASSERT_OFFSET(fade_state,          0x8c0);
@@ -205,6 +253,36 @@ enum { kVNOrderBelow = -1, kVNOrderOut = 0, kVNOrderAbove = 1 };
 #define kVNSymReleaseWindow "__ZN9CGXWindow14release_windowEP13CGXConnectionPS_"
 
 /// pid_t WSWindowGetOwningPID(CGXWindow *)
+/// One-instruction accessors for CGXWindow::filter -- get is
+/// `ldr x0, [x0, #0x8a8]`, set is `str x1, [x0, #0x8a8]`. Preferred over
+/// touching the field directly so the offset lives in exactly one place.
+#define kVNSymWindowGetFilter "_WSWindowGetFilter"
+#define kVNSymWindowSetFilter "_WSWindowSetFilter"
+
+/// `updateWindow(conn, win)` -- CGXWindowIsVisible, then
+/// CGXCreateScreenVisibleFrameShapeForWindow + CGXInvalidateDisplayShape. This
+/// is what _XSetWindowCIFilter calls after changing a filter, and what a
+/// per-frame parameter change needs: writing the parameters alone leaves the
+/// window clean, so the compositor never re-reads them.
+#define kVNSymUpdateWindow "_updateWindow"
+
+/// `metal_composite_ripple(MetalContext *, WSCompositeSourceLayer *, WSCompositeDestination *)`
+///
+/// The composite function a type-1 filter routes a layer to. This is the hook
+/// point for a shader animation, and the reason the filter slot is worth using
+/// at all: MetalCompositeLayer's *first* branch is `layer->[0x228] == 1`, taken
+/// before it does any work, so hooking here costs nothing on the frames where
+/// no window carries a filter -- unlike hooking MetalCompositeLayer itself,
+/// which runs for every layer of every frame.
+#define kVNSymMetalCompositeRipple \
+    "__ZL22metal_composite_rippleP12MetalContextP22WSCompositeSourceLayerP22WSCompositeDestination"
+
+/// Offsets into WSCompositeSourceLayer that generate_layers_for_window fills
+/// from the window's filter. Read-only for us: the compositor rewrites them
+/// from the filter object every frame.
+#define kVNLayerFilterType   0x228
+#define kVNLayerFilterParams 0x230
+
 #define kVNSymWSWindowGetOwningPID "_WSWindowGetOwningPID"
 
 /// int CGXGetConnectionAppName(uint32_t cid, char *buf, size_t buflen)
@@ -416,6 +494,10 @@ typedef CGRect      (*VNScreenRectFn)(CGXWindow *);
 typedef uint32_t    (*VNWindowGetIDFn)(CGXWindow *);
 
 typedef void   (*VNSetMeshWarpFn)(CGXWindow *, CGXConnection *, unsigned, unsigned, const float *);
+typedef VNWindowFilter *(*VNWindowGetFilterFn)(CGXWindow *);
+typedef void   (*VNWindowSetFilterFn)(CGXWindow *, VNWindowFilter *);
+typedef void   (*VNUpdateWindowFn)(CGXConnection *, CGXWindow *);
+typedef void   (*VNMetalCompositeRippleFn)(void *ctx, void *layer, void *dest);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);
 
 typedef void (*VNClearShadowDensityFn)(CGXWindow *);

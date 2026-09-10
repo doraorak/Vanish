@@ -56,6 +56,12 @@ cat > "$PREFS_SRC/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Shaders are compiled here, never inside WindowServer: the server only ever
+# loads the finished library, so it needs no Metal compiler and no compiler
+# service, and every shader error is a build error instead of a runtime one.
+echo "==> 1b. Compiling shaders -> Vanish.metallib..."
+xcrun -sdk macosx metal -O2 -o "$DIR/$BUNDLE/Contents/Resources/Vanish.metallib" "$DIR/shaders/Vanish.metal"
+
 cp "$DIR/Filter.plist" "$DIR/$BUNDLE/Contents/Resources/Filter.plist"
 if [ -f "$PREFS_SRC/Root.plist" ]; then
     cp "$PREFS_SRC/Root.plist" "$DIR/$BUNDLE/Contents/Resources/Root.plist"

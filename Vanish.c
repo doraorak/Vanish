@@ -224,6 +224,9 @@ static VNOrderWindowListFn          vn_orig_order;
 static VNWindowByIDFn               vn_resolved_window_by_id;
 static VNScheduleCallbackFn         vn_resolved_schedule_callback;
 static VNSetMeshWarpFn              vn_resolved_set_mesh_warp;
+static VNWindowGetFilterFn          vn_resolved_window_get_filter;
+static VNWindowSetFilterFn          vn_resolved_window_set_filter;
+static VNUpdateWindowFn             vn_resolved_update_window;
 static VNCreateCloneFn              vn_resolved_create_clone;
 static VNSystemWindowReleaseFn      vn_resolved_system_window_release;
 static VNWindowGetDisplayFn         vn_resolved_window_get_display;
@@ -241,6 +244,7 @@ static VNWSWindowSetShadowEnableFn        vn_resolved_window_set_shadow_enable;
 static VNWSWindowReleaseShadowResourcesFn vn_resolved_window_release_shadow_resources;
 static VNSLSSetWindowShadowParametersFn   vn_resolved_set_window_shadow_parameters;
 static VNIsProcessEligibleForSetFrontFn    vn_orig_is_process_eligible;
+static VNMetalCompositeRippleFn     vn_orig_metal_composite_ripple;
 
 typedef bool (*VNDynWindowIsOrderedInFn)(const CGXWindow *win);
 static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
@@ -636,12 +640,24 @@ static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
     return false;
 }
 
+static void vn_filter_detach(CGXWindow *clone);
+
+/// Every path that releases a clone goes through here, so a filter can never
+/// outlive the window it hangs off. There are four of them -- the animation
+/// finishing, a pre-clone discarded, the pre-clone cleanup timer, and the
+/// release-window hook -- and a detach missing from any one leaks the object.
+static void vn_release_clone(CGXWindow *clone) {
+    if (!clone) return;
+    vn_filter_detach(clone);
+    if (vn_resolved_system_window_release) vn_resolved_system_window_release(clone);
+}
+
 static void vn_delayed_clone_release(void *ctx, double when) {
     (void)when;
     CGXWindow *clone = (CGXWindow *)ctx;
     if (clone && vn_resolved_system_window_release) {
         VN_TRACE("delayed_release: freeing clone win=%p", clone);
-        vn_resolved_system_window_release(clone);
+        vn_release_clone(clone);
     }
 }
 
@@ -697,8 +713,8 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
     }
     if (vn_resolved_schedule_callback && clone_win) {
         vn_resolved_schedule_callback(vn_delayed_clone_release, clone_win, SLSCurrentRealTime() + 0.1);
-    } else if (vn_resolved_system_window_release && clone_win) {
-        vn_resolved_system_window_release(clone_win);
+    } else if (clone_win) {
+        vn_release_clone(clone_win);
     }
 }
 
@@ -781,7 +797,7 @@ static void vn_preclone_discard_wid(uint32_t orig_wid) {
             vn_orig_order(NULL, &clone_wid, &op, &rel, 1, false);
         }
         if (vn_resolved_system_window_release) {
-            vn_resolved_system_window_release(clone);
+            vn_release_clone(clone);
         }
     }
 }
@@ -829,7 +845,7 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
                 vn_orig_order(NULL, &wids_to_free[i], &op, &rel, 1, false);
             }
             if (vn_resolved_system_window_release) {
-                vn_resolved_system_window_release(clones_to_free[i]);
+                vn_release_clone(clones_to_free[i]);
             }
         }
     }
@@ -882,17 +898,39 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 #define kVNMeshSwirlW 12
 #define kVNMeshSwirlH 14
 
+// Three ways to animate a clone, and they are different enough to warrant
+// different arms rather than one flattened struct:
+//
+//   MESH    deforms the clone through CGXWindow::set_mesh_warp. Moves existing
+//           pixels; cannot make new ones.
+//   FILTER  hands the clone to one of the compositor's own effects by setting
+//           CGXWindow::filter. A closed set of two -- ripple and colour invert
+//           are all _XNewCIFilter will accept -- but they are real Metal
+//           effects and cost us nothing per frame beyond five floats.
+//   SHADER  our own Metal shader, reached through the same filter slot: a
+//           type-1 filter routes the layer to metal_composite_ripple, which is
+//           a narrow function we can hook without touching the compositor's
+//           per-layer hot path. Nothing implements this yet.
 typedef enum {
     VN_ANIM_MESH   = 0,
-    VN_ANIM_SHADER = 1,   // reserved; nothing implements this yet
+    VN_ANIM_FILTER = 1,
+    VN_ANIM_SHADER = 2,   // reserved; nothing implements this yet
 } VNAnimKind;
 
 struct VNAnimation {
     const char *key;      // stored in prefs -- stable, do not rename
     const char *title;    // shown in the preferences pane
     VNAnimKind  kind;
-    unsigned    mesh_w, mesh_h;
-    void      (*fill_mesh)(VNPointWarp *mesh, CGRect bounds, double t);
+    union {
+        struct {
+            unsigned w, h;
+            void (*fill)(VNPointWarp *mesh, CGRect bounds, double t);
+        } mesh;
+        struct {
+            uint32_t type;   // kVNFilterType*
+            void (*fill_params)(float params[5], CGRect bounds, double t);
+        } filter;
+    };
 };
 
 static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t);
@@ -908,22 +946,24 @@ static void vn_anim_spin(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_roll(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_barrel(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_clock(VNPointWarp *mesh, CGRect bounds, double t);
+static void vn_anim_ripple(float params[5], CGRect bounds, double t);
 
 // The first entry is the fallback for a missing or unrecognised preference.
 static const VNAnimation gAnimations[] = {
-    { "shrink",   "Shrink",   VN_ANIM_MESH, 2, 2, vn_anim_shrink   },
-    { "squish",   "Squish",   VN_ANIM_MESH, 2, 3, vn_anim_squish   },
-    { "fall",     "Fall",     VN_ANIM_MESH, 2, 2, vn_anim_fall     },
-    { "swirl",    "Swirl",    VN_ANIM_MESH, kVNMeshSwirlW, kVNMeshSwirlH, vn_anim_swirl },
-    { "flip",     "Flip",     VN_ANIM_MESH, 2, 2, vn_anim_flip     },
-    { "tilt",     "Tilt",     VN_ANIM_MESH, 2, 2, vn_anim_tilt     },
-    { "slide",    "Slide",    VN_ANIM_MESH, 2, 2, vn_anim_slide    },
-    { "genie",    "Genie",    VN_ANIM_MESH, 6, 10, vn_anim_genie   },
-    { "flag",     "Flag",     VN_ANIM_MESH, 8, 6, vn_anim_flag     },
-    { "spin",     "Spin",     VN_ANIM_MESH, 2, 2, vn_anim_spin     },
-    { "roll",     "Roll",     VN_ANIM_MESH, 6, 12, vn_anim_roll    },
-    { "barrel",   "Barrel",   VN_ANIM_MESH, 8, 8, vn_anim_barrel   },
-    { "clock",    "Clock",    VN_ANIM_MESH, 8, 8, vn_anim_clock    },
+    { "shrink",   "Shrink",   VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_shrink } },
+    { "squish",   "Squish",   VN_ANIM_MESH, .mesh = { 2, 3, vn_anim_squish } },
+    { "fall",     "Fall",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_fall } },
+    { "swirl",    "Swirl",    VN_ANIM_MESH, .mesh = { kVNMeshSwirlW, kVNMeshSwirlH, vn_anim_swirl } },
+    { "flip",     "Flip",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_flip } },
+    { "tilt",     "Tilt",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_tilt } },
+    { "slide",    "Slide",    VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_slide } },
+    { "genie",    "Genie",    VN_ANIM_MESH, .mesh = { 6, 10, vn_anim_genie } },
+    { "flag",     "Flag",     VN_ANIM_MESH, .mesh = { 8, 6, vn_anim_flag } },
+    { "spin",     "Spin",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_spin } },
+    { "roll",     "Roll",     VN_ANIM_MESH, .mesh = { 6, 12, vn_anim_roll } },
+    { "barrel",   "Barrel",   VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_barrel } },
+    { "clock",    "Clock",    VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_clock } },
+    { "ripple",   "Ripple",   VN_ANIM_FILTER, .filter = { kVNFilterTypeRipple, vn_anim_ripple } },
 };
 #define kVNAnimationCount (sizeof(gAnimations) / sizeof(gAnimations[0]))
 
@@ -935,6 +975,85 @@ static const VNAnimation *vn_animation_for_key(const char *key) {
     }
     return &gAnimations[0];
 }
+
+#pragma mark - Window filters
+
+// A filter hung off CGXWindow::filter routes the clone into one of the
+// compositor's own composite functions, and carries five floats there every
+// frame at no cost to us (see VNWindowFilter in SkyLightServer.h).
+//
+// We allocate the object ourselves rather than going through _XNewCIFilter,
+// which is a MIG server routine expecting a serialized plist from a client and
+// registers what it makes in a process-wide list. Skipping that is safe in both
+// directions: nothing else ever sees our object, and if the server does tear it
+// down -- CGXWindow's destructor calls CGXReleaseWindowCIFilters -- the unlink
+// walk simply fails to find it in that list and falls through to the free().
+// We still detach explicitly, so the lifetime does not depend on the
+// destructor running.
+
+static bool vn_filter_attach(CGXWindow *clone, uint32_t type, const float params[5]) {
+    if (!clone || !vn_resolved_window_set_filter) return false;
+
+    VNWindowFilter *f = calloc(1, sizeof(VNWindowFilter));
+    if (!f) return false;
+
+    f->refcount = 1;      // so a server-side release frees it exactly once
+    f->type     = type;
+    memcpy(f->params, params, sizeof(f->params));
+
+    vn_resolved_window_set_filter(clone, f);
+    return true;
+}
+
+/// New parameters for the next frame. Both this and the compositor's read in
+/// generate_layers_for_window happen on the server's own thread -- the same one
+/// the animation tick runs on -- so the five floats are never torn.
+///
+/// The update_window call is not optional: writing the parameters leaves the
+/// window clean, and a clean window is never re-composited, so the change would
+/// not appear until something else happened to dirty it.
+static void vn_filter_update(CGXWindow *clone, const float params[5]) {
+    if (!clone || !vn_resolved_window_get_filter) return;
+
+    VNWindowFilter *f = vn_resolved_window_get_filter(clone);
+    if (!f) return;
+    memcpy(f->params, params, sizeof(f->params));
+
+    if (vn_resolved_update_window) {
+        vn_resolved_update_window(vn_window_connection(clone), clone);
+    }
+}
+
+/// Must run before the clone is released, on every path that releases one.
+static void vn_filter_detach(CGXWindow *clone) {
+    if (!clone || !vn_resolved_window_get_filter || !vn_resolved_window_set_filter) return;
+
+    VNWindowFilter *f = vn_resolved_window_get_filter(clone);
+    if (!f) return;
+    vn_resolved_window_set_filter(clone, NULL);
+    free(f);
+}
+
+// CIShapedWaterRipple's five floats, as metal_composite_ripple consumes them:
+// params[0..1] and params[2..3] are two float pairs it multiplies by the
+// layer's scale, and params[4] goes into the uniform buffer untouched. Their
+// exact meaning is not documented anywhere and is not yet worked out from the
+// shader, so this drives them from t and leaves tuning to what it looks like.
+//
+// At t = 0 every one of them is zero, which is the registry's identity rule:
+// vn_make_snapshot attaches the filter with a t = 0 fill while the clone is
+// still hidden, and that priming is only invisible if it changes nothing.
+static void vn_anim_ripple(float params[5], CGRect bounds, double t) {
+    const float w = (float)bounds.size.width;
+    const float h = (float)bounds.size.height;
+
+    params[0] = (float)t * w * 0.5f;
+    params[1] = (float)t * h * 0.5f;
+    params[2] = (float)t * w * 0.5f;
+    params[3] = (float)t * h * 0.5f;
+    params[4] = (float)t;
+}
+
 
 static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
                                    uint32_t *out_wid, CGRect *out_frame,
@@ -1009,10 +1128,14 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     // clone is still hidden behind the original, moves that cost off the
     // first frame. At t=0 the shrink solver is an identity warp (s = 1.0), so
     // this cannot change what is on screen.
-    if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->fill_mesh) {
+    if (anim->kind == VN_ANIM_FILTER && anim->filter.fill_params) {
+        float params[5] = {0};
+        anim->filter.fill_params(params, frame, 0.0);
+        vn_filter_attach(clone, anim->filter.type, params);
+    } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
         VNPointWarp warm[kVNMeshMaxCount];
-        anim->fill_mesh(warm, frame, 0.0);
-        vn_resolved_set_mesh_warp(clone, NULL, anim->mesh_w, anim->mesh_h, (const float *)warm);
+        anim->mesh.fill(warm, frame, 0.0);
+        vn_resolved_set_mesh_warp(clone, NULL, anim->mesh.w, anim->mesh.h, (const float *)warm);
     }
 
     if (!prefs.shadows) {
@@ -1549,11 +1672,18 @@ static void vn_anim_tick(void *ctx, double when) {
         // can be added here without disturbing this path.
         switch (anim->kind) {
         case VN_ANIM_MESH:
-            if (vn_resolved_set_mesh_warp && anim->fill_mesh) {
+            if (vn_resolved_set_mesh_warp && anim->mesh.fill) {
                 VNPointWarp mesh[kVNMeshMaxCount];
-                anim->fill_mesh(mesh, snapshots[i].bounds, snapshots[i].p);
+                anim->mesh.fill(mesh, snapshots[i].bounds, snapshots[i].p);
                 vn_resolved_set_mesh_warp(snapshots[i].clone_win, NULL,
-                                          anim->mesh_w, anim->mesh_h, (const float *)mesh);
+                                          anim->mesh.w, anim->mesh.h, (const float *)mesh);
+            }
+            break;
+        case VN_ANIM_FILTER:
+            if (anim->filter.fill_params) {
+                float params[5] = {0};
+                anim->filter.fill_params(params, snapshots[i].bounds, snapshots[i].p);
+                vn_filter_update(snapshots[i].clone_win, params);
             }
             break;
         case VN_ANIM_SHADER:
@@ -2081,8 +2211,8 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
         if (clone_to_release) {
             if (vn_resolved_schedule_callback) {
                 vn_resolved_schedule_callback(vn_delayed_clone_release, clone_to_release, SLSCurrentRealTime() + 0.1);
-            } else if (vn_resolved_system_window_release) {
-                vn_resolved_system_window_release(clone_to_release);
+            } else {
+                vn_release_clone(clone_to_release);
             }
         }
     }
@@ -2836,6 +2966,33 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
     vn_orig_order(conn, wids, ops, relativeTo, count, spaceSwitch);
 }
 
+#pragma mark - Shader composite hook
+
+// Where a shader animation will draw. A type-1 filter on the clone makes the
+// compositor route its layer here (see kVNSymMetalCompositeRipple), so this
+// runs only for windows carrying a filter -- in practice only ours, since
+// nothing on the system sets one: the sole route is SLSNewCIFilterByName,
+// a private client API for a two-effect legacy set.
+//
+// It draws nothing yet. Right now it only proves the hook fires where the
+// static analysis says it does, and, just as importantly, that it stays quiet
+// the rest of the time: a line per frame while a clone animates and not one
+// otherwise is what says this is safe to build on.
+static void vn_hook_metal_composite_ripple(void *ctx, void *layer, void *dest) {
+#if ENABLE_LOGS && VN_LOG_LEVEL >= VN_LOG_LEVEL_TRACE
+    if (layer) {
+        const uint32_t type = *(const uint32_t *)((const uint8_t *)layer + kVNLayerFilterType);
+        const float   *p    = (const float *)((const uint8_t *)layer + kVNLayerFilterParams);
+        VN_TRACE("composite_ripple: layer=%p type=%u params=[%.3f %.3f %.3f %.3f %.3f] ctx=%p dest=%p",
+                 layer, type, p[0], p[1], p[2], p[3], p[4], ctx, dest);
+    }
+#endif
+
+    if (vn_orig_metal_composite_ripple) {
+        vn_orig_metal_composite_ripple(ctx, layer, dest);
+    }
+}
+
 #pragma mark - Entry
 
 extern void MSHookFunction(void *symbol, void *replace, void **result);
@@ -2858,6 +3015,9 @@ static void vanish_init(void) {
     vn_resolved_get_connection_app_name      = (VNGetConnectionAppNameFn)vn_skylight_symbol(kVNSymGetConnectionAppName);
     vn_resolved_schedule_callback            = (VNScheduleCallbackFn)vn_skylight_symbol(kVNSymScheduleCallback);
     vn_resolved_set_mesh_warp                = (VNSetMeshWarpFn)vn_skylight_symbol(kVNSymSetMeshWarp);
+    vn_resolved_window_get_filter            = (VNWindowGetFilterFn)vn_skylight_symbol(kVNSymWindowGetFilter);
+    vn_resolved_window_set_filter            = (VNWindowSetFilterFn)vn_skylight_symbol(kVNSymWindowSetFilter);
+    vn_resolved_update_window                = (VNUpdateWindowFn)vn_skylight_symbol(kVNSymUpdateWindow);
     vn_resolved_create_clone                 = (VNCreateCloneFn)vn_skylight_symbol(kVNSymCreateCloneOfWindow);
     vn_resolved_system_window_release        = (VNSystemWindowReleaseFn)vn_skylight_symbol(kVNSymSystemWindowRelease);
     vn_resolved_window_get_display           = (VNWindowGetDisplayFn)vn_skylight_symbol(kVNSymWindowGetDisplay);
@@ -2879,7 +3039,7 @@ static void vanish_init(void) {
     }
 
     if (!targetOrder || !targetRelease || !vn_resolved_window_by_id ||
-        !vn_resolved_schedule_callback || !vn_resolved_set_mesh_warp || !vn_resolved_clipped_frame_bounds) {
+        !vn_resolved_schedule_callback || !vn_resolved_clipped_frame_bounds) {
         VN_ERROR("symbol resolution failed -- inert (order=%p release=%p win_by_id=%p mesh_warp=%p)",
                targetOrder, targetRelease, vn_resolved_window_by_id, (void *)vn_resolved_set_mesh_warp);
         return;
@@ -2897,6 +3057,16 @@ static void vanish_init(void) {
         VN_DEBUG("hooked CGXPostEventByConnection -> orig %p", vn_orig_post_event);
     } else {
         VN_ERROR("WARNING: CGXPostEventByConnection unresolved");
+    }
+
+    void *targetRipple = vn_skylight_symbol(kVNSymMetalCompositeRipple);
+    if (targetRipple) {
+        void *rawRipple = ptrauth_strip(targetRipple, ptrauth_key_function_pointer);
+        MSHookFunction(rawRipple, (void *)vn_hook_metal_composite_ripple,
+                       (void **)&vn_orig_metal_composite_ripple);
+        VN_DEBUG("hooked metal_composite_ripple -> orig %p", (void *)vn_orig_metal_composite_ripple);
+    } else {
+        VN_ERROR("WARNING: metal_composite_ripple unresolved -- shader animations cannot draw");
     }
 
     if (targetEligible) {
