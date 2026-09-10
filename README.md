@@ -22,7 +22,7 @@ Vanish replaces the close animation for every window on the system. It runs **in
 
 - **Starts when *you* click, not when the app gets around to it.** An AppKit or Chromium window doesn't disappear when you hit the red button — the app spends about a quarter of a second fading it out before it ever asks the server to remove it. Waiting for that request means the animation begins after the close is visually over. Vanish watches the window's own alpha instead and takes over the moment it starts to drop.
 
-- **Four close animations** — **Shrink**, **Squish**, **Fall** and **Swirl** — selected in System Settings.
+- **Thirteen close animations** — **Shrink**, **Squish**, **Fall**, **Swirl**, **Flip**, **Tilt**, **Slide**, **Genie**, **Flag**, **Spin**, **Roll**, **Barrel** and **Clock** — selected in System Settings.
 
 - **Hardware-accelerated warp.** The closing window's surface is cloned inside the server and deformed through `CGXWindow::set_mesh_warp`. Each animation declares the smallest grid that renders it exactly: a shrink or a topple is affine and needs nothing beyond its four corners, while a swirl, where different parts of the window travel along different curves, asks for a denser one.
 
@@ -110,7 +110,7 @@ sudo cp -R layout/Library/TweakInject/Preferences/* /Library/TweakInject/Prefere
 
 Open **System Settings** → **TweakInject** → **Vanish** to configure:
 - **Enable Animation**: Toggle window close animations on/off.
-- **Animation**: Shrink, Squish, Fall or Swirl. Applies to the next window you close.
+- **Animation**: Shrink, Squish, Fall, Swirl, Flip, Tilt, Slide, Genie, Flag, Spin, Roll, Barrel or Clock. Applies to the next window you close.
 - **Duration**: Adjust close speed between 0.05s and 2.0s (default: 0.25s).
 - **Refresh Rate**: Adjust animation update frequency up to 120 Hz (default: 120 Hz). Set it to 0 to follow the display's own refresh rate.
 - **Window Shadow**: Enable or disable the drop shadow on the animated window.
