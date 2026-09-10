@@ -227,6 +227,14 @@ static VNSetMeshWarpFn              vn_resolved_set_mesh_warp;
 static VNWindowGetFilterFn          vn_resolved_window_get_filter;
 static VNWindowSetFilterFn          vn_resolved_window_set_filter;
 static VNUpdateWindowFn             vn_resolved_update_window;
+static VNCreateShaderFn             vn_resolved_create_shader;
+static VNCreateSpecializedShaderFn  vn_orig_create_specialized_shader;
+
+/// Non-zero while at least one clone carries a shader animation's tag. The
+/// substitution hook tests this first: macOS's own Invert Colours accessibility
+/// setting sets the same option bit on every layer, and without this we would
+/// replace the shader for the entire screen.
+static _Atomic int gShaderFilterCount;
 static VNCreateCloneFn              vn_resolved_create_clone;
 static VNSystemWindowReleaseFn      vn_resolved_system_window_release;
 static VNWindowGetDisplayFn         vn_resolved_window_get_display;
@@ -244,7 +252,6 @@ static VNWSWindowSetShadowEnableFn        vn_resolved_window_set_shadow_enable;
 static VNWSWindowReleaseShadowResourcesFn vn_resolved_window_release_shadow_resources;
 static VNSLSSetWindowShadowParametersFn   vn_resolved_set_window_shadow_parameters;
 static VNIsProcessEligibleForSetFrontFn    vn_orig_is_process_eligible;
-static VNMetalCompositeRippleFn     vn_orig_metal_composite_ripple;
 
 typedef bool (*VNDynWindowIsOrderedInFn)(const CGXWindow *win);
 static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
@@ -913,8 +920,7 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 //           per-layer hot path. Nothing implements this yet.
 typedef enum {
     VN_ANIM_MESH   = 0,
-    VN_ANIM_FILTER = 1,
-    VN_ANIM_SHADER = 2,   // reserved; nothing implements this yet
+    VN_ANIM_SHADER = 1,
 } VNAnimKind;
 
 struct VNAnimation {
@@ -927,9 +933,9 @@ struct VNAnimation {
             void (*fill)(VNPointWarp *mesh, CGRect bounds, double t);
         } mesh;
         struct {
-            uint32_t type;   // kVNFilterType*
-            void (*fill_params)(float params[5], CGRect bounds, double t);
-        } filter;
+            uint32_t    type;   // kVNFilterType*, the tag that routes the clone
+            const char *frag;   // fragment function in Vanish.metallib
+        } shader;
     };
 };
 
@@ -946,7 +952,6 @@ static void vn_anim_spin(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_roll(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_barrel(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_clock(VNPointWarp *mesh, CGRect bounds, double t);
-static void vn_anim_ripple(float params[5], CGRect bounds, double t);
 
 // The first entry is the fallback for a missing or unrecognised preference.
 static const VNAnimation gAnimations[] = {
@@ -963,7 +968,7 @@ static const VNAnimation gAnimations[] = {
     { "roll",     "Roll",     VN_ANIM_MESH, .mesh = { 6, 12, vn_anim_roll } },
     { "barrel",   "Barrel",   VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_barrel } },
     { "clock",    "Clock",    VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_clock } },
-    { "ripple",   "Ripple",   VN_ANIM_FILTER, .filter = { kVNFilterTypeRipple, vn_anim_ripple } },
+    { "dissolve", "Dissolve", VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve" } },
 };
 #define kVNAnimationCount (sizeof(gAnimations) / sizeof(gAnimations[0]))
 
@@ -991,34 +996,41 @@ static const VNAnimation *vn_animation_for_key(const char *key) {
 // We still detach explicitly, so the lifetime does not depend on the
 // destructor running.
 
-static bool vn_filter_attach(CGXWindow *clone, uint32_t type, const float params[5]) {
+static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader) {
     if (!clone || !vn_resolved_window_set_filter) return false;
 
     VNWindowFilter *f = calloc(1, sizeof(VNWindowFilter));
     if (!f) return false;
 
-    f->refcount = 1;      // so a server-side release frees it exactly once
-    f->type     = type;
-    memcpy(f->params, params, sizeof(f->params));
+    f->refcount  = 1;     // so a server-side release frees it exactly once
+    f->type      = type;
+    f->filter_id = is_shader ? kVNFilterMarkerShader : 0;
+    // params stay zero: nothing reads them on this path -- the tag is what
+    // routes the clone, and the animation's progress rides on brightness.
+
+    if (is_shader) atomic_fetch_add_explicit(&gShaderFilterCount, 1, memory_order_acq_rel);
 
     vn_resolved_window_set_filter(clone, f);
     return true;
 }
 
-/// New parameters for the next frame. Both this and the compositor's read in
-/// generate_layers_for_window happen on the server's own thread -- the same one
-/// the animation tick runs on -- so the five floats are never torn.
+/// The animation's progress, handed to the shader through the one per-window
+/// float the compositor already plumbs into UberComposite_FragmentArgs:
+/// CGXWindow::brightness -> layer->[0x224] -> args._brightness.
 ///
-/// The update_window call is not optional: writing the parameters leaves the
-/// window clean, and a clean window is never re-composited, so the change would
-/// not appear until something else happened to dirty it.
-static void vn_filter_update(CGXWindow *clone, const float params[5]) {
-    if (!clone || !vn_resolved_window_get_filter) return;
+/// Runs 1 -> 0, so a clone that has been tagged but not yet started sits at 1,
+/// which every shader here treats as identity.
+static void vn_shader_set_phase(CGXWindow *clone, double t) {
+    if (!clone) return;
 
-    VNWindowFilter *f = vn_resolved_window_get_filter(clone);
-    if (!f) return;
-    memcpy(f->params, params, sizeof(f->params));
+    double b = 1.0 - t;
+    if (b < 0.0) b = 0.0;
+    if (b > 1.0) b = 1.0;
+    clone->brightness = (float)b;
 
+    // Writing the field leaves the window clean, and a clean window is never
+    // re-composited, so the change would not reach the shader until something
+    // else happened to dirty it.
     if (vn_resolved_update_window) {
         vn_resolved_update_window(vn_window_connection(clone), clone);
     }
@@ -1031,28 +1043,13 @@ static void vn_filter_detach(CGXWindow *clone) {
     VNWindowFilter *f = vn_resolved_window_get_filter(clone);
     if (!f) return;
     vn_resolved_window_set_filter(clone, NULL);
+    if (f->filter_id == kVNFilterMarkerShader) {
+        atomic_fetch_sub_explicit(&gShaderFilterCount, 1, memory_order_acq_rel);
+    }
     free(f);
 }
 
-// CIShapedWaterRipple's five floats, as metal_composite_ripple consumes them:
-// params[0..1] and params[2..3] are two float pairs it multiplies by the
-// layer's scale, and params[4] goes into the uniform buffer untouched. Their
-// exact meaning is not documented anywhere and is not yet worked out from the
-// shader, so this drives them from t and leaves tuning to what it looks like.
-//
-// At t = 0 every one of them is zero, which is the registry's identity rule:
-// vn_make_snapshot attaches the filter with a t = 0 fill while the clone is
-// still hidden, and that priming is only invisible if it changes nothing.
-static void vn_anim_ripple(float params[5], CGRect bounds, double t) {
-    const float w = (float)bounds.size.width;
-    const float h = (float)bounds.size.height;
 
-    params[0] = (float)t * w * 0.5f;
-    params[1] = (float)t * h * 0.5f;
-    params[2] = (float)t * w * 0.5f;
-    params[3] = (float)t * h * 0.5f;
-    params[4] = (float)t;
-}
 
 
 static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
@@ -1128,10 +1125,9 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     // clone is still hidden behind the original, moves that cost off the
     // first frame. At t=0 the shrink solver is an identity warp (s = 1.0), so
     // this cannot change what is on screen.
-    if (anim->kind == VN_ANIM_FILTER && anim->filter.fill_params) {
-        float params[5] = {0};
-        anim->filter.fill_params(params, frame, 0.0);
-        vn_filter_attach(clone, anim->filter.type, params);
+    if (anim->kind == VN_ANIM_SHADER) {
+        vn_filter_attach(clone, anim->shader.type, true);
+        vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
         VNPointWarp warm[kVNMeshMaxCount];
         anim->mesh.fill(warm, frame, 0.0);
@@ -1679,15 +1675,11 @@ static void vn_anim_tick(void *ctx, double when) {
                                           anim->mesh.w, anim->mesh.h, (const float *)mesh);
             }
             break;
-        case VN_ANIM_FILTER:
-            if (anim->filter.fill_params) {
-                float params[5] = {0};
-                anim->filter.fill_params(params, snapshots[i].bounds, snapshots[i].p);
-                vn_filter_update(snapshots[i].clone_win, params);
-            }
-            break;
         case VN_ANIM_SHADER:
-            break;   // nothing implements this yet
+            // The tag routes the clone to our substituted ubershader; all that
+            // changes per frame is the progress it reads.
+            vn_shader_set_phase(snapshots[i].clone_win, snapshots[i].p);
+            break;
         }
     }
 
@@ -2966,31 +2958,118 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
     vn_orig_order(conn, wids, ops, relativeTo, count, spaceSwitch);
 }
 
-#pragma mark - Shader composite hook
+#pragma mark - Shader substitution
 
-// Where a shader animation will draw. A type-1 filter on the clone makes the
-// compositor route its layer here (see kVNSymMetalCompositeRipple), so this
-// runs only for windows carrying a filter -- in practice only ours, since
-// nothing on the system sets one: the sole route is SLSNewCIFilterByName,
-// a private client API for a two-effect legacy set.
-//
-// It draws nothing yet. Right now it only proves the hook fires where the
-// static analysis says it does, and, just as importantly, that it stays quiet
-// the rest of the time: a line per frame while a clone animates and not one
-// otherwise is what says this is safe to build on.
-static void vn_hook_metal_composite_ripple(void *ctx, void *layer, void *dest) {
-#if ENABLE_LOGS && VN_LOG_LEVEL >= VN_LOG_LEVEL_TRACE
-    if (layer) {
-        const uint32_t type = *(const uint32_t *)((const uint8_t *)layer + kVNLayerFilterType);
-        const float   *p    = (const float *)((const uint8_t *)layer + kVNLayerFilterParams);
-        VN_TRACE("composite_ripple: layer=%p type=%u params=[%.3f %.3f %.3f %.3f %.3f] ctx=%p dest=%p",
-                 layer, type, p[0], p[1], p[2], p[3], p[4], ctx, dest);
-    }
-#endif
+/// The fragment the running shader animation wants, or the registry's first
+/// shader entry if none is running. Only consulted when a pipeline is actually
+/// being built, which is once per process.
+static const char *vn_shader_fragment_name(void) {
+    const char *name = NULL;
 
-    if (vn_orig_metal_composite_ripple) {
-        vn_orig_metal_composite_ripple(ctx, layer, dest);
+    os_unfair_lock_lock(&gAnimsLock);
+    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
+        if (gActiveAnims[i].is_animating && gActiveAnims[i].anim &&
+            gActiveAnims[i].anim->kind == VN_ANIM_SHADER) {
+            name = gActiveAnims[i].anim->shader.frag;
+            break;
+        }
     }
+    os_unfair_lock_unlock(&gAnimsLock);
+
+    if (!name) {
+        for (size_t i = 0; i < kVNAnimationCount; i++) {
+            if (gAnimations[i].kind == VN_ANIM_SHADER) { name = gAnimations[i].shader.frag; break; }
+        }
+    }
+    return name ? name : "vn_uber_dissolve";
+}
+
+/// Our compiled shaders, loaded once, on the device of the library Apple is
+/// building from -- a pipeline state is bound to the device that made it, and
+/// taking the device from the library we were handed removes the question.
+static void *vn_shader_library(void *their_lib) {
+    static void *s_library = NULL;
+    static bool  s_tried   = false;
+    if (s_tried) return s_library;
+    s_tried = true;
+
+    void *(*msg)(void *, void *)                   = (void *(*)(void *, void *))dlsym(RTLD_DEFAULT, "objc_msgSend");
+    void *(*msg2)(void *, void *, void *, void **) = (void *(*)(void *, void *, void *, void **))dlsym(RTLD_DEFAULT, "objc_msgSend");
+    void *(*sel)(const char *)                     = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
+    if (!msg || !sel || !their_lib) return NULL;
+
+    void *device = msg(their_lib, sel("device"));
+    if (!device) return NULL;
+
+    Dl_info di;
+    char path[4096];
+    if (!dladdr((void *)vn_shader_library, &di) || !di.dli_fname) return NULL;
+    if (strlcpy(path, di.dli_fname, sizeof(path)) >= sizeof(path)) return NULL;
+    char *macos = strstr(path, "/Contents/MacOS/");
+    if (!macos) return NULL;
+    *macos = '\0';
+    if (strlcat(path, "/Contents/Resources/Vanish.metallib", sizeof(path)) >= sizeof(path)) return NULL;
+
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path,
+                                                           (CFIndex)strlen(path), false);
+    if (!url) return NULL;
+
+    double t0 = SLSCurrentRealTime();
+    void *err = NULL;
+    s_library = msg2(device, sel("newLibraryWithURL:error:"), (void *)url, &err);
+    CFRelease(url);
+
+    if (!s_library) VN_ERROR("shader: failed to load %s on device %p", path, device);
+    else VN_INFO("shader: loaded %s on device %p in %.1fms", path, device,
+                 (SLSCurrentRealTime() - t0) * 1000.0);
+    return s_library;
+}
+
+/// The whole substitution, and it is one call.
+///
+/// A clone tagged with filter type 2 makes DetermineShaderOptions set option bit
+/// 0x10, which reaches here as `options`. Answering with the same request
+/// against OUR library gives a pipeline built by Apple's own code -- right pixel
+/// formats, right vertex descriptor, their quad, their texture binds, their
+/// uniform buffer -- running our functions. UberComposite caches the result per
+/// options value, so this happens once and costs nothing per frame.
+///
+/// We call create_shader rather than passing the constants function through:
+/// our shader declares none of the ubershader's function constants, so it needs
+/// none supplied.
+static void *vn_hook_create_specialized_shader(void *library, void *vtx, void *frag,
+                                               void *constants_fn, uint64_t options, void *vdesc) {
+    const int shader_clones = atomic_load_explicit(&gShaderFilterCount, memory_order_acquire);
+    if (options & kVNUberOptionShaderTag) {
+        VN_INFO("shader: create_specialized_shader(options=0x%llx, clones=%d)",
+                (unsigned long long)options, shader_clones);
+    }
+
+    if ((options & kVNUberOptionShaderTag) && shader_clones > 0 && vn_resolved_create_shader) {
+
+        void *lib = vn_shader_library(library);
+        if (lib) {
+            // One pipeline per process: UberComposite caches by options value and
+            // every shader animation produces the same options, so whichever
+            // fragment is built first is the one the cache keeps. Selecting
+            // between several effects has to ride on a uniform, not on this.
+            const char *frag_name = vn_shader_fragment_name();
+            CFStringRef frag_str  = CFStringCreateWithCString(NULL, frag_name, kCFStringEncodingUTF8);
+            void *shader = frag_str ? vn_resolved_create_shader(lib,
+                                                                (void *)CFSTR("vn_uber_vertex"),
+                                                                (void *)frag_str, vdesc) : NULL;
+            if (frag_str) CFRelease(frag_str);
+            if (shader) {
+                VN_INFO("shader: substituted our pair for options=0x%llx", (unsigned long long)options);
+                return shader;
+            }
+            VN_ERROR("shader: create_shader refused our library -- falling back to the stock ubershader");
+        }
+    }
+
+    return vn_orig_create_specialized_shader
+         ? vn_orig_create_specialized_shader(library, vtx, frag, constants_fn, options, vdesc)
+         : NULL;
 }
 
 #pragma mark - Entry
@@ -3018,6 +3097,7 @@ static void vanish_init(void) {
     vn_resolved_window_get_filter            = (VNWindowGetFilterFn)vn_skylight_symbol(kVNSymWindowGetFilter);
     vn_resolved_window_set_filter            = (VNWindowSetFilterFn)vn_skylight_symbol(kVNSymWindowSetFilter);
     vn_resolved_update_window                = (VNUpdateWindowFn)vn_skylight_symbol(kVNSymUpdateWindow);
+    vn_resolved_create_shader                = (VNCreateShaderFn)vn_skylight_symbol(kVNSymCreateShader);
     vn_resolved_create_clone                 = (VNCreateCloneFn)vn_skylight_symbol(kVNSymCreateCloneOfWindow);
     vn_resolved_system_window_release        = (VNSystemWindowReleaseFn)vn_skylight_symbol(kVNSymSystemWindowRelease);
     vn_resolved_window_get_display           = (VNWindowGetDisplayFn)vn_skylight_symbol(kVNSymWindowGetDisplay);
@@ -3059,14 +3139,15 @@ static void vanish_init(void) {
         VN_ERROR("WARNING: CGXPostEventByConnection unresolved");
     }
 
-    void *targetRipple = vn_skylight_symbol(kVNSymMetalCompositeRipple);
-    if (targetRipple) {
-        void *rawRipple = ptrauth_strip(targetRipple, ptrauth_key_function_pointer);
-        MSHookFunction(rawRipple, (void *)vn_hook_metal_composite_ripple,
-                       (void **)&vn_orig_metal_composite_ripple);
-        VN_DEBUG("hooked metal_composite_ripple -> orig %p", (void *)vn_orig_metal_composite_ripple);
+    void *targetSpecialized = vn_skylight_symbol(kVNSymCreateSpecializedShader);
+    if (targetSpecialized && vn_resolved_create_shader) {
+        void *rawSpecialized = ptrauth_strip(targetSpecialized, ptrauth_key_function_pointer);
+        MSHookFunction(rawSpecialized, (void *)vn_hook_create_specialized_shader,
+                       (void **)&vn_orig_create_specialized_shader);
+        VN_DEBUG("hooked ShaderComposer::create_specialized_shader -> orig %p",
+                 (void *)vn_orig_create_specialized_shader);
     } else {
-        VN_ERROR("WARNING: metal_composite_ripple unresolved -- shader animations cannot draw");
+        VN_ERROR("WARNING: create_specialized_shader/create_shader unresolved -- shader animations will not draw");
     }
 
     if (targetEligible) {

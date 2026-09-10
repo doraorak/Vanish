@@ -95,8 +95,49 @@ _Static_assert(offsetof(VNWindowFilter, refcount) == 0x08, "VNWindowFilter.refco
 _Static_assert(offsetof(VNWindowFilter, type)     == 0x0c, "VNWindowFilter.type is not at 0x0c");
 _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.params is not at 0x18");
 
-#define kVNFilterTypeRipple       1
-#define kVNFilterTypeColorInvert  2
+/// The tag Vanish puts on a clone. Nominally "colour invert", but we never get
+/// its effect: the tag exists to reach our substituted shader, and the stock
+/// invert is what shows if the substitution ever fails to happen.
+#define kVNFilterTypeShaderTag    2
+
+/// How a custom shader reaches a clone, established end to end by disassembly.
+///
+/// Routing through the ripple slot (type 1) is a dead end: metal_composite_ripple
+/// never draws the layer at all -- it blits the current render target into a
+/// scratch and draws a quad sampling that, so the window's own pixels are simply
+/// absent. That is why the stock ripple recolours the background rather than the
+/// window, and why no shader on that path can ever show window content.
+///
+/// Type 2 is the useful one. MetalCompositeLayer reads layer->[0x228] exactly
+/// once (`cmp w8, #1`), so a type-2 tag leaves the clone on the NORMAL path,
+/// which does draw the layer's own texture. The tag is not inert though:
+///
+///     DetermineShaderOptions  +260: ldr w8, [layer, #0x228]
+///                             +264: orr x9, x23, #0x10
+///                             +268: cmp w8, #0x2        -> options |= 0x10
+///
+/// and those options pick the shader via
+/// ShaderComposer::UberComposite(pixelFormat, options), which caches per options
+/// value and on a miss calls create_specialized_shader with the ubershader's own
+/// vertex descriptor. So the options word is a per-layer gate we control, and a
+/// substitution is built once and then cached for the life of the process.
+///
+/// UberCompositeFragment binds texture(0) = the layer's own content, plus a
+/// 12-byte buffer(0) of { _brightness, _fade, _hdr_scale } fed from
+/// layer->[0x224] and [0x18c]. layer->[0x224] is copied straight from
+/// CGXWindow::brightness (generate_layers_for_window +7560/+7564), which hands an
+/// animation a per-frame float channel without injecting anything anywhere.
+/// Written into VNWindowFilter::filter_id on clones whose animation is a custom
+/// shader. The compositor never reads that field -- only _XNewCIFilter's id
+/// bookkeeping does, and we bypass that -- so it is free for us to mark ours.
+#define kVNFilterMarkerShader 0x564E5348u   /* 'VNSH' */
+
+#define kVNUberOptionShaderTag 0x10
+
+#define kVNSymCreateSpecializedShader \
+    "__ZN14ShaderComposer25create_specialized_shaderEPU21objcproto10MTLLibrary11objc_objectP8NSStringS3_PFP25MTLFunctionConstantValuesyEyP19MTLVertexDescriptor"
+#define kVNSymCreateShader \
+    "__ZN14ShaderComposer13create_shaderEPU21objcproto10MTLLibrary11objc_objectP8NSStringS3_P19MTLVertexDescriptor"
 
 typedef struct CGXWindow {
     uint32_t       window_id;                           // 0x000
@@ -147,7 +188,9 @@ typedef struct CGXWindow {
     double         sfx_corner_radius;                   // 0x7d0
     uint8_t        _pad_7d8[0x10];
     uint64_t       dominant_display_id;                 // 0x7e8
-    uint8_t        _pad_7f0[0x78];
+    uint8_t        _pad_7f0[0x6c];
+    float          brightness;                          // 0x85c
+    uint8_t        _pad_860[0x8];
     double         corner_radius;                       // 0x868
     double         debug_corner_radius;                 // 0x870
     double         corner_radii[4];                     // 0x878
@@ -197,6 +240,7 @@ VN_ASSERT_OFFSET(dominant_display_id, 0x7e8);
 VN_ASSERT_OFFSET(corner_radius,       0x868);
 VN_ASSERT_OFFSET(debug_corner_radius, 0x870);
 VN_ASSERT_OFFSET(corner_radii,        0x878);
+VN_ASSERT_OFFSET(brightness,          0x85c);
 VN_ASSERT_OFFSET(mask_path,           0x8a0);
 VN_ASSERT_OFFSET(filter,              0x8a8);
 VN_ASSERT_OFFSET(mesh,                0x8b0);
@@ -266,22 +310,7 @@ enum { kVNOrderBelow = -1, kVNOrderOut = 0, kVNOrderAbove = 1 };
 /// window clean, so the compositor never re-reads them.
 #define kVNSymUpdateWindow "_updateWindow"
 
-/// `metal_composite_ripple(MetalContext *, WSCompositeSourceLayer *, WSCompositeDestination *)`
-///
-/// The composite function a type-1 filter routes a layer to. This is the hook
-/// point for a shader animation, and the reason the filter slot is worth using
-/// at all: MetalCompositeLayer's *first* branch is `layer->[0x228] == 1`, taken
-/// before it does any work, so hooking here costs nothing on the frames where
-/// no window carries a filter -- unlike hooking MetalCompositeLayer itself,
-/// which runs for every layer of every frame.
-#define kVNSymMetalCompositeRipple \
-    "__ZL22metal_composite_rippleP12MetalContextP22WSCompositeSourceLayerP22WSCompositeDestination"
 
-/// Offsets into WSCompositeSourceLayer that generate_layers_for_window fills
-/// from the window's filter. Read-only for us: the compositor rewrites them
-/// from the filter object every frame.
-#define kVNLayerFilterType   0x228
-#define kVNLayerFilterParams 0x230
 
 #define kVNSymWSWindowGetOwningPID "_WSWindowGetOwningPID"
 
@@ -497,7 +526,15 @@ typedef void   (*VNSetMeshWarpFn)(CGXWindow *, CGXConnection *, unsigned, unsign
 typedef VNWindowFilter *(*VNWindowGetFilterFn)(CGXWindow *);
 typedef void   (*VNWindowSetFilterFn)(CGXWindow *, VNWindowFilter *);
 typedef void   (*VNUpdateWindowFn)(CGXConnection *, CGXWindow *);
-typedef void   (*VNMetalCompositeRippleFn)(void *ctx, void *layer, void *dest);
+
+/// STATIC -- no `this`; x0 is the library. Static and non-static member
+/// functions mangle identically in the Itanium ABI, so only the disassembly
+/// distinguishes them. Getting this wrong messages the ShaderComposer as an
+/// MTLLibrary and objc_msgSend authenticates its C++ vtable as an isa:
+/// PAC_EXCEPTION, WindowServer dead. It has happened once already.
+typedef void  *(*VNCreateShaderFn)(void *library, void *vtx, void *frag, void *vdesc);
+typedef void  *(*VNCreateSpecializedShaderFn)(void *library, void *vtx, void *frag,
+                                              void *constants_fn, uint64_t options, void *vdesc);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);
 
 typedef void (*VNClearShadowDensityFn)(CGXWindow *);

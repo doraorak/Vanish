@@ -60,7 +60,7 @@
 				<string>Roll</string>
 				<string>Barrel</string>
 				<string>Clock</string>
-				<string>Ripple</string>
+				<string>Dissolve</string>
 			</array>
 			<key>validValues</key>
 			<array>
@@ -77,7 +77,7 @@
 				<string>roll</string>
 				<string>barrel</string>
 				<string>clock</string>
-				<string>ripple</string>
+				<string>dissolve</string>
 			</array>
 		</dict>
 		<dict>
