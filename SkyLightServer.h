@@ -195,6 +195,10 @@ enum { kVNOrderBelow = -1, kVNOrderOut = 0, kVNOrderAbove = 1 };
 #define kVNSymWindowByID "__ZL12window_by_idj"
 
 /// void CGXSetWindowListAlpha(CGXConnection *, CGXWindow *, float alpha, float duration)
+/// NOT CURRENTLY USED. Kept as a recovered signature: Vanish animates
+/// geometry only and never touches alpha. Relevant because this is the call
+/// an app's own close fade comes through, which is the signal Vanish watches
+/// for (by reading the window's alpha, not by hooking this).
 #define kVNSymSetAlpha "_CGXSetWindowListAlpha"
 
 /// void CGXWindow::release_window(CGXConnection *, CGXWindow *)
@@ -319,6 +323,13 @@ typedef void (*VNScheduleCallbackFn)(void (*)(void *, double), void *, double);
 
 /// A 4x4 transform, for the cheap cases. Unlike the alpha path this schedules
 /// its own redraw (`accumulate_window_display_updates`).
+/// NOT CURRENTLY USED. ABI recovered from Apple's own caller inside
+/// translate_window_group:
+///     WSSetWindowTransform(conn, win, slot /*0x1ffffff0*/, flags,
+///                          CATransform3D *)
+/// It fetches the window's existing transform for that slot (identity if
+/// unset), applies CATransform3DTranslate, and sets it back. Kept for a
+/// possible move to transform-based animation.
 #define kVNSymWSSetWindowTransform "_WSSetWindowTransform"
 
 /// One mesh vertex: where it is in the window, and where to draw it on screen.
@@ -345,6 +356,11 @@ typedef struct {
 ///
 /// `layergen_frozen_window` is one of the functions that reads the mesh at
 /// `[win + 0x8b0]`, so frozen content is warped like any other.
+/// NOT CURRENTLY USED. It was wired up once on the theory that the clone
+/// live-mirrors the original's content; that is wrong -- the clone is already
+/// a static image of the window as it was at close time -- so the call was
+/// removed. Kept because the disassembly notes above are real and were
+/// expensive to establish.
 #define kVNSymFreezeContent "_WSWindowFreezeContent"
 
 typedef void   (*VNFreezeContentFn)(CGXWindow *);

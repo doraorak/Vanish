@@ -2,32 +2,56 @@
 //  Vanish.c
 //  Smooth window close animations for macOS on Apple Silicon.
 //
-//  Injected directly into WindowServer (com.apple.WindowManager) via TweakInject / ellekit.
+//  Injected into WindowServer via TweakInject / ellekit. Everything here runs
+//  server-side: Vanish never talks to the closing application, and never
+//  relies on anything client-side.
 //
-//  Architecture:
-//  1. Server-Level Intent Detection:
-//     Monitors mouse down/up events within the red traffic-light close button at the
-//     window server compositor level.
-//     Maintains a short-lived pre-clone to ensure 100% gapless, flash-free visual handoff.
+//  Hooks (vn_hook_*), with their originals kept as vn_orig_*:
+//    CGXOrderWindowListSpaceSwitchOptions  every window-ordering path
+//    CGXWindow::release_window             window teardown
+//    CGXPostEventByConnection              the mouse event stream
+//    isProcessEligibleForSetFront          WhatsApp front-eligibility quirk
+//  Everything else the server provides is resolved by name at runtime
+//  (vn_resolved_*), since none of it is exported -- see SkyLightServer.h.
 //
-//  2. Pre-Cloning & Visual Handoff:
-//     Upon detecting a close gesture, creates an offscreen clone of the target window
-//     surface via SkyLight (CGXCreateCloneWindowWithTransform).
-//     When the application orders out or releases the original window, the clone
-//     is already composited and seamlessly takes over without dropped frames or flashes.
+//  How a close actually plays out:
 //
-//  3. Hardware-Accelerated Mesh Warp & Display Cadence:
-//     Drives a geometric shrink and fade transition on the clone window using
-//     SkyLight mesh warps (CGXSetWindowWarpMesh). Frame updates are scheduled
-//     according to the display refresh interval (supporting 10 Hz up to 120 Hz ProMotion).
+//  1. Intent, from the event stream. A mouse-down inside the red button's
+//     region is recorded but does nothing yet. A drag off the button, or
+//     more than 4pt of movement while held, cancels it. Only the release
+//     commits -- so a press that turns into a window drag never produces a
+//     clone, and there is nothing to be exposed when the window moves.
 //
-//  4. Shadow & Visual Property Management:
-//     Optionally clears or adjusts drop shadow properties on the clone to eliminate
-//     shadow projection artifacts during scaling.
+//  2. Pre-clone on release. The window's surface is cloned and ordered below
+//     the original, after the release has been forwarded so the build cost
+//     (2ms light, 16ms heavy) is off the input path. The clone's warp path is
+//     pre-warmed with an identity mesh so the first animated frame does not
+//     also have to realize its surface.
 //
-//  5. System Window Safety:
-//     Non-standard system surfaces (Dock, menu bar, notification center, wallpaper,
-//     tooltips, lock screen, inspector panels) pass directly through untouched.
+//  3. Start on the app's fade, not its order-out. An AppKit or Chromium
+//     window does not vanish when closed: the app fades its alpha to zero
+//     over ~250ms and only then orders out. Triggering on the order-out
+//     therefore meant sitting through the entire close before starting.
+//     Vanish watches the original's alpha instead and takes over the moment
+//     it drops -- roughly 250ms earlier -- hiding the original so it cannot
+//     show through behind the shrinking clone.
+//
+//  4. Shrink. A uniform scale about the window's centre, driven by
+//     CGXWindow::set_mesh_warp on a 2x2 mesh (an affine map needs only its
+//     four corners), on an absolute frame deadline so timer lateness cannot
+//     accumulate. Despite the log wording, nothing fades: alpha is never
+//     animated, only geometry.
+//
+//  5. Stay out of the way. Some windows already have a system close
+//     animation -- double-click a file in Finder and the app transposes the
+//     window back into its icon on close, using brand-new proxy windows that
+//     fly to the icon. Running ours on top looks broken, so a genuinely new
+//     window appearing from the same process just before we would start is
+//     taken as a system animation in flight, and we defer to it.
+//
+//  6. System surfaces (Dock, menu bar, notification centre, wallpaper,
+//     tooltips, lock screen, Finder's Get Info panel) pass through
+//     untouched.
 //
 
 #include <CoreFoundation/CoreFoundation.h>
