@@ -1,16 +1,14 @@
 # Video
 
 
-
-https://github.com/user-attachments/assets/bfbdce35-49ab-47a2-8ed9-0d51ce3b22ba
-
+https://github.com/user-attachments/assets/4b989d29-43bc-4a35-9230-32cc14efc8f8
 
 
 # Vanish
 
 Smooth window close animations for macOS on Apple Silicon.
 
-Vanish replaces the close animation for every window on the system. It runs **inside `WindowServer` itself**, injected through **[TweakInject](https://github.com/doraorak/TweakInject)** — so it works with any application, with no plugins, no injection into apps, and no cooperation from the window being closed.
+Vanish replaces the close animation for windows ! It runs **inside `WindowServer` itself**, injected through **[TweakInject](https://github.com/doraorak/TweakInject)** — so it works with any application.
 
 ---
 
@@ -18,13 +16,15 @@ Vanish replaces the close animation for every window on the system. It runs **in
 
 - **Runs inside the compositor.** Vanish hooks WindowServer's own window-ordering, teardown and event-delivery routines. None of them are exported — they're located by walking the symbol table at load time and pointer-signed before they're ever called.
 
-- **Nothing client-side.** Traffic-light hit testing happens on the raw event stream inside the server. Vanish never loads into applications and never links AppKit. An app cannot tell it's there.
+- **Nothing client-side.** Traffic-light hit testing happens on the raw event stream inside the server. Vanish never loads into applications and doesn't link AppKit. 
 
-- **Starts when *you* click, not when the app gets around to it.** An AppKit or Chromium window doesn't disappear when you hit the red button — the app spends about a quarter of a second fading it out before it ever asks the server to remove it. Waiting for that request means the animation begins after the close is visually over. Vanish watches the window's own alpha instead and takes over the moment it starts to drop.
+- **Starts when *you* click, not when the app gets around to it.** By default some AppKit or Chromium windows don't disappear when you hit the red button — the app spends about a quarter of a second fading it out before it ever asks the server to remove it. Waiting for that request means the animation begins after the close is visually over. Vanish watches the window's own alpha instead and takes over the moment it starts to drop.
 
-- **Thirteen close animations** — **Shrink**, **Squish**, **Fall**, **Swirl**, **Flip**, **Tilt**, **Slide**, **Genie**, **Flag**, **Spin**, **Roll**, **Barrel** and **Clock** — selected in System Settings.
+- **Many close animations** — More than 10 animations selectable through the tweaks preferences.
 
 - **Hardware-accelerated warp.** The closing window's surface is cloned inside the server and deformed through `CGXWindow::set_mesh_warp`. Each animation declares the smallest grid that renders it exactly: a shrink or a topple is affine and needs nothing beyond its four corners, while a swirl, where different parts of the window travel along different curves, asks for a denser one.
+
+- **Metal shader animations** — Full support for MSL, some animations use shaders to provide more complex animations that are impossible to do with plain mesh warps. 
 
 - **Locked to the display.** Frames are scheduled against an absolute deadline rather than chained off one another, keeping the animation in step with the panel — a full 120 Hz on ProMotion.
 
@@ -49,17 +49,18 @@ Vanish replaces the close animation for every window on the system. It runs **in
 
 3. **Takeover.** Vanish watches the original's alpha and starts the moment the app begins fading it out, hiding the original so it can't show through from behind.
 
-4. **Animate.** The chosen warp is applied to the clone on a fixed frame cadence. Only geometry is animated.
+4. **Animate.** The chosen warp or shader animation is applied to the clone window.
 
-5. **Cleanup.** The clone is hidden, ordered out and released. If the close never actually arrives, it's discarded on a timeout.
+5. **Cleanup.** After the custom animation, the clone is hidden ordered out and released.
 
 ---
 
 ## 🛠 Prerequisites
 
-- **macOS 15.0+** (tested up to macOS 27 / Sequoia+)
+- **macOS 27.0+** (tested on macOS 27)
 - **Apple Silicon** (`arm64e`)
-- **System Integrity Protection (SIP) disabled** (required for `WindowServer` injection)
+- **System Integrity Protection (SIP) disabled** 
+- **Library Validation (LV) disabled** 
 - **[tweakLoader](https://github.com/doraorak/tweakLoader) / [TweakInject](https://github.com/doraorak/TweakInject)** installed
 
 ---
@@ -110,9 +111,9 @@ sudo cp -R layout/Library/TweakInject/Preferences/* /Library/TweakInject/Prefere
 
 Open **System Settings** → **TweakInject** → **Vanish** to configure:
 - **Enable Animation**: Toggle window close animations on/off.
-- **Animation**: Shrink, Squish, Fall, Swirl, Flip, Tilt, Slide, Genie, Flag, Spin, Roll, Barrel or Clock. Applies to the next window you close.
+- **Animation**: Applies to the next window you close.
 - **Duration**: Adjust close speed between 0.05s and 2.0s (default: 0.25s).
-- **Refresh Rate**: Adjust animation update frequency up to 120 Hz (default: 120 Hz). Set it to 0 to follow the display's own refresh rate.
+- **Refresh Rate**: Adjust animation update frequency up to 120 Hz (default: 120 Hz). 
 - **Window Shadow**: Enable or disable the drop shadow on the animated window.
 
 Preferences are stored in:
