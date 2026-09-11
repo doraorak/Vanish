@@ -1187,6 +1187,17 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
 
     const VNAnimation *anim = vn_animation_for_key(prefs.animation);
 
+    // Diagnostic: the selected animation silently falling back to the first
+    // registry entry is indistinguishable, on screen, from the shader path
+    // being broken. Log what prefs actually held and what it resolved to, so
+    // the two can be told apart without a second build. The length is here
+    // because a trailing space or newline in the stored value looks identical
+    // in a plist dump but never matches a registry key.
+    VN_INFO("animation select: prefs='%s' (len=%zu) -> key='%s' kind=%s",
+            prefs.animation, strlen(prefs.animation),
+            anim ? anim->key : "?",
+            anim ? (anim->kind == VN_ANIM_SHADER ? "SHADER" : "MESH") : "?");
+
     double t_clone0 = SLSCurrentRealTime();
     CGXWindow *clone = vn_resolved_create_clone(win, frame, display, true);
     double clone_ms = (SLSCurrentRealTime() - t_clone0) * 1000.0;
