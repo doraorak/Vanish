@@ -990,6 +990,7 @@ static const VNAnimation gAnimations[] = {
     { "clock",    "Clock",    VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_clock } },
     { "dissolve", "Dissolve", VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve" } },
     { "crt",      "CRT Off",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt" } },
+    { "shatter",  "Shatter",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter" } },
 };
 #define kVNAnimationCount (sizeof(gAnimations) / sizeof(gAnimations[0]))
 
