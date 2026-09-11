@@ -74,7 +74,16 @@ vertex VNUberStage vn_uber_vertex(VNUberIn in [[stage_in]],
 // top-left corner, which the widened shape moved up and left by m. Subtracting
 // m puts the window back where it was, centred in the quad with margin all
 // round, and makes anything outside [0,1] the margin.
-constant float kVNShaderMargin = 0.35;
+// One margin for every shader animation, deliberately.
+//
+// Effects that never leave the window could ask for far less, and the quad's
+// area is what they cost -- but a small margin exposes a one-or-two-frame
+// artifact at the start of the close that has resisted five attempts to fix
+// (a displaced copy of the window peeking out from behind the original). At
+// this width the displaced frame lands entirely behind the original window and
+// is never seen. That is a workaround, not a fix: the underlying mismatch is
+// still there, it is simply covered.
+constant float kVNShaderMargin = 0.36;
 
 static float2 vn_window_uv(float2 tex) {
     return tex - kVNShaderMargin;
@@ -164,5 +173,38 @@ fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
 
     float4 colour = tex2D.sample(samp, src);
     colour *= clamp(1.2 - age, 0.0, 1.0);
+    return colour;
+}
+
+/// CRT off: the picture collapses to a bright line, then a dot, and snaps out.
+///
+/// Two stages off one phase -- vertical collapse, then horizontal -- with the
+/// brightness lifting as the energy concentrates.
+///
+/// `brightness` is the phase, 1 -> 0. At 1 both scales are 1, the sample is the
+/// pixel itself and the lift is zero, so the frame is the untouched window.
+fragment float4 vn_uber_crt(VNUberStage in [[stage_in]],
+                            texture2d<float> tex2D [[texture(0)]],
+                            constant VNUberArgs &args [[buffer(0)]],
+                            sampler samp [[sampler(0)]]) {
+    const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
+    const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
+
+    const float vert  = clamp(t / 0.62, 0.0, 1.0);          // squeeze to a line
+    const float horiz = clamp((t - 0.62) / 0.38, 0.0, 1.0); // then to a dot
+
+    // Eased so the collapse accelerates into the line.
+    const float sy = max(1.0 - vert  * vert  * 0.995, 0.0012);
+    const float sx = max(1.0 - horiz * horiz * 0.995, 0.0012);
+
+    const float2 src = (uv - 0.5) / float2(sx, sy) + 0.5;
+    if (any(src < 0.0) || any(src > 1.0)) return float4(0.0);
+
+    float4 colour = tex2D.sample(samp, src);
+
+    // Brighter as it is squeezed into less space, then the dot burns out.
+    colour.rgb += float3(vert * 0.45 + horiz * 1.10);
+    colour *= 1.0 - horiz * horiz;
+
     return colour;
 }

@@ -61,6 +61,7 @@
 				<string>Barrel</string>
 				<string>Clock</string>
 				<string>Dissolve</string>
+				<string>CRT Off</string>
 			</array>
 			<key>validValues</key>
 			<array>
@@ -78,6 +79,7 @@
 				<string>barrel</string>
 				<string>clock</string>
 				<string>dissolve</string>
+				<string>crt</string>
 			</array>
 		</dict>
 		<dict>
