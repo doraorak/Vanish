@@ -897,11 +897,23 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 //   gains nothing from more. Only genuinely non-affine motion, where
 //   different parts of the window move on different curves, needs a denser
 //   grid, and every extra vertex is per-frame work for the compositor.
+
 // How far past the window a shader animation may draw, as a fraction of the
-// window's size on each side. Purely a C-side number: the shader needs no
-// matching constant, because texture coordinates outside [0,1] are margin
-// whatever its width.
-#define kVNShaderMargin 0.35
+// window's size on each side.
+//
+// MUST match kVNShaderMargin in shaders/Vanish.metal. The shader subtracts it
+// to put the window back at [0,1] after the widened shape moved the origin up
+// and left; disagree here and every shader animation samples off by the
+// difference.
+//
+// One margin for every shader animation, deliberately. An effect that never
+// leaves the window could ask for far less, and the quad's area is what it
+// costs -- but a small margin exposes a one-or-two-frame artifact at the start
+// of the close that has resisted five attempts to fix (a displaced copy of the
+// window peeking out from behind the original). At this width the displaced
+// frame lands entirely behind the original and is never seen. That is a
+// workaround, not a fix: the mismatch is still there, it is merely covered.
+#define kVNShaderMargin 0.36
 
 #define kVNMeshMaxDim   16
 #define kVNMeshMaxCount (kVNMeshMaxDim * kVNMeshMaxDim)
