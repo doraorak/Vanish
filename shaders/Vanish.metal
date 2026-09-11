@@ -203,7 +203,13 @@ fragment float4 vn_uber_crt(VNUberStage in [[stage_in]],
     float4 colour = tex2D.sample(samp, src);
 
     // Brighter as it is squeezed into less space, then the dot burns out.
-    colour.rgb += float3(vert * 0.45 + horiz * 1.10);
+    //
+    // Scaled by alpha because the content is premultiplied. Adding a flat
+    // amount instead lights up every transparent texel as well -- and with
+    // shadows enabled the clone is built at the window's BOUNDS, so the whole
+    // shadow border is low-alpha texels inside [0,1]. That is what put a white
+    // wash behind the window for the length of the animation.
+    colour.rgb += colour.a * (vert * 0.45 + horiz * 1.10);
     colour *= 1.0 - horiz * horiz;
 
     return colour;
