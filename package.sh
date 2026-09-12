@@ -47,8 +47,25 @@ PREFS_BUNDLE="${NAME}Prefs.bundle"
 PREFS_SRC="$DIR/layout/Library/TweakInject/Preferences/PreferenceBundles/$PREFS_BUNDLE"
 PKG_VERSION="$(awk '/^Version:/{print $2}' "$DIR/control")"
 
-mkdir -p "$PREFS_SRC"
-cat > "$PREFS_SRC/Info.plist" <<PLIST
+echo "==> 1a. Compiling $PREFS_BUNDLE (arm64 + arm64e)..."
+rm -rf "$PREFS_SRC"
+mkdir -p "$PREFS_SRC/Contents/MacOS" "$PREFS_SRC/Contents/Resources"
+
+PREFS_SUPPORT_LIB="/Library/TweakInject/TI_PreferenceSupport.dylib"
+if [ ! -f "$PREFS_SUPPORT_LIB" ]; then
+    if [ -f "$DIR/../../XCode-projects/DYLIB/TI_PreferenceSupport/Build/Products/Release/TI_PreferenceSupport.dylib" ]; then
+        PREFS_SUPPORT_LIB="$DIR/../../XCode-projects/DYLIB/TI_PreferenceSupport/Build/Products/Release/TI_PreferenceSupport.dylib"
+    fi
+fi
+
+clang -bundle -arch arm64 -arch arm64e -isysroot "$SDK_PATH" -fobjc-arc \
+    -framework Cocoa \
+    "$PREFS_SUPPORT_LIB" \
+    -I"$DIR/Preferences" \
+    -o "$PREFS_SRC/Contents/MacOS/VanishPrefs" \
+    "$DIR/Preferences/VanishPrefsViewController.m"
+
+cat > "$PREFS_SRC/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -57,13 +74,32 @@ cat > "$PREFS_SRC/Info.plist" <<PLIST
 	<string>${PKG_ID}prefs</string>
 	<key>CFBundleName</key>
 	<string>$PREFS_BUNDLE</string>
+	<key>CFBundleExecutable</key>
+	<string>VanishPrefs</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$PKG_VERSION</string>
+	<key>NSPrincipalClass</key>
+	<string>VanishPrefsViewController</string>
+	<key>title</key>
+	<string>Vanish</string>
+	<key>defaults</key>
+	<string>$PKG_ID</string>
+	<key>icon</key>
+	<string>icon.svg</string>
 </dict>
 </plist>
 PLIST
+
+if [ -f "$DIR/Preferences/icon.svg" ]; then
+    cp "$DIR/Preferences/icon.svg" "$PREFS_SRC/Contents/Resources/icon.svg"
+fi
+if [ -f "$DIR/Preferences/Root.plist" ]; then
+    cp "$DIR/Preferences/Root.plist" "$PREFS_SRC/Contents/Resources/Root.plist"
+fi
+
+codesign -f -s - "$PREFS_SRC"
 
 # Shaders are compiled here, never inside WindowServer: the server only ever
 # loads the finished library, so it needs no Metal compiler and no compiler
@@ -72,11 +108,11 @@ echo "==> 1b. Compiling shaders -> Vanish.metallib..."
 xcrun -sdk macosx metal -O2 -o "$DIR/$BUNDLE/Contents/Resources/Vanish.metallib" "$DIR/shaders/Vanish.metal"
 
 cp "$DIR/Filter.plist" "$DIR/$BUNDLE/Contents/Resources/Filter.plist"
-if [ -f "$PREFS_SRC/Root.plist" ]; then
-    cp "$PREFS_SRC/Root.plist" "$DIR/$BUNDLE/Contents/Resources/Root.plist"
+if [ -f "$PREFS_SRC/Contents/Resources/Root.plist" ]; then
+    cp "$PREFS_SRC/Contents/Resources/Root.plist" "$DIR/$BUNDLE/Contents/Resources/Root.plist"
 fi
-if [ -f "$PREFS_SRC/icon.svg" ]; then
-    cp "$PREFS_SRC/icon.svg" "$DIR/$BUNDLE/Contents/Resources/icon.svg"
+if [ -f "$PREFS_SRC/Contents/Resources/icon.svg" ]; then
+    cp "$PREFS_SRC/Contents/Resources/icon.svg" "$DIR/$BUNDLE/Contents/Resources/icon.svg"
 fi
 # Embed companion preference bundle inside the tweak bundle
 rm -rf "$DIR/$BUNDLE/Contents/Resources/$PREFS_BUNDLE"
@@ -114,6 +150,7 @@ if [ -d "$DIR/layout" ]; then
 fi
 mkdir -p "$STAGE_DIR/Library/TweakInject/Tweaks/Bundles"
 cp -R "$DIR/$BUNDLE" "$STAGE_DIR/Library/TweakInject/Tweaks/Bundles/"
+find "$STAGE_DIR" -name ".DS_Store" -delete 2>/dev/null || true
 
 # Version comes from ./control so the two cannot drift.
 PKG_VERSION="$(awk '/^Version:/{print $2}' "$DIR/control")"

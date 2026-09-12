@@ -6,6 +6,38 @@
 	<string>shrink</string>
 	<key>duration</key>
 	<real>0.25</real>
+	<key>duration_barrel</key>
+	<real>0.35</real>
+	<key>duration_clock</key>
+	<real>0.35</real>
+	<key>duration_crt</key>
+	<real>0.30</real>
+	<key>duration_dissolve</key>
+	<real>0.25</real>
+	<key>duration_fall</key>
+	<real>0.25</real>
+	<key>duration_flag</key>
+	<real>0.30</real>
+	<key>duration_flip</key>
+	<real>0.25</real>
+	<key>duration_genie</key>
+	<real>0.35</real>
+	<key>duration_roll</key>
+	<real>0.30</real>
+	<key>duration_shatter</key>
+	<real>0.40</real>
+	<key>duration_shrink</key>
+	<real>0.25</real>
+	<key>duration_slide</key>
+	<real>0.25</real>
+	<key>duration_spin</key>
+	<real>0.25</real>
+	<key>duration_squish</key>
+	<real>0.25</real>
+	<key>duration_swirl</key>
+	<real>0.30</real>
+	<key>duration_tilt</key>
+	<real>0.25</real>
 	<key>enabled</key>
 	<true/>
 	<key>refreshRate</key>

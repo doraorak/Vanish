@@ -260,11 +260,18 @@ static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
 
 #pragma mark - Preferences
 
+static const char * const kVNAnimationKeys[] = {
+    "shrink", "squish", "fall", "swirl", "flip", "tilt", "slide", "genie",
+    "flag", "spin", "roll", "barrel", "clock", "dissolve", "crt", "shatter"
+};
+#define kVNAnimationKeyCount (sizeof(kVNAnimationKeys) / sizeof(kVNAnimationKeys[0]))
+
 typedef struct {
     bool  enabled;
     bool  shadows;
     float refreshRate;
     float duration;
+    float animDurations[kVNAnimationKeyCount];
     char  targetApp[256];
     char  animation[64];
 } VNPreferences;
@@ -279,6 +286,9 @@ static void vn_reload_prefs_locked(void) {
     gPrefs.shadows = true;
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
+    for (size_t i = 0; i < kVNAnimationKeyCount; i++) {
+        gPrefs.animDurations[i] = 0.0f;
+    }
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
     strlcpy(gPrefs.animation, "shrink", sizeof(gPrefs.animation));
 
@@ -335,6 +345,27 @@ static void vn_reload_prefs_locked(void) {
                             }
                             if (dur >= 0.05f && dur <= 60.0f) {
                                 gPrefs.duration = dur;
+                            }
+                        }
+
+                        for (size_t i = 0; i < kVNAnimationKeyCount; i++) {
+                            char keyBuf[64];
+                            snprintf(keyBuf, sizeof(keyBuf), "duration_%s", kVNAnimationKeys[i]);
+                            CFStringRef cfKey = CFStringCreateWithCString(kCFAllocatorDefault, keyBuf, kCFStringEncodingUTF8);
+                            if (cfKey) {
+                                CFTypeRef aDurVal = CFDictionaryGetValue(dict, cfKey);
+                                if (aDurVal) {
+                                    float aDur = 0.0f;
+                                    if (CFGetTypeID(aDurVal) == CFNumberGetTypeID()) {
+                                        CFNumberGetValue((CFNumberRef)aDurVal, kCFNumberFloatType, &aDur);
+                                    } else if (CFGetTypeID(aDurVal) == CFStringGetTypeID()) {
+                                        aDur = (float)CFStringGetDoubleValue((CFStringRef)aDurVal);
+                                    }
+                                    if (aDur >= 0.05f && aDur <= 60.0f) {
+                                        gPrefs.animDurations[i] = aDur;
+                                    }
+                                }
+                                CFRelease(cfKey);
                             }
                         }
 
@@ -407,9 +438,24 @@ static void vn_prefs_changed_callback(CFNotificationCenterRef center, void *obse
     os_unfair_lock_unlock(&gPrefsLock);
 }
 
+static float vn_duration_for_key(const char *animKey) {
+    VNPreferences prefs = vn_get_prefs();
+    if (animKey && animKey[0]) {
+        for (size_t i = 0; i < kVNAnimationKeyCount; i++) {
+            if (strcasecmp(kVNAnimationKeys[i], animKey) == 0) {
+                if (prefs.animDurations[i] >= 0.05f) {
+                    return prefs.animDurations[i];
+                }
+                break;
+            }
+        }
+    }
+    return prefs.duration >= 0.05f ? prefs.duration : 0.25f;
+}
+
 static float vn_duration(void) {
     VNPreferences prefs = vn_get_prefs();
-    return prefs.duration;
+    return vn_duration_for_key(prefs.animation);
 }
 
 #pragma mark - Window Eligibility Filtering
@@ -1001,6 +1047,10 @@ static const VNAnimation *vn_animation_for_key(const char *key) {
         }
     }
     return &gAnimations[0];
+}
+
+static float vn_duration_for_anim(const VNAnimation *anim) {
+    return vn_duration_for_key(anim ? anim->key : NULL);
 }
 
 #pragma mark - Window filters
@@ -1827,7 +1877,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
                                      pid_t pid, uint64_t psn, bool is_wa, const char *app_name) {
     if (!clone_win) return;
     uint32_t clone_wid = vn_resolved_window_get_id ? vn_resolved_window_get_id(clone_win) : 0;
-    float dur = vn_duration();
+    float dur = vn_duration_for_anim(anim);
 
     if ((pid == 0 || psn == 0) && orig_wid != 0 && vn_resolved_window_by_id) {
         CGXWindow *orig_win = vn_resolved_window_by_id(orig_wid);
