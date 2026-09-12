@@ -25,12 +25,21 @@ mkdir -p "$DIR/$BUNDLE/Contents/MacOS" "$DIR/$BUNDLE/Contents/Resources"
 # SkyLight is linked for the SLS* symbols. It is a private framework, hence the
 # explicit -F; the SDK does not put it on the default search path.
 #
-# ellekit provides MSHookFunction. Its install name is /usr/local/lib, which is
-# where the loader keeps it, so -L only matters at link time.
+# TI_Ellekit provides MSHookFunction. Its install name is /Library/TweakInject/TI_Ellekit.dylib.
+TWEAKINJECT_DIR="$DIR/../../XCode-projects/APP/My apps/TweakInject"
+ELLEKIT_LIB="/Library/TweakInject/TI_Ellekit.dylib"
+if [ ! -f "$ELLEKIT_LIB" ]; then
+    if [ -f "$TWEAKINJECT_DIR/Payload/TI_Ellekit.dylib" ]; then
+        ELLEKIT_LIB="$TWEAKINJECT_DIR/Payload/TI_Ellekit.dylib"
+    elif [ -f "$TWEAKINJECT_DIR/.payload-build/Build/Products/Release/TI_Ellekit.dylib" ]; then
+        ELLEKIT_LIB="$TWEAKINJECT_DIR/.payload-build/Build/Products/Release/TI_Ellekit.dylib"
+    fi
+fi
+
 clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fblocks -std=c11 \
     -F"$SDK_PATH/System/Library/PrivateFrameworks" \
     -framework CoreFoundation -framework CoreGraphics -framework SkyLight \
-    -L/Library/TweakInject -lellekit \
+    "$ELLEKIT_LIB" \
     -install_name "/Library/TweakInject/Tweaks/Bundles/$BUNDLE/Contents/MacOS/$NAME" \
     -o "$DIR/$BUNDLE/Contents/MacOS/$NAME" "$DIR/$NAME.c"
 
