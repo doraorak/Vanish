@@ -3,7 +3,7 @@
 //  VanishPrefs
 //
 //  Custom NSViewController conforming to PSPreferenceController for Vanish.
-//  Works seamlessly in both System Settings (PreferenceLoaderTI) and TweakInject.
+//  Ultra-compact, responsive design tailored specifically for macOS System Settings.
 //
 
 #import "VanishPrefsViewController.h"
@@ -15,7 +15,7 @@ extern CFPropertyListRef _Nullable PSPreferencesCopyAppValue(CFStringRef key, CF
 extern void PSPreferencesSetAppValue(CFStringRef key, CFPropertyListRef _Nullable value, CFStringRef domain);
 extern Boolean PSPreferencesAppSynchronize(CFStringRef domain);
 
-#pragma mark - FlippedView & ScrollView Helpers
+#pragma mark - FlippedView
 
 @interface VNPFlippedView : NSView
 @end
@@ -26,69 +26,79 @@ extern Boolean PSPreferencesAppSynchronize(CFStringRef domain);
 }
 @end
 
-@interface VNPScrollView : NSScrollView
-@end
-
-@implementation VNPScrollView
-- (void)scrollWheel:(NSEvent *)event {
-    if (self.enclosingScrollView != nil) {
-        [[self nextResponder] scrollWheel:event];
-        return;
-    }
-    [super scrollWheel:event];
-}
-@end
-
 #pragma mark - Animation Metadata
 
 typedef struct {
     const char *key;
     const char *name;
-    const char *desc;
     double defaultDuration;
 } VNAnimationMeta;
 
 static const VNAnimationMeta kAnimations[] = {
-    { "shrink",   "Shrink",   "Scale down smoothly toward window center",  0.25 },
-    { "squish",   "Squish",   "Vertical compression with elastic rebound", 0.25 },
-    { "fall",     "Fall",     "Gravity drop off-screen",                  0.25 },
-    { "swirl",    "Swirl",    "Vortex spiral collapse into center",       0.30 },
-    { "flip",     "Flip",     "3D perspective flip along horizontal axis",0.25 },
-    { "tilt",     "Tilt",     "3D isometric tilt and perspective fade",   0.25 },
-    { "slide",    "Slide",    "Slide smoothly off toward screen edge",    0.25 },
-    { "genie",    "Genie",    "Classic macOS genie suck into dock/origin",0.35 },
-    { "flag",     "Flag",     "Waving banner mesh oscillation",           0.30 },
-    { "spin",     "Spin",     "Centroid rotation and scale-down",         0.25 },
-    { "roll",     "Roll",     "Cylinder roll up like parchment",          0.30 },
-    { "barrel",   "Barrel",   "Barrel roll perspective distortion",       0.35 },
-    { "clock",    "Clock",    "Clock hand radial sweep wipe",             0.35 },
-    { "dissolve", "Dissolve", "Grainy pixel dispersion fade",             0.25 },
-    { "crt",      "CRT Off",  "Retro cathode-ray tube shutdown beam",     0.30 },
-    { "shatter",  "Shatter",  "Glass fracture explosion into fragments",  0.40 },
+    { "shrink",   "Shrink",   0.25 },
+    { "squish",   "Squish",   0.25 },
+    { "fall",     "Fall",     0.25 },
+    { "swirl",    "Swirl",    0.30 },
+    { "flip",     "Flip",     0.25 },
+    { "tilt",     "Tilt",     0.25 },
+    { "slide",    "Slide",    0.25 },
+    { "genie",    "Genie",    0.35 },
+    { "flag",     "Flag",     0.30 },
+    { "spin",     "Spin",     0.25 },
+    { "roll",     "Roll",     0.30 },
+    { "barrel",   "Barrel",   0.35 },
+    { "clock",    "Clock",    0.35 },
+    { "dissolve", "Dissolve", 0.25 },
+    { "crt",      "CRT Off",  0.30 },
+    { "shatter",  "Shatter",  0.40 },
 };
 #define kAnimationCount (sizeof(kAnimations) / sizeof(kAnimations[0]))
 
 #pragma mark - VanishPrefsViewController
 
 @interface VanishPrefsViewController () <NSTextFieldDelegate> {
-    NSScrollView *_scrollView;
     VNPFlippedView *_contentView;
     
-    // General Controls
+    // Card 1: General Settings
+    NSTextField *_genHeader;
+    VNPFlippedView *_genCard;
+    VNPFlippedView *_rowEnable;
+    NSTextField *_enabledTitle;
     NSSwitch *_enabledSwitch;
+    NSBox *_sep1;
+    
+    VNPFlippedView *_rowShadows;
+    NSTextField *_shadowsTitle;
     NSSwitch *_shadowsSwitch;
+    NSBox *_sep2;
+    
+    VNPFlippedView *_rowTarget;
+    NSTextField *_targetTitle;
     NSTextField *_targetAppField;
     
-    // Animation & Timing Controls
+    // Card 2: Animation & Timing
+    NSTextField *_animHeader;
+    VNPFlippedView *_animCard;
+    VNPFlippedView *_rowAnim;
+    NSTextField *_animTitle;
     NSPopUpButton *_animPopUp;
-    NSSlider *_durationSlider;
-    NSTextField *_durationLabel;
-    NSTextField *_durationSubtitle;
-    NSButton *_resetDurationBtn;
-    NSSlider *_refreshRateSlider;
-    NSTextField *_refreshRateLabel;
+    NSBox *_sep3;
     
-    CGFloat _totalContentHeight;
+    VNPFlippedView *_rowDuration;
+    NSTextField *_durationTitle;
+    NSTextField *_durationLabel;
+    NSButton *_resetDurationBtn;
+    NSTextField *_durationSubtitle;
+    NSSlider *_durationSlider;
+    NSBox *_sep4;
+    
+    VNPFlippedView *_rowRefresh;
+    NSTextField *_refreshTitle;
+    NSTextField *_refreshRateLabel;
+    NSTextField *_refreshSubtitle;
+    NSSlider *_refreshRateSlider;
+    
+    CGFloat _totalHeight;
 }
 @end
 
@@ -98,6 +108,8 @@ static const VNAnimationMeta kAnimations[] = {
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
         _preferencesDomain = @"com.doraorak.vanish";
+        _totalHeight = 302.0;
+        self.preferredContentSize = NSMakeSize(260.0, _totalHeight);
     }
     return self;
 }
@@ -111,7 +123,7 @@ static const VNAnimationMeta kAnimations[] = {
 
 - (void)preferencesDidAppear {
     [self reloadAllValues];
-    [self updateLayoutSizing];
+    [self layoutAllSubviews];
 }
 
 - (void)preferencesDidDisappear {
@@ -158,229 +170,269 @@ static const VNAnimationMeta kAnimations[] = {
 #pragma mark - View Lifecycle
 
 - (void)loadView {
-    NSRect initialFrame = NSMakeRect(0, 0, 360, 520);
-    
-    _scrollView = [[VNPScrollView alloc] initWithFrame:initialFrame];
-    _scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    _scrollView.drawsBackground = NO;
-    _scrollView.hasVerticalScroller = YES;
-    _scrollView.hasHorizontalScroller = NO;
-    _scrollView.autohidesScrollers = YES;
-    
-    _contentView = [[VNPFlippedView alloc] initWithFrame:initialFrame];
+    // Self.view is a clean flipped view, perfectly suited for embedding in System Settings
+    _contentView = [[VNPFlippedView alloc] initWithFrame:NSMakeRect(0, 0, 260, _totalHeight)];
     _contentView.autoresizingMask = NSViewWidthSizable;
     _contentView.wantsLayer = YES;
     
     [self buildUI];
     
-    _scrollView.documentView = _contentView;
-    self.view = _scrollView;
+    self.view = _contentView;
+    self.preferredContentSize = NSMakeSize(260.0, _totalHeight);
     
     [self reloadAllValues];
+    [self layoutAllSubviews];
 }
 
 - (void)viewDidLayout {
     [super viewDidLayout];
-    [self updateLayoutSizing];
-}
-
-- (void)updateLayoutSizing {
-    CGFloat currentW = self.view.bounds.size.width;
-    if (currentW < 240.0) currentW = 360.0;
-    
-    if (_contentView) {
-        NSRect cvFrame = _contentView.frame;
-        if (cvFrame.size.width != currentW || cvFrame.size.height != _totalContentHeight) {
-            _contentView.frame = NSMakeRect(0, 0, currentW, _totalContentHeight);
-        }
-    }
-    
-    if (self.view.enclosingScrollView != nil) {
-        self.preferredContentSize = NSMakeSize(currentW, _totalContentHeight);
-        _scrollView.hasVerticalScroller = NO;
-        _scrollView.hasHorizontalScroller = NO;
-    } else {
-        self.preferredContentSize = NSMakeSize(currentW, _totalContentHeight);
-        _scrollView.hasVerticalScroller = YES;
-        _scrollView.hasHorizontalScroller = NO;
-    }
+    [self layoutAllSubviews];
 }
 
 #pragma mark - UI Building
 
 - (void)buildUI {
-    CGFloat width = 360.0;
-    CGFloat y = 14.0;
-    CGFloat pad = 12.0;
-    CGFloat cardW = width - (pad * 2.0);
+    // --- Section 1: General Settings ---
+    _genHeader = [self createSectionHeader:@"GENERAL"];
+    [_contentView addSubview:_genHeader];
     
-    // --- CARD 1: General Settings ---
-    // Create card directly with real cardW to prevent any initial autoresizing scaling
-    NSView *generalCard = [self createCardViewWithFrame:NSMakeRect(pad, y, cardW, 200)];
-    CGFloat genY = 14.0;
+    _genCard = [self createCardView];
+    [_contentView addSubview:_genCard];
     
-    NSTextField *genHeader = [self createSectionHeader:@"General Settings"];
-    genHeader.frame = NSMakeRect(14, genY, cardW - 28, 20);
-    genHeader.autoresizingMask = NSViewWidthSizable;
-    [generalCard addSubview:genHeader];
-    genY += 26.0;
-    
-    // 1. Enable Switch
+    // Row 1: Enable Vanish
+    _rowEnable = [[VNPFlippedView alloc] init];
+    _enabledTitle = [self createLabel:@"Enable Vanish"];
+    [_rowEnable addSubview:_enabledTitle];
     _enabledSwitch = [self createSwitch];
     _enabledSwitch.target = self;
     _enabledSwitch.action = @selector(enabledToggled:);
-    [generalCard addSubview:[self createSettingRowWithTitle:@"Enable Vanish"
-                                                   subtitle:@"Play window close animations when closing apps."
-                                                    control:_enabledSwitch
-                                                          y:genY
-                                                      width:cardW]];
-    genY += 46.0;
-    [generalCard addSubview:[self createSeparatorAtY:genY width:cardW]];
-    genY += 8.0;
+    [_rowEnable addSubview:_enabledSwitch];
+    [_genCard addSubview:_rowEnable];
     
-    // 2. Shadows Switch
+    _sep1 = [self createSeparator];
+    [_genCard addSubview:_sep1];
+    
+    // Row 2: Window Shadows
+    _rowShadows = [[VNPFlippedView alloc] init];
+    _shadowsTitle = [self createLabel:@"Window Shadows"];
+    [_rowShadows addSubview:_shadowsTitle];
     _shadowsSwitch = [self createSwitch];
     _shadowsSwitch.target = self;
     _shadowsSwitch.action = @selector(shadowsToggled:);
-    [generalCard addSubview:[self createSettingRowWithTitle:@"Window Shadows"
-                                                   subtitle:@"Include drop shadows during animations."
-                                                    control:_shadowsSwitch
-                                                          y:genY
-                                                      width:cardW]];
-    genY += 46.0;
-    [generalCard addSubview:[self createSeparatorAtY:genY width:cardW]];
-    genY += 8.0;
+    [_rowShadows addSubview:_shadowsSwitch];
+    [_genCard addSubview:_rowShadows];
     
-    // 3. Target App Field
-    _targetAppField = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 110, 22)];
+    _sep2 = [self createSeparator];
+    [_genCard addSubview:_sep2];
+    
+    // Row 3: Target Application
+    _rowTarget = [[VNPFlippedView alloc] init];
+    _targetTitle = [self createLabel:@"Target Application"];
+    [_rowTarget addSubview:_targetTitle];
+    _targetAppField = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 80, 20)];
     _targetAppField.placeholderString = @"all";
-    _targetAppField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    _targetAppField.font = [NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightRegular];
+    _targetAppField.controlSize = NSControlSizeSmall;
     _targetAppField.delegate = self;
-    [generalCard addSubview:[self createSettingRowWithTitle:@"Target Application"
-                                                   subtitle:@"'all' or specific app name (e.g. Mail, Slack)."
-                                                    control:_targetAppField
-                                                          y:genY
-                                                      width:cardW]];
-    genY += 46.0;
+    [_rowTarget addSubview:_targetAppField];
+    [_genCard addSubview:_rowTarget];
     
-    // Finalize card 1 frame (width remains cardW, only height finalized)
-    generalCard.frame = NSMakeRect(pad, y, cardW, genY + 10.0);
-    [_contentView addSubview:generalCard];
+    // --- Section 2: Animation & Timing ---
+    _animHeader = [self createSectionHeader:@"ANIMATION & TIMING"];
+    [_contentView addSubview:_animHeader];
     
-    y += generalCard.frame.size.height + 16.0;
+    _animCard = [self createCardView];
+    [_contentView addSubview:_animCard];
     
-    // --- CARD 2: Animation & Timing ---
-    NSView *animCard = [self createCardViewWithFrame:NSMakeRect(pad, y, cardW, 250)];
-    CGFloat animY = 14.0;
-    
-    NSTextField *animHeader = [self createSectionHeader:@"Animation & Timing"];
-    animHeader.frame = NSMakeRect(14, animY, cardW - 28, 20);
-    animHeader.autoresizingMask = NSViewWidthSizable;
-    [animCard addSubview:animHeader];
-    animY += 26.0;
-    
-    // 1. Active Animation PopUp Button
-    _animPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 130, 26) pullsDown:NO];
-    _animPopUp.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    // Row 1: Active Animation
+    _rowAnim = [[VNPFlippedView alloc] init];
+    _animTitle = [self createLabel:@"Active Animation"];
+    [_rowAnim addSubview:_animTitle];
+    _animPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 110, 22) pullsDown:NO];
+    _animPopUp.controlSize = NSControlSizeSmall;
+    _animPopUp.font = [NSFont systemFontOfSize:11];
     for (size_t i = 0; i < kAnimationCount; i++) {
         [_animPopUp addItemWithTitle:[NSString stringWithUTF8String:kAnimations[i].name]];
         _animPopUp.lastItem.representedObject = [NSString stringWithUTF8String:kAnimations[i].key];
     }
     _animPopUp.target = self;
     _animPopUp.action = @selector(animationSelected:);
-    [animCard addSubview:[self createSettingRowWithTitle:@"Active Animation"
-                                                subtitle:@"Animation style to play on window close."
-                                                 control:_animPopUp
-                                                       y:animY
-                                                   width:cardW]];
-    animY += 46.0;
-    [animCard addSubview:[self createSeparatorAtY:animY width:cardW]];
-    animY += 8.0;
+    [_rowAnim addSubview:_animPopUp];
+    [_animCard addSubview:_rowAnim];
     
-    // 2. Single Animation Duration Slider (controls duration for the selected active animation)
-    _durationSlider = [self createSliderWithMin:0.05 max:2.00 defaultVal:0.25];
-    _durationSlider.target = self;
-    _durationSlider.action = @selector(durationSliderChanged:);
+    _sep3 = [self createSeparator];
+    [_animCard addSubview:_sep3];
+    
+    // Row 2: Single Animation Duration Slider
+    _rowDuration = [[VNPFlippedView alloc] init];
+    _durationTitle = [self createLabel:@"Animation Duration"];
+    [_rowDuration addSubview:_durationTitle];
+    
     _durationLabel = [self createBadgeLabel:@"0.25s"];
-    
-    _durationSubtitle = [NSTextField labelWithString:@""];
-    _durationSubtitle.font = [NSFont systemFontOfSize:11];
-    _durationSubtitle.textColor = [NSColor secondaryLabelColor];
+    [_rowDuration addSubview:_durationLabel];
     
     _resetDurationBtn = [NSButton buttonWithTitle:@"Reset" target:self action:@selector(resetDurationClicked:)];
     _resetDurationBtn.bezelStyle = NSBezelStyleInline;
-    _resetDurationBtn.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
+    _resetDurationBtn.font = [NSFont systemFontOfSize:9.5 weight:NSFontWeightMedium];
+    [_rowDuration addSubview:_resetDurationBtn];
     
-    [animCard addSubview:[self createDurationSliderRowWithTitle:@"Animation Duration"
-                                                  subtitleLabel:_durationSubtitle
-                                                         slider:_durationSlider
-                                                     valueLabel:_durationLabel
-                                                    resetButton:_resetDurationBtn
-                                                              y:animY
-                                                          width:cardW]];
-    animY += 62.0;
-    [animCard addSubview:[self createSeparatorAtY:animY width:cardW]];
-    animY += 8.0;
+    _durationSubtitle = [self createSubtitle:@"Duration for active animation"];
+    [_rowDuration addSubview:_durationSubtitle];
     
-    // 3. Refresh Rate Slider
+    _durationSlider = [self createSliderWithMin:0.05 max:2.00 defaultVal:0.25];
+    _durationSlider.target = self;
+    _durationSlider.action = @selector(durationSliderChanged:);
+    [_rowDuration addSubview:_durationSlider];
+    [_animCard addSubview:_rowDuration];
+    
+    _sep4 = [self createSeparator];
+    [_animCard addSubview:_sep4];
+    
+    // Row 3: Refresh Rate Slider
+    _rowRefresh = [[VNPFlippedView alloc] init];
+    _refreshTitle = [self createLabel:@"Refresh Rate"];
+    [_rowRefresh addSubview:_refreshTitle];
+    
+    _refreshRateLabel = [self createBadgeLabel:@"120 Hz"];
+    [_rowRefresh addSubview:_refreshRateLabel];
+    
+    _refreshSubtitle = [self createSubtitle:@"Animation FPS (0 follows ProMotion)"];
+    [_rowRefresh addSubview:_refreshSubtitle];
+    
     _refreshRateSlider = [self createSliderWithMin:0.0 max:144.0 defaultVal:120.0];
     _refreshRateSlider.target = self;
     _refreshRateSlider.action = @selector(refreshRateChanged:);
-    _refreshRateLabel = [self createBadgeLabel:@"120 Hz"];
-    [animCard addSubview:[self createSliderRowWithTitle:@"Refresh Rate"
-                                               subtitle:@"Animation FPS (0 follows display ProMotion rate)."
-                                                 slider:_refreshRateSlider
-                                             valueLabel:_refreshRateLabel
-                                                      y:animY
-                                                  width:cardW]];
-    animY += 62.0;
+    [_rowRefresh addSubview:_refreshRateSlider];
+    [_animCard addSubview:_rowRefresh];
+}
+
+#pragma mark - Explicit Dynamic Layout
+
+- (void)layoutAllSubviews {
+    CGFloat w = self.view.bounds.size.width;
+    if (w < 120.0) return;
     
-    // Finalize card 2 frame
-    animCard.frame = NSMakeRect(pad, y, cardW, animY + 10.0);
-    [_contentView addSubview:animCard];
+    CGFloat y = 4.0;
     
-    y += animCard.frame.size.height + 20.0;
-    _totalContentHeight = y;
-    _contentView.frame = NSMakeRect(0, 0, width, _totalContentHeight);
+    // Section 1: General
+    _genHeader.frame = NSMakeRect(8, y, w - 16, 14);
+    y += 18.0;
+    
+    _genCard.frame = NSMakeRect(0, y, w, 110.0);
+    
+    // Switch sizing (fitting size or minimum 42x22)
+    CGSize swFit = [_enabledSwitch fittingSize];
+    CGFloat swW = MAX(swFit.width, 42.0);
+    CGFloat swH = MAX(swFit.height, 22.0);
+    
+    // Row 1: Enable
+    _rowEnable.frame = NSMakeRect(0, 0, w, 36.0);
+    _enabledSwitch.frame = NSMakeRect(w - 12 - swW, (36.0 - swH) / 2.0, swW, swH);
+    _enabledTitle.frame = NSMakeRect(12, (36.0 - 16.0) / 2.0, w - 24 - swW - 8, 16);
+    _sep1.frame = NSMakeRect(12, 36, w - 24, 1);
+    
+    // Row 2: Shadows
+    _rowShadows.frame = NSMakeRect(0, 37, w, 36.0);
+    _shadowsSwitch.frame = NSMakeRect(w - 12 - swW, (36.0 - swH) / 2.0, swW, swH);
+    _shadowsTitle.frame = NSMakeRect(12, (36.0 - 16.0) / 2.0, w - 24 - swW - 8, 16);
+    _sep2.frame = NSMakeRect(12, 73, w - 24, 1);
+    
+    // Row 3: Target App
+    _rowTarget.frame = NSMakeRect(0, 74, w, 36.0);
+    CGFloat tfW = 75.0;
+    _targetAppField.frame = NSMakeRect(w - 12 - tfW, (36.0 - 20.0) / 2.0, tfW, 20);
+    _targetTitle.frame = NSMakeRect(12, (36.0 - 16.0) / 2.0, w - 24 - tfW - 8, 16);
+    
+    y += 110.0 + 14.0;
+    
+    // Section 2: Animation & Timing
+    _animHeader.frame = NSMakeRect(8, y, w - 16, 14);
+    y += 18.0;
+    
+    _animCard.frame = NSMakeRect(0, y, w, 142.0);
+    // Row 1: Active Animation
+    _rowAnim.frame = NSMakeRect(0, 0, w, 36.0);
+    CGFloat popW = 104.0;
+    _animPopUp.frame = NSMakeRect(w - 12 - popW, (36.0 - 22.0) / 2.0, popW, 22);
+    _animTitle.frame = NSMakeRect(12, (36.0 - 16.0) / 2.0, w - 24 - popW - 8, 16);
+    _sep3.frame = NSMakeRect(12, 36, w - 24, 1);
+    
+    // Row 2: Single Duration Slider
+    _rowDuration.frame = NSMakeRect(0, 37, w, 52.0);
+    CGFloat durLabelW = 42.0;
+    CGSize rsz = [_resetDurationBtn fittingSize];
+    CGFloat resetW = MAX(rsz.width + 6, 40.0);
+    _durationLabel.frame = NSMakeRect(w - 12 - durLabelW, 5, durLabelW, 15);
+    _resetDurationBtn.frame = NSMakeRect(w - 12 - durLabelW - 4 - resetW, 4, resetW, 18);
+    _durationTitle.frame = NSMakeRect(12, 5, w - 24 - durLabelW - 4 - resetW - 6, 15);
+    _durationSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
+    _durationSlider.frame = NSMakeRect(12, 33, w - 24, 15);
+    _sep4.frame = NSMakeRect(12, 89, w - 24, 1);
+    
+    // Row 3: Refresh Rate Slider
+    _rowRefresh.frame = NSMakeRect(0, 90, w, 52.0);
+    CGFloat rrLabelW = 48.0;
+    _refreshRateLabel.frame = NSMakeRect(w - 12 - rrLabelW, 5, rrLabelW, 15);
+    _refreshTitle.frame = NSMakeRect(12, 5, w - 24 - rrLabelW - 6, 15);
+    _refreshSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
+    _refreshRateSlider.frame = NSMakeRect(12, 33, w - 24, 15);
+    
+    y += 142.0 + 8.0;
+    _totalHeight = y;
+    self.preferredContentSize = NSMakeSize(w, _totalHeight);
 }
 
 #pragma mark - UI Factory Helpers
 
-- (NSView *)createCardViewWithFrame:(NSRect)frame {
-    VNPFlippedView *card = [[VNPFlippedView alloc] initWithFrame:frame];
+- (VNPFlippedView *)createCardView {
+    VNPFlippedView *card = [[VNPFlippedView alloc] init];
     card.wantsLayer = YES;
-    card.layer.cornerRadius = 10.0;
+    card.layer.cornerRadius = 8.0;
     if (@available(macOS 10.15, *)) {
         card.layer.cornerCurve = @"continuous";
     }
-    card.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.08].CGColor;
+    card.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.07].CGColor;
     card.layer.borderColor = [NSColor separatorColor].CGColor;
     card.layer.borderWidth = 0.5;
-    card.autoresizingMask = NSViewWidthSizable;
     return card;
 }
 
 - (NSTextField *)createSectionHeader:(NSString *)title {
     NSTextField *tf = [NSTextField labelWithString:title];
-    tf.font = [NSFont systemFontOfSize:14 weight:NSFontWeightBold];
+    tf.font = [NSFont systemFontOfSize:10 weight:NSFontWeightBold];
+    tf.textColor = [NSColor secondaryLabelColor];
+    return tf;
+}
+
+- (NSTextField *)createLabel:(NSString *)text {
+    NSTextField *tf = [NSTextField labelWithString:text];
+    tf.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     tf.textColor = [NSColor labelColor];
     return tf;
 }
 
-- (NSView *)createSeparatorAtY:(CGFloat)y width:(CGFloat)w {
-    NSBox *sep = [[NSBox alloc] initWithFrame:NSMakeRect(14, y, w - 28, 1)];
+- (NSTextField *)createSubtitle:(NSString *)text {
+    NSTextField *tf = [NSTextField labelWithString:text];
+    tf.font = [NSFont systemFontOfSize:9.5 weight:NSFontWeightRegular];
+    tf.textColor = [NSColor secondaryLabelColor];
+    return tf;
+}
+
+- (NSBox *)createSeparator {
+    NSBox *sep = [[NSBox alloc] init];
     sep.boxType = NSBoxSeparator;
-    sep.autoresizingMask = NSViewWidthSizable;
     return sep;
 }
 
 - (NSSwitch *)createSwitch {
-    NSSwitch *sw = [[NSSwitch alloc] initWithFrame:NSMakeRect(0, 0, 42, 22)];
+    NSSwitch *sw = [[NSSwitch alloc] initWithFrame:NSMakeRect(0, 0, 40, 22)];
+    sw.controlSize = NSControlSizeSmall;
     return sw;
 }
 
 - (NSSlider *)createSliderWithMin:(double)min max:(double)max defaultVal:(double)def {
-    NSSlider *sl = [[NSSlider alloc] initWithFrame:NSMakeRect(0, 0, 140, 20)];
+    NSSlider *sl = [[NSSlider alloc] initWithFrame:NSMakeRect(0, 0, 140, 15)];
+    sl.controlSize = NSControlSizeSmall;
     sl.minValue = min;
     sl.maxValue = max;
     sl.doubleValue = def;
@@ -390,111 +442,10 @@ static const VNAnimationMeta kAnimations[] = {
 
 - (NSTextField *)createBadgeLabel:(NSString *)text {
     NSTextField *tf = [NSTextField labelWithString:text];
-    tf.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightSemibold];
+    tf.font = [NSFont monospacedDigitSystemFontOfSize:10.5 weight:NSFontWeightSemibold];
     tf.textColor = [NSColor labelColor];
     tf.alignment = NSTextAlignmentRight;
     return tf;
-}
-
-- (NSView *)createSettingRowWithTitle:(NSString *)title subtitle:(NSString *)subtitle control:(NSView *)control y:(CGFloat)y width:(CGFloat)w {
-    VNPFlippedView *row = [[VNPFlippedView alloc] initWithFrame:NSMakeRect(0, y, w, 46)];
-    row.autoresizingMask = NSViewWidthSizable;
-    
-    CGFloat cW = control.frame.size.width;
-    CGFloat cH = control.frame.size.height;
-    
-    NSTextField *titleLbl = [NSTextField labelWithString:title];
-    titleLbl.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-    titleLbl.textColor = [NSColor labelColor];
-    titleLbl.frame = NSMakeRect(14, 5, w - 28 - cW - 10, 18);
-    titleLbl.autoresizingMask = NSViewWidthSizable;
-    [row addSubview:titleLbl];
-    
-    if (subtitle && subtitle.length > 0) {
-        NSTextField *subLbl = [NSTextField labelWithString:subtitle];
-        subLbl.font = [NSFont systemFontOfSize:11];
-        subLbl.textColor = [NSColor secondaryLabelColor];
-        subLbl.frame = NSMakeRect(14, 24, w - 28 - cW - 10, 14);
-        subLbl.autoresizingMask = NSViewWidthSizable;
-        [row addSubview:subLbl];
-    }
-    
-    control.frame = NSMakeRect(w - 14 - cW, (46 - cH) / 2.0, cW, cH);
-    control.autoresizingMask = NSViewMinXMargin;
-    [row addSubview:control];
-    
-    return row;
-}
-
-- (NSView *)createDurationSliderRowWithTitle:(NSString *)title
-                               subtitleLabel:(NSTextField *)subLbl
-                                      slider:(NSSlider *)slider
-                                  valueLabel:(NSTextField *)valueLabel
-                                 resetButton:(NSButton *)resetBtn
-                                           y:(CGFloat)y
-                                       width:(CGFloat)w {
-    VNPFlippedView *row = [[VNPFlippedView alloc] initWithFrame:NSMakeRect(0, y, w, 62)];
-    row.autoresizingMask = NSViewWidthSizable;
-    
-    CGFloat rightItemsWidth = 56 + 6 + 50; // badge + spacing + reset button
-    
-    NSTextField *titleLbl = [NSTextField labelWithString:title];
-    titleLbl.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-    titleLbl.textColor = [NSColor labelColor];
-    titleLbl.frame = NSMakeRect(14, 4, w - 28 - rightItemsWidth, 18);
-    titleLbl.autoresizingMask = NSViewWidthSizable;
-    [row addSubview:titleLbl];
-    
-    resetBtn.frame = NSMakeRect(w - 14 - 48, 3, 48, 20);
-    resetBtn.autoresizingMask = NSViewMinXMargin;
-    [row addSubview:resetBtn];
-    
-    valueLabel.frame = NSMakeRect(w - 14 - 48 - 6 - 54, 4, 54, 18);
-    valueLabel.autoresizingMask = NSViewMinXMargin;
-    [row addSubview:valueLabel];
-    
-    if (subLbl) {
-        subLbl.frame = NSMakeRect(14, 22, w - 28, 14);
-        subLbl.autoresizingMask = NSViewWidthSizable;
-        [row addSubview:subLbl];
-    }
-    
-    slider.frame = NSMakeRect(14, 40, w - 28, 18);
-    slider.autoresizingMask = NSViewWidthSizable;
-    [row addSubview:slider];
-    
-    return row;
-}
-
-- (NSView *)createSliderRowWithTitle:(NSString *)title subtitle:(NSString *)subtitle slider:(NSSlider *)slider valueLabel:(NSTextField *)valueLabel y:(CGFloat)y width:(CGFloat)w {
-    VNPFlippedView *row = [[VNPFlippedView alloc] initWithFrame:NSMakeRect(0, y, w, 62)];
-    row.autoresizingMask = NSViewWidthSizable;
-    
-    NSTextField *titleLbl = [NSTextField labelWithString:title];
-    titleLbl.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-    titleLbl.textColor = [NSColor labelColor];
-    titleLbl.frame = NSMakeRect(14, 4, w - 28 - 60, 18);
-    titleLbl.autoresizingMask = NSViewWidthSizable;
-    [row addSubview:titleLbl];
-    
-    valueLabel.frame = NSMakeRect(w - 14 - 56, 4, 56, 18);
-    valueLabel.autoresizingMask = NSViewMinXMargin;
-    [row addSubview:valueLabel];
-    
-    if (subtitle && subtitle.length > 0) {
-        NSTextField *subLbl = [NSTextField labelWithString:subtitle];
-        subLbl.font = [NSFont systemFontOfSize:11];
-        subLbl.textColor = [NSColor secondaryLabelColor];
-        subLbl.frame = NSMakeRect(14, 22, w - 28, 14);
-        subLbl.autoresizingMask = NSViewWidthSizable;
-        [row addSubview:subLbl];
-    }
-    
-    slider.frame = NSMakeRect(14, 40, w - 28, 18);
-    slider.autoresizingMask = NSViewWidthSizable;
-    [row addSubview:slider];
-    
-    return row;
 }
 
 #pragma mark - Reload Data
@@ -523,7 +474,7 @@ static const VNAnimationMeta kAnimations[] = {
     _durationSlider.doubleValue = dur;
     _durationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", dur];
     if (_durationSubtitle) {
-        _durationSubtitle.stringValue = [NSString stringWithFormat:@"Duration for %s animation (default: %.2fs).", meta->name, meta->defaultDuration];
+        _durationSubtitle.stringValue = [NSString stringWithFormat:@"Duration for %s (default: %.2fs)", meta->name, meta->defaultDuration];
     }
 }
 
