@@ -77,16 +77,16 @@ static const VNAnimationMeta kAnimations[] = {
     // General Controls
     NSSwitch *_enabledSwitch;
     NSSwitch *_shadowsSwitch;
-    NSPopUpButton *_animPopUp;
     NSTextField *_targetAppField;
+    
+    // Animation & Timing Controls
+    NSPopUpButton *_animPopUp;
+    NSSlider *_durationSlider;
+    NSTextField *_durationLabel;
+    NSTextField *_durationSubtitle;
+    NSButton *_resetDurationBtn;
     NSSlider *_refreshRateSlider;
     NSTextField *_refreshRateLabel;
-    NSSlider *_globalDurationSlider;
-    NSTextField *_globalDurationLabel;
-    
-    // Per-Animation Duration Controls
-    NSSlider *_animSliders[kAnimationCount];
-    NSTextField *_animLabels[kAnimationCount];
     
     CGFloat _totalContentHeight;
 }
@@ -115,7 +115,6 @@ static const VNAnimationMeta kAnimations[] = {
 }
 
 - (void)preferencesDidDisappear {
-    // Commit any in-flight text edits
     if (_targetAppField && self.view.window) {
         [self.view.window makeFirstResponder:nil];
     }
@@ -151,7 +150,6 @@ static const VNAnimationMeta kAnimations[] = {
                              (__bridge CFPropertyListRef)value,
                              (__bridge CFStringRef)_preferencesDomain);
     
-    // Explicitly post Darwin notification so hooked processes reload immediately
     NSString *notif = [NSString stringWithFormat:@"%@/prefsChanged", _preferencesDomain];
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          (__bridge CFStringRef)notif, NULL, NULL, true);
@@ -160,7 +158,7 @@ static const VNAnimationMeta kAnimations[] = {
 #pragma mark - View Lifecycle
 
 - (void)loadView {
-    NSRect initialFrame = NSMakeRect(0, 0, 340, 700);
+    NSRect initialFrame = NSMakeRect(0, 0, 360, 520);
     
     _scrollView = [[VNPScrollView alloc] initWithFrame:initialFrame];
     _scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -188,7 +186,7 @@ static const VNAnimationMeta kAnimations[] = {
 
 - (void)updateLayoutSizing {
     CGFloat currentW = self.view.bounds.size.width;
-    if (currentW < 240.0) currentW = 340.0;
+    if (currentW < 240.0) currentW = 360.0;
     
     if (_contentView) {
         NSRect cvFrame = _contentView.frame;
@@ -198,13 +196,11 @@ static const VNAnimationMeta kAnimations[] = {
     }
     
     if (self.view.enclosingScrollView != nil) {
-        // Hosted inside an outer scroll view (e.g. System Settings TweaksPrefPane)
         self.preferredContentSize = NSMakeSize(currentW, _totalContentHeight);
         _scrollView.hasVerticalScroller = NO;
         _scrollView.hasHorizontalScroller = NO;
     } else {
-        // Hosted in a standalone representable (e.g. TweakInjectApp)
-        self.preferredContentSize = NSMakeSize(currentW, 600);
+        self.preferredContentSize = NSMakeSize(currentW, _totalContentHeight);
         _scrollView.hasVerticalScroller = YES;
         _scrollView.hasHorizontalScroller = NO;
     }
@@ -213,16 +209,16 @@ static const VNAnimationMeta kAnimations[] = {
 #pragma mark - UI Building
 
 - (void)buildUI {
-    CGFloat width = 340.0;
+    CGFloat width = 360.0;
     CGFloat y = 14.0;
     CGFloat pad = 12.0;
     CGFloat cardW = width - (pad * 2.0);
     
-    // --- SECTION 1: General Settings Card ---
-    NSView *generalCard = [self createCardView];
+    // --- CARD 1: General Settings ---
+    // Create card directly with real cardW to prevent any initial autoresizing scaling
+    NSView *generalCard = [self createCardViewWithFrame:NSMakeRect(pad, y, cardW, 200)];
     CGFloat genY = 14.0;
     
-    // Title
     NSTextField *genHeader = [self createSectionHeader:@"General Settings"];
     genHeader.frame = NSMakeRect(14, genY, cardW - 28, 20);
     genHeader.autoresizingMask = NSViewWidthSizable;
@@ -255,26 +251,8 @@ static const VNAnimationMeta kAnimations[] = {
     [generalCard addSubview:[self createSeparatorAtY:genY width:cardW]];
     genY += 8.0;
     
-    // 3. Active Animation PopUp
-    _animPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 120, 26) pullsDown:NO];
-    _animPopUp.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
-    for (size_t i = 0; i < kAnimationCount; i++) {
-        [_animPopUp addItemWithTitle:[NSString stringWithUTF8String:kAnimations[i].name]];
-        _animPopUp.lastItem.representedObject = [NSString stringWithUTF8String:kAnimations[i].key];
-    }
-    _animPopUp.target = self;
-    _animPopUp.action = @selector(animationSelected:);
-    [generalCard addSubview:[self createSettingRowWithTitle:@"Active Animation"
-                                                   subtitle:@"Animation style to play on window close."
-                                                    control:_animPopUp
-                                                          y:genY
-                                                      width:cardW]];
-    genY += 46.0;
-    [generalCard addSubview:[self createSeparatorAtY:genY width:cardW]];
-    genY += 8.0;
-    
-    // 4. Target App Field
-    _targetAppField = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 100, 22)];
+    // 3. Target App Field
+    _targetAppField = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 110, 22)];
     _targetAppField.placeholderString = @"all";
     _targetAppField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     _targetAppField.delegate = self;
@@ -284,109 +262,92 @@ static const VNAnimationMeta kAnimations[] = {
                                                           y:genY
                                                       width:cardW]];
     genY += 46.0;
-    [generalCard addSubview:[self createSeparatorAtY:genY width:cardW]];
-    genY += 8.0;
     
-    // 5. Refresh Rate Slider (vertical stack)
-    _refreshRateSlider = [self createSliderWithMin:0.0 max:144.0 defaultVal:120.0];
-    _refreshRateSlider.target = self;
-    _refreshRateSlider.action = @selector(refreshRateChanged:);
-    _refreshRateLabel = [self createBadgeLabel:@"120 Hz"];
-    [generalCard addSubview:[self createSliderRowWithTitle:@"Refresh Rate"
-                                                  subtitle:@"Animation FPS (0 follows display ProMotion rate)."
-                                                    slider:_refreshRateSlider
-                                                valueLabel:_refreshRateLabel
-                                                         y:genY
-                                                     width:cardW]];
-    genY += 60.0;
-    [generalCard addSubview:[self createSeparatorAtY:genY width:cardW]];
-    genY += 8.0;
-    
-    // 6. Global Fallback Duration Slider (vertical stack)
-    _globalDurationSlider = [self createSliderWithMin:0.05 max:2.0 defaultVal:0.25];
-    _globalDurationSlider.target = self;
-    _globalDurationSlider.action = @selector(globalDurationChanged:);
-    _globalDurationLabel = [self createBadgeLabel:@"0.25s"];
-    [generalCard addSubview:[self createSliderRowWithTitle:@"Default Duration"
-                                                  subtitle:@"Fallback duration when no custom duration is set."
-                                                    slider:_globalDurationSlider
-                                                valueLabel:_globalDurationLabel
-                                                         y:genY
-                                                     width:cardW]];
-    genY += 62.0;
-    
-    generalCard.frame = NSMakeRect(pad, y, cardW, genY + 6.0);
-    generalCard.autoresizingMask = NSViewWidthSizable;
+    // Finalize card 1 frame (width remains cardW, only height finalized)
+    generalCard.frame = NSMakeRect(pad, y, cardW, genY + 10.0);
     [_contentView addSubview:generalCard];
     
     y += generalCard.frame.size.height + 16.0;
     
-    // --- SECTION 2: Per-Animation Durations Card ---
-    NSView *durationsCard = [self createCardView];
-    CGFloat durY = 14.0;
+    // --- CARD 2: Animation & Timing ---
+    NSView *animCard = [self createCardViewWithFrame:NSMakeRect(pad, y, cardW, 250)];
+    CGFloat animY = 14.0;
     
-    // Section Header & Reset All Button
-    NSTextField *durHeader = [self createSectionHeader:@"Per-Animation Durations"];
-    durHeader.frame = NSMakeRect(14, durY, cardW - 28 - 84, 20);
-    durHeader.autoresizingMask = NSViewWidthSizable;
-    [durationsCard addSubview:durHeader];
+    NSTextField *animHeader = [self createSectionHeader:@"Animation & Timing"];
+    animHeader.frame = NSMakeRect(14, animY, cardW - 28, 20);
+    animHeader.autoresizingMask = NSViewWidthSizable;
+    [animCard addSubview:animHeader];
+    animY += 26.0;
     
-    NSButton *resetAllBtn = [NSButton buttonWithTitle:@"Reset All" target:self action:@selector(resetAllDurationsClicked:)];
-    resetAllBtn.bezelStyle = NSBezelStyleInline;
-    resetAllBtn.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
-    resetAllBtn.frame = NSMakeRect(cardW - 14 - 76, durY - 2, 76, 22);
-    resetAllBtn.autoresizingMask = NSViewMinXMargin;
-    [durationsCard addSubview:resetAllBtn];
-    durY += 24.0;
-    
-    NSTextField *durDesc = [NSTextField wrappingLabelWithString:@"Fine-tune duration individually for each close animation (0.05s to 2.00s)."];
-    durDesc.font = [NSFont systemFontOfSize:11];
-    durDesc.textColor = [NSColor secondaryLabelColor];
-    durDesc.frame = NSMakeRect(14, durY, cardW - 28, 28);
-    durDesc.autoresizingMask = NSViewWidthSizable;
-    [durationsCard addSubview:durDesc];
-    durY += 34.0;
-    
-    // 16 Sliders (vertical stack)
+    // 1. Active Animation PopUp Button
+    _animPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 130, 26) pullsDown:NO];
+    _animPopUp.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
     for (size_t i = 0; i < kAnimationCount; i++) {
-        [durationsCard addSubview:[self createSeparatorAtY:durY width:cardW]];
-        durY += 8.0;
-        
-        NSSlider *sl = [self createSliderWithMin:0.05 max:2.00 defaultVal:kAnimations[i].defaultDuration];
-        sl.tag = (NSInteger)i;
-        sl.target = self;
-        sl.action = @selector(animDurationSliderChanged:);
-        _animSliders[i] = sl;
-        
-        NSTextField *lbl = [self createBadgeLabel:[NSString stringWithFormat:@"%.2fs", kAnimations[i].defaultDuration]];
-        _animLabels[i] = lbl;
-        
-        NSString *title = [NSString stringWithUTF8String:kAnimations[i].name];
-        NSString *subtitle = [NSString stringWithUTF8String:kAnimations[i].desc];
-        
-        NSView *row = [self createSliderRowWithTitle:title
-                                            subtitle:subtitle
-                                              slider:sl
-                                          valueLabel:lbl
-                                                   y:durY
-                                               width:cardW];
-        [durationsCard addSubview:row];
-        durY += 60.0;
+        [_animPopUp addItemWithTitle:[NSString stringWithUTF8String:kAnimations[i].name]];
+        _animPopUp.lastItem.representedObject = [NSString stringWithUTF8String:kAnimations[i].key];
     }
+    _animPopUp.target = self;
+    _animPopUp.action = @selector(animationSelected:);
+    [animCard addSubview:[self createSettingRowWithTitle:@"Active Animation"
+                                                subtitle:@"Animation style to play on window close."
+                                                 control:_animPopUp
+                                                       y:animY
+                                                   width:cardW]];
+    animY += 46.0;
+    [animCard addSubview:[self createSeparatorAtY:animY width:cardW]];
+    animY += 8.0;
     
-    durationsCard.frame = NSMakeRect(pad, y, cardW, durY + 8.0);
-    durationsCard.autoresizingMask = NSViewWidthSizable;
-    [_contentView addSubview:durationsCard];
+    // 2. Single Animation Duration Slider (controls duration for the selected active animation)
+    _durationSlider = [self createSliderWithMin:0.05 max:2.00 defaultVal:0.25];
+    _durationSlider.target = self;
+    _durationSlider.action = @selector(durationSliderChanged:);
+    _durationLabel = [self createBadgeLabel:@"0.25s"];
     
-    y += durationsCard.frame.size.height + 20.0;
+    _durationSubtitle = [NSTextField labelWithString:@""];
+    _durationSubtitle.font = [NSFont systemFontOfSize:11];
+    _durationSubtitle.textColor = [NSColor secondaryLabelColor];
+    
+    _resetDurationBtn = [NSButton buttonWithTitle:@"Reset" target:self action:@selector(resetDurationClicked:)];
+    _resetDurationBtn.bezelStyle = NSBezelStyleInline;
+    _resetDurationBtn.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
+    
+    [animCard addSubview:[self createDurationSliderRowWithTitle:@"Animation Duration"
+                                                  subtitleLabel:_durationSubtitle
+                                                         slider:_durationSlider
+                                                     valueLabel:_durationLabel
+                                                    resetButton:_resetDurationBtn
+                                                              y:animY
+                                                          width:cardW]];
+    animY += 62.0;
+    [animCard addSubview:[self createSeparatorAtY:animY width:cardW]];
+    animY += 8.0;
+    
+    // 3. Refresh Rate Slider
+    _refreshRateSlider = [self createSliderWithMin:0.0 max:144.0 defaultVal:120.0];
+    _refreshRateSlider.target = self;
+    _refreshRateSlider.action = @selector(refreshRateChanged:);
+    _refreshRateLabel = [self createBadgeLabel:@"120 Hz"];
+    [animCard addSubview:[self createSliderRowWithTitle:@"Refresh Rate"
+                                               subtitle:@"Animation FPS (0 follows display ProMotion rate)."
+                                                 slider:_refreshRateSlider
+                                             valueLabel:_refreshRateLabel
+                                                      y:animY
+                                                  width:cardW]];
+    animY += 62.0;
+    
+    // Finalize card 2 frame
+    animCard.frame = NSMakeRect(pad, y, cardW, animY + 10.0);
+    [_contentView addSubview:animCard];
+    
+    y += animCard.frame.size.height + 20.0;
     _totalContentHeight = y;
     _contentView.frame = NSMakeRect(0, 0, width, _totalContentHeight);
 }
 
 #pragma mark - UI Factory Helpers
 
-- (NSView *)createCardView {
-    VNPFlippedView *card = [[VNPFlippedView alloc] init];
+- (NSView *)createCardViewWithFrame:(NSRect)frame {
+    VNPFlippedView *card = [[VNPFlippedView alloc] initWithFrame:frame];
     card.wantsLayer = YES;
     card.layer.cornerRadius = 10.0;
     if (@available(macOS 10.15, *)) {
@@ -395,6 +356,7 @@ static const VNAnimationMeta kAnimations[] = {
     card.layer.backgroundColor = [NSColor colorWithWhite:0.5 alpha:0.08].CGColor;
     card.layer.borderColor = [NSColor separatorColor].CGColor;
     card.layer.borderWidth = 0.5;
+    card.autoresizingMask = NSViewWidthSizable;
     return card;
 }
 
@@ -464,8 +426,48 @@ static const VNAnimationMeta kAnimations[] = {
     return row;
 }
 
+- (NSView *)createDurationSliderRowWithTitle:(NSString *)title
+                               subtitleLabel:(NSTextField *)subLbl
+                                      slider:(NSSlider *)slider
+                                  valueLabel:(NSTextField *)valueLabel
+                                 resetButton:(NSButton *)resetBtn
+                                           y:(CGFloat)y
+                                       width:(CGFloat)w {
+    VNPFlippedView *row = [[VNPFlippedView alloc] initWithFrame:NSMakeRect(0, y, w, 62)];
+    row.autoresizingMask = NSViewWidthSizable;
+    
+    CGFloat rightItemsWidth = 56 + 6 + 50; // badge + spacing + reset button
+    
+    NSTextField *titleLbl = [NSTextField labelWithString:title];
+    titleLbl.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    titleLbl.textColor = [NSColor labelColor];
+    titleLbl.frame = NSMakeRect(14, 4, w - 28 - rightItemsWidth, 18);
+    titleLbl.autoresizingMask = NSViewWidthSizable;
+    [row addSubview:titleLbl];
+    
+    resetBtn.frame = NSMakeRect(w - 14 - 48, 3, 48, 20);
+    resetBtn.autoresizingMask = NSViewMinXMargin;
+    [row addSubview:resetBtn];
+    
+    valueLabel.frame = NSMakeRect(w - 14 - 48 - 6 - 54, 4, 54, 18);
+    valueLabel.autoresizingMask = NSViewMinXMargin;
+    [row addSubview:valueLabel];
+    
+    if (subLbl) {
+        subLbl.frame = NSMakeRect(14, 22, w - 28, 14);
+        subLbl.autoresizingMask = NSViewWidthSizable;
+        [row addSubview:subLbl];
+    }
+    
+    slider.frame = NSMakeRect(14, 40, w - 28, 18);
+    slider.autoresizingMask = NSViewWidthSizable;
+    [row addSubview:slider];
+    
+    return row;
+}
+
 - (NSView *)createSliderRowWithTitle:(NSString *)title subtitle:(NSString *)subtitle slider:(NSSlider *)slider valueLabel:(NSTextField *)valueLabel y:(CGFloat)y width:(CGFloat)w {
-    VNPFlippedView *row = [[VNPFlippedView alloc] initWithFrame:NSMakeRect(0, y, w, 60)];
+    VNPFlippedView *row = [[VNPFlippedView alloc] initWithFrame:NSMakeRect(0, y, w, 62)];
     row.autoresizingMask = NSViewWidthSizable;
     
     NSTextField *titleLbl = [NSTextField labelWithString:title];
@@ -488,7 +490,7 @@ static const VNAnimationMeta kAnimations[] = {
         [row addSubview:subLbl];
     }
     
-    slider.frame = NSMakeRect(14, 38, w - 28, 18);
+    slider.frame = NSMakeRect(14, 40, w - 28, 18);
     slider.autoresizingMask = NSViewWidthSizable;
     [row addSubview:slider];
     
@@ -496,6 +498,34 @@ static const VNAnimationMeta kAnimations[] = {
 }
 
 #pragma mark - Reload Data
+
+- (const VNAnimationMeta *)metaForAnimationKey:(NSString *)key {
+    if (!key || key.length == 0) return &kAnimations[0];
+    for (size_t i = 0; i < kAnimationCount; i++) {
+        if (strcasecmp(kAnimations[i].key, [key UTF8String]) == 0) {
+            return &kAnimations[i];
+        }
+    }
+    return &kAnimations[0];
+}
+
+- (void)updateDurationSliderForActiveAnimation {
+    if (!_animPopUp || !_durationSlider) return;
+    
+    NSString *animKey = _animPopUp.selectedItem.representedObject ?: @"shrink";
+    const VNAnimationMeta *meta = [self metaForAnimationKey:animKey];
+    
+    NSString *durKey = [NSString stringWithFormat:@"duration_%s", meta->key];
+    double globalDur = [self readDouble:@"duration" defaultValue:0.25];
+    double dur = [self readDouble:durKey defaultValue:meta->defaultDuration];
+    if (dur < 0.05) dur = (globalDur >= 0.05) ? globalDur : meta->defaultDuration;
+    
+    _durationSlider.doubleValue = dur;
+    _durationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", dur];
+    if (_durationSubtitle) {
+        _durationSubtitle.stringValue = [NSString stringWithFormat:@"Duration for %s animation (default: %.2fs).", meta->name, meta->defaultDuration];
+    }
+}
 
 - (void)reloadAllValues {
     if (!_enabledSwitch) return;
@@ -507,6 +537,10 @@ static const VNAnimationMeta kAnimations[] = {
     BOOL shadows = [self readBool:@"shadows" defaultValue:YES];
     _shadowsSwitch.state = shadows ? NSControlStateValueOn : NSControlStateValueOff;
     
+    NSString *targetApp = [self readString:@"targetApp" defaultValue:@"all"];
+    _targetAppField.stringValue = targetApp ?: @"all";
+    
+    // 2. Animation & Timing
     NSString *anim = [self readString:@"animation" defaultValue:@"shrink"];
     for (NSMenuItem *it in _animPopUp.itemArray) {
         if ([it.representedObject isEqualToString:anim]) {
@@ -515,25 +549,11 @@ static const VNAnimationMeta kAnimations[] = {
         }
     }
     
-    NSString *targetApp = [self readString:@"targetApp" defaultValue:@"all"];
-    _targetAppField.stringValue = targetApp ?: @"all";
+    [self updateDurationSliderForActiveAnimation];
     
     double rr = [self readDouble:@"refreshRate" defaultValue:120.0];
     _refreshRateSlider.doubleValue = rr;
     _refreshRateLabel.stringValue = (rr <= 0.0) ? @"Auto" : [NSString stringWithFormat:@"%.0f Hz", rr];
-    
-    double globalDur = [self readDouble:@"duration" defaultValue:0.25];
-    _globalDurationSlider.doubleValue = globalDur;
-    _globalDurationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", globalDur];
-    
-    // 2. Per-Animation Durations
-    for (size_t i = 0; i < kAnimationCount; i++) {
-        NSString *key = [NSString stringWithFormat:@"duration_%s", kAnimations[i].key];
-        double d = [self readDouble:key defaultValue:kAnimations[i].defaultDuration];
-        if (d < 0.05) d = globalDur;
-        _animSliders[i].doubleValue = d;
-        _animLabels[i].stringValue = [NSString stringWithFormat:@"%.2fs", d];
-    }
 }
 
 #pragma mark - Control Actions
@@ -552,7 +572,31 @@ static const VNAnimationMeta kAnimations[] = {
     NSString *key = sender.selectedItem.representedObject;
     if (key) {
         [self writePrefValue:key forKey:@"animation"];
+        [self updateDurationSliderForActiveAnimation];
     }
+}
+
+- (void)durationSliderChanged:(NSSlider *)sender {
+    double dur = sender.doubleValue;
+    _durationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", dur];
+    
+    NSString *animKey = _animPopUp.selectedItem.representedObject ?: @"shrink";
+    NSString *durKey = [NSString stringWithFormat:@"duration_%@", animKey];
+    [self writePrefValue:@(dur) forKey:durKey];
+    [self writePrefValue:@(dur) forKey:@"duration"];
+}
+
+- (void)resetDurationClicked:(NSButton *)sender {
+    NSString *animKey = _animPopUp.selectedItem.representedObject ?: @"shrink";
+    const VNAnimationMeta *meta = [self metaForAnimationKey:animKey];
+    
+    double defDur = meta->defaultDuration;
+    _durationSlider.doubleValue = defDur;
+    _durationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", defDur];
+    
+    NSString *durKey = [NSString stringWithFormat:@"duration_%s", meta->key];
+    [self writePrefValue:@(defDur) forKey:durKey];
+    [self writePrefValue:@(defDur) forKey:@"duration"];
 }
 
 - (void)controlTextDidEndEditing:(NSNotification *)obj {
@@ -567,34 +611,6 @@ static const VNAnimationMeta kAnimations[] = {
     double val = round(sender.doubleValue);
     _refreshRateLabel.stringValue = (val <= 0.0) ? @"Auto" : [NSString stringWithFormat:@"%.0f Hz", val];
     [self writePrefValue:@(val) forKey:@"refreshRate"];
-}
-
-- (void)globalDurationChanged:(NSSlider *)sender {
-    double val = round(sender.doubleValue * 100.0) / 100.0;
-    _globalDurationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", val];
-    [self writePrefValue:@(val) forKey:@"duration"];
-}
-
-- (void)animDurationSliderChanged:(NSSlider *)sender {
-    NSInteger idx = sender.tag;
-    if (idx < 0 || idx >= (NSInteger)kAnimationCount) return;
-    
-    double val = round(sender.doubleValue * 100.0) / 100.0;
-    _animLabels[idx].stringValue = [NSString stringWithFormat:@"%.2fs", val];
-    
-    NSString *key = [NSString stringWithFormat:@"duration_%s", kAnimations[idx].key];
-    [self writePrefValue:@(val) forKey:key];
-}
-
-- (void)resetAllDurationsClicked:(NSButton *)sender {
-    for (size_t i = 0; i < kAnimationCount; i++) {
-        double def = kAnimations[i].defaultDuration;
-        _animSliders[i].doubleValue = def;
-        _animLabels[i].stringValue = [NSString stringWithFormat:@"%.2fs", def];
-        
-        NSString *key = [NSString stringWithFormat:@"duration_%s", kAnimations[i].key];
-        [self writePrefValue:@(def) forKey:key];
-    }
 }
 
 @end
