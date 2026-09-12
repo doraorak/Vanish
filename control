@@ -6,4 +6,4 @@ Description: Animates windows closing from the red traffic-light button.
 Maintainer: Dora Orak
 Author: Dora Orak
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), preferenceloaderti
+Depends: mobilesubstrate (>= 0.9.5000), preferenceloaderx
