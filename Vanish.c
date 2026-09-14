@@ -262,7 +262,8 @@ static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
 
 static const char * const kVNAnimationKeys[] = {
     "shrink", "squish", "fall", "swirl", "flip", "tilt", "slide", "genie",
-    "flag", "spin", "roll", "barrel", "clock", "dissolve", "crt", "shatter"
+    "flag", "spin", "roll", "barrel", "clock", "dissolve", "crt", "shatter",
+    "supernova"
 };
 #define kVNAnimationKeyCount (sizeof(kVNAnimationKeys) / sizeof(kVNAnimationKeys[0]))
 
@@ -959,7 +960,7 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 // window peeking out from behind the original). At this width the displaced
 // frame lands entirely behind the original and is never seen. That is a
 // workaround, not a fix: the mismatch is still there, it is merely covered.
-#define kVNShaderMargin 0.36
+#define kVNShaderMargin 0.50
 
 #define kVNMeshMaxDim   16
 #define kVNMeshMaxCount (kVNMeshMaxDim * kVNMeshMaxDim)
@@ -1034,9 +1035,10 @@ static const VNAnimation gAnimations[] = {
     { "roll",     "Roll",     VN_ANIM_MESH, .mesh = { 6, 12, vn_anim_roll } },
     { "barrel",   "Barrel",   VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_barrel } },
     { "clock",    "Clock",    VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_clock } },
-    { "dissolve", "Dissolve", VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve" } },
-    { "crt",      "CRT Off",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt" } },
-    { "shatter",  "Shatter",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter" } },
+    { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve" } },
+    { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt" } },
+    { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter" } },
+    { "supernova", "Supernova", VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_supernova" } },
 };
 #define kVNAnimationCount (sizeof(gAnimations) / sizeof(gAnimations[0]))
 
@@ -1276,16 +1278,6 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     // clone is still hidden behind the original, moves that cost off the
     // first frame. At t=0 the shrink solver is an identity warp (s = 1.0), so
     // this cannot change what is on screen.
-    if (anim->kind == VN_ANIM_SHADER) {
-        vn_filter_attach(clone, anim->shader.type, true);
-        vn_shader_widen_bounds(clone, frame);
-        vn_shader_set_phase(clone, 0.0);
-    } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
-        VNPointWarp warm[kVNMeshMaxCount];
-        anim->mesh.fill(warm, frame, 0.0);
-        vn_resolved_set_mesh_warp(clone, NULL, anim->mesh.w, anim->mesh.h, (const float *)warm);
-    }
-
     if (!prefs.shadows) {
         if (vn_resolved_clear_shadow_density) {
             vn_resolved_clear_shadow_density(clone);
@@ -1299,6 +1291,16 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
             vn_resolved_set_window_shadow_parameters(0, wid, 0.0f, 0.0f, 0.0f, 0.0f);
         }
         VN_DEBUG("snapshot: disabled shadow property on clone wid=%u win=%p", wid, clone);
+    }
+
+    if (anim->kind == VN_ANIM_SHADER) {
+        vn_filter_attach(clone, anim->shader.type, true);
+        vn_shader_widen_bounds(clone, frame);
+        vn_shader_set_phase(clone, 0.0);
+    } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
+        VNPointWarp warm[kVNMeshMaxCount];
+        anim->mesh.fill(warm, frame, 0.0);
+        vn_resolved_set_mesh_warp(clone, NULL, anim->mesh.w, anim->mesh.h, (const float *)warm);
     }
 
     // The clone is built synchronously in the event hook, before the app is

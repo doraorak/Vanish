@@ -63,6 +63,7 @@
 				<string>Dissolve</string>
 				<string>CRT Off</string>
 				<string>Shatter</string>
+				<string>Supernova</string>
 			</array>
 			<key>validValues</key>
 			<array>
@@ -82,6 +83,7 @@
 				<string>dissolve</string>
 				<string>crt</string>
 				<string>shatter</string>
+				<string>supernova</string>
 			</array>
 		</dict>
 		<dict>
@@ -467,6 +469,24 @@
 			<string>duration_shatter</string>
 			<key>label</key>
 			<string>Shatter</string>
+			<key>max</key>
+			<real>2.0</real>
+			<key>min</key>
+			<real>0.05</real>
+			<key>showValue</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>default</key>
+			<real>0.35</real>
+			<key>key</key>
+			<string>duration_supernova</string>
+			<key>label</key>
+			<string>Supernova</string>
 			<key>max</key>
 			<real>2.0</real>
 			<key>min</key>
