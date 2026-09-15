@@ -4,6 +4,9 @@
 https://github.com/user-attachments/assets/4b989d29-43bc-4a35-9230-32cc14efc8f8
 
 
+https://github.com/user-attachments/assets/fe520e4c-29b3-48d2-9b33-64cda45dd6a5
+
+
 # Vanish
 
 Smooth window close animations for macOS on Apple Silicon.
@@ -25,6 +28,8 @@ Vanish replaces the close animation for windows ! It runs **inside `WindowServer
 - **Hardware-accelerated warp.** The closing window's surface is cloned inside the server and deformed through `CGXWindow::set_mesh_warp`. Each animation declares the smallest grid that renders it exactly: a shrink or a topple is affine and needs nothing beyond its four corners, while a swirl, where different parts of the window travel along different curves, asks for a denser one.
 
 - **Metal shader animations** — Full support for MSL, some animations use shaders to provide more complex animations that are impossible to do with plain mesh warps. 
+
+- **EDR/HDR support** - Shader animations are fully supported for making use of HDR/EDR. 
 
 - **Locked to the display.** Frames are scheduled against an absolute deadline rather than chained off one another, keeping the animation in step with the panel — a full 120 Hz on ProMotion.
 
