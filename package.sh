@@ -15,7 +15,23 @@ SDK_PATH=$(xcrun --show-sdk-path --sdk macosx)
 # in Contents/MacOS as the executable and reads the filter from
 # Contents/Resources/Filter.plist. See tl_find_bundle_executable() and
 # tl_read_bundle_filter() in tweakLoader.c.
-echo "==> 1. Compiling $NAME (arm64e)..."
+BUILD_TYPE="release"
+if [ "${1:-}" = "--debug" ] || [ "${DEBUG:-0}" = "1" ]; then
+    BUILD_TYPE="debug"
+fi
+
+if [ "$BUILD_TYPE" = "release" ]; then
+    echo "==> 1. Compiling $NAME (arm64e) [RELEASE: stripped symbols, debug logs removed]..."
+    BUILD_CFLAGS="-O3 -DENABLE_LOGS=0 -fvisibility=hidden -fvisibility-inlines-hidden"
+    BUILD_LDFLAGS="-Wl,-dead_strip -Wl,-x"
+    DO_STRIP=1
+else
+    echo "==> 1. Compiling $NAME (arm64e) [DEBUG: symbols preserved, debug logs enabled]..."
+    BUILD_CFLAGS="-O2 -DENABLE_LOGS=1"
+    BUILD_LDFLAGS=""
+    DO_STRIP=0
+fi
+
 rm -rf "$DIR/$BUNDLE"
 mkdir -p "$DIR/$BUNDLE/Contents/MacOS" "$DIR/$BUNDLE/Contents/Resources"
 
@@ -45,6 +61,7 @@ if [ ! -f "$SUPPORT_LIB" ]; then
 fi
 
 clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fblocks -std=c11 \
+    $BUILD_CFLAGS $BUILD_LDFLAGS \
     -F"$SDK_PATH/System/Library/PrivateFrameworks" \
     -framework CoreFoundation -framework CoreGraphics -framework SkyLight \
     -framework IOKit -framework Security \
@@ -104,6 +121,9 @@ if [ -f "$DIR/Preferences/Root.plist" ]; then
     cp "$DIR/Preferences/Root.plist" "$PREFS_SRC/Contents/Resources/Root.plist"
 fi
 
+if [ "$DO_STRIP" = "1" ]; then
+    strip -x "$PREFS_SRC/Contents/MacOS/VanishPrefs" 2>/dev/null || true
+fi
 codesign -f -s - "$PREFS_SRC"
 
 # Shaders are compiled here, never inside WindowServer: the server only ever
@@ -145,6 +165,9 @@ echo "</plist>" >> "$DIR/$BUNDLE/Contents/Info.plist"
 # Ad-hoc, like every other injected component here. Library validation is
 # disabled system-wide, which is the only reason anything unsigned-by-Apple
 # loads into WindowServer at all.
+if [ "$DO_STRIP" = "1" ]; then
+    strip -x "$DIR/$BUNDLE/Contents/MacOS/$NAME" 2>/dev/null || true
+fi
 codesign -f -s - "$DIR/$BUNDLE"
 
 echo "==> 2. Staging..."

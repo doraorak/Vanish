@@ -76,7 +76,9 @@
 
 #pragma mark - Logging
 
+#ifndef ENABLE_LOGS
 #define ENABLE_LOGS 1
+#endif
 
 // Compile-time log level. Override with -DVN_LOG_LEVEL=... at build time.
 //
