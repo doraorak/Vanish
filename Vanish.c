@@ -72,6 +72,7 @@
 #include <stdatomic.h>
 
 #include "SkyLightServer.h"
+#include "TILicense.h"
 
 #pragma mark - Logging
 
@@ -267,6 +268,28 @@ static const char * const kVNAnimationKeys[] = {
 };
 #define kVNAnimationKeyCount (sizeof(kVNAnimationKeys) / sizeof(kVNAnimationKeys[0]))
 
+static const float kVNAnimationDefaultDurations[] = {
+    0.25f, /* shrink */
+    0.25f, /* squish */
+    0.25f, /* fall */
+    0.30f, /* swirl */
+    0.25f, /* flip */
+    0.25f, /* tilt */
+    0.25f, /* slide */
+    0.35f, /* genie */
+    0.30f, /* flag */
+    0.25f, /* spin */
+    0.30f, /* roll */
+    0.35f, /* barrel */
+    0.35f, /* clock */
+    0.30f, /* dissolve */
+    0.30f, /* crt */
+    0.35f, /* shatter */
+    0.35f  /* supernova */
+};
+_Static_assert(sizeof(kVNAnimationDefaultDurations) / sizeof(kVNAnimationDefaultDurations[0]) == kVNAnimationKeyCount,
+               "kVNAnimationDefaultDurations count mismatch");
+
 typedef struct {
     bool  enabled;
     bool  shadows;
@@ -288,7 +311,7 @@ static void vn_reload_prefs_locked(void) {
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     for (size_t i = 0; i < kVNAnimationKeyCount; i++) {
-        gPrefs.animDurations[i] = 0.0f;
+        gPrefs.animDurations[i] = kVNAnimationDefaultDurations[i];
     }
     strlcpy(gPrefs.targetApp, "all", sizeof(gPrefs.targetApp));
     strlcpy(gPrefs.animation, "shrink", sizeof(gPrefs.animation));
@@ -447,7 +470,7 @@ static float vn_duration_for_key(const char *animKey) {
                 if (prefs.animDurations[i] >= 0.05f) {
                     return prefs.animDurations[i];
                 }
-                break;
+                return kVNAnimationDefaultDurations[i];
             }
         }
     }
@@ -2914,6 +2937,17 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
     // windows that filter rejects.
     for (unsigned pi = 0; ops && pi < count; pi++) {
         uint32_t pwid = wids ? wids[pi] : 0;
+
+        // Cleared here rather than only in the target-window branches below.
+        // The restore backstop fires 2s after a fade-path close if no order-out
+        // was seen, and "seen" used to mean "seen for a window that still passes
+        // vn_is_target_window()". A window that stops matching the filter on the
+        // way out -- which a closing Chromium window can, its properties change
+        // as it goes -- ordered out perfectly well and was still counted as
+        // never having done so, so two seconds later the backstop made it
+        // visible again. This loop sees every ordering op before any filtering.
+        if (ops[pi] == kVNOrderOut) vn_early_hidden_forget(pwid);
+
         CGXWindow *pwin = pwid ? vn_resolved_window_by_id(pwid) : NULL;
         if (!pwin || vn_is_clone_wid(pwid, pwin)) continue;
         CGRect pr = vn_resolved_screen_rect ? vn_resolved_screen_rect(pwin) : CGRectZero;
@@ -2943,8 +2977,34 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
 
                     bool animating = vn_is_window_animating(wid, win);
                     if (animating) {
-                        VN_DEBUG("Window wid=%u (%p, app: '%s') already animating; dropping duplicate order-out",
+                        // Forwarded, not dropped. What this guard is for is
+                        // "do not start a SECOND animation" -- but it used to
+                        // skip vn_orig_order too, and on the fade path that is
+                        // the only order-out the window ever gets.
+                        //
+                        // The fade path starts the animation from
+                        // vn_close_watch_tick, before the app has asked for
+                        // anything. The original is hidden there by forcing its
+                        // CA visibility off, which is not the same as being
+                        // ordered out: the server still has it ordered in. So
+                        // swallowing the app's real order-out left the window
+                        // alive and ordered in, invisible only for as long as
+                        // nothing recomputed its visibility. Anything that did
+                        // -- the app reusing the window, a space or display
+                        // change -- brought it straight back, after a close
+                        // that had looked perfect.
+                        //
+                        // Apps that destroy the window right after hid this:
+                        // release_window tore it down before anything noticed.
+                        // Chromium keeps its NSWindows and reuses them, which
+                        // is why Chrome and Discord are where it shows up.
+                        //
+                        // A genuinely duplicate order-out is harmless here: the
+                        // window is already out, and ordering it out again is a
+                        // no-op.
+                        VN_DEBUG("Window wid=%u (%p, app: '%s') already animating; forwarding the order-out, not starting a second animation",
                                wid, win, app);
+                        vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
                         return;
                     }
 
@@ -3030,8 +3090,14 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                     vn_early_hidden_forget(wid);
 
                     if (vn_is_window_animating(wid, win)) {
-                        VN_DEBUG("Window wid=%u (%p, app: '%s') already animating; dropping duplicate order-out",
+                        // Passed along rather than dropped from the batch, for
+                        // the reason given in the single-window branch above.
+                        VN_DEBUG("Window wid=%u (%p, app: '%s') already animating; forwarding the order-out, not starting a second animation",
                                wid, win, app);
+                        pass_wids[pass_count] = wid;
+                        pass_ops[pass_count] = ops[i];
+                        pass_rel[pass_count] = relativeTo ? relativeTo[i] : 0;
+                        pass_count++;
                         continue;
                     }
 
@@ -3305,6 +3371,11 @@ static void vanish_init(void) {
     if (_NSGetExecutablePath(self, &len) != 0) return;
     if (strstr(self, "WindowServer") == NULL) {
         VN_INFO("not WindowServer (%{public}s) -- doing nothing", self);
+        return;
+    }
+
+    if (!TILicenseCheck("com.doraorak.vanish")) {
+        VN_ERROR("License verification failed for com.doraorak.vanish -- Vanish inactive");
         return;
     }
 

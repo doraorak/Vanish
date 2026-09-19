@@ -468,9 +468,8 @@ static const VNAnimationMeta kAnimations[] = {
     const VNAnimationMeta *meta = [self metaForAnimationKey:animKey];
     
     NSString *durKey = [NSString stringWithFormat:@"duration_%s", meta->key];
-    double globalDur = [self readDouble:@"duration" defaultValue:0.25];
     double dur = [self readDouble:durKey defaultValue:meta->defaultDuration];
-    if (dur < 0.05) dur = (globalDur >= 0.05) ? globalDur : meta->defaultDuration;
+    if (dur < 0.05) dur = meta->defaultDuration;
     
     _durationSlider.doubleValue = dur;
     _durationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", dur];
@@ -535,7 +534,6 @@ static const VNAnimationMeta kAnimations[] = {
     NSString *animKey = _animPopUp.selectedItem.representedObject ?: @"shrink";
     NSString *durKey = [NSString stringWithFormat:@"duration_%@", animKey];
     [self writePrefValue:@(dur) forKey:durKey];
-    [self writePrefValue:@(dur) forKey:@"duration"];
 }
 
 - (void)resetDurationClicked:(NSButton *)sender {
@@ -548,7 +546,6 @@ static const VNAnimationMeta kAnimations[] = {
     
     NSString *durKey = [NSString stringWithFormat:@"duration_%s", meta->key];
     [self writePrefValue:@(defDur) forKey:durKey];
-    [self writePrefValue:@(defDur) forKey:@"duration"];
 }
 
 - (void)controlTextDidEndEditing:(NSNotification *)obj {

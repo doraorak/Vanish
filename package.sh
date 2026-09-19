@@ -39,6 +39,8 @@ fi
 clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fblocks -std=c11 \
     -F"$SDK_PATH/System/Library/PrivateFrameworks" \
     -framework CoreFoundation -framework CoreGraphics -framework SkyLight \
+    -framework IOKit -framework Security \
+    -I"$DIR/../../XCode-projects/DYLIB/TI_Support" \
     "$ELLEKIT_LIB" \
     -install_name "/Library/TweakInject/Tweaks/Bundles/$BUNDLE/Contents/MacOS/$NAME" \
     -o "$DIR/$BUNDLE/Contents/MacOS/$NAME" "$DIR/$NAME.c"
@@ -51,17 +53,20 @@ echo "==> 1a. Compiling $PREFS_BUNDLE (arm64 + arm64e)..."
 rm -rf "$PREFS_SRC"
 mkdir -p "$PREFS_SRC/Contents/MacOS" "$PREFS_SRC/Contents/Resources"
 
-PREFS_SUPPORT_LIB="/Library/TweakInject/TI_PreferenceSupport.dylib"
-if [ ! -f "$PREFS_SUPPORT_LIB" ]; then
-    if [ -f "$DIR/../../XCode-projects/DYLIB/TI_PreferenceSupport/Build/Products/Release/TI_PreferenceSupport.dylib" ]; then
-        PREFS_SUPPORT_LIB="$DIR/../../XCode-projects/DYLIB/TI_PreferenceSupport/Build/Products/Release/TI_PreferenceSupport.dylib"
+SUPPORT_LIB="/Library/TweakInject/TI_Support.dylib"
+if [ ! -f "$SUPPORT_LIB" ]; then
+    if [ -f "$TWEAKINJECT_DIR/Payload/TI_Support.dylib" ]; then
+        SUPPORT_LIB="$TWEAKINJECT_DIR/Payload/TI_Support.dylib"
+    elif [ -f "$DIR/../../XCode-projects/DYLIB/TI_Support/TI_Support.dylib" ]; then
+        SUPPORT_LIB="$DIR/../../XCode-projects/DYLIB/TI_Support/TI_Support.dylib"
     fi
 fi
 
 clang -bundle -arch arm64 -arch arm64e -isysroot "$SDK_PATH" -fobjc-arc \
-    -framework Cocoa \
-    "$PREFS_SUPPORT_LIB" \
+    -framework Cocoa -framework IOKit -framework Security \
+    "$SUPPORT_LIB" \
     -I"$DIR/Preferences" \
+    -I"$DIR/../../XCode-projects/DYLIB/TI_Support" \
     -o "$PREFS_SRC/Contents/MacOS/VanishPrefs" \
     "$DIR/Preferences/VanishPrefsViewController.m"
 
