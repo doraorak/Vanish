@@ -3364,21 +3364,7 @@ static void *vn_hook_create_specialized_shader(void *library, void *vtx, void *f
 
 extern void MSHookFunction(void *symbol, void *replace, void **result);
 
-__attribute__((constructor))
-static void vanish_init(void) {
-    char self[1024] = {0};
-    uint32_t len = (uint32_t)sizeof(self);
-    if (_NSGetExecutablePath(self, &len) != 0) return;
-    if (strstr(self, "WindowServer") == NULL) {
-        VN_INFO("not WindowServer (%{public}s) -- doing nothing", self);
-        return;
-    }
-
-    if (!TILicenseCheck("com.doraorak.vanish")) {
-        VN_ERROR("License verification failed for com.doraorak.vanish -- Vanish inactive");
-        return;
-    }
-
+static void vanish_init_payload(void) {
     void *targetOrder               = vn_skylight_symbol(kVNSymOrderWindowList);
     void *targetRelease             = vn_skylight_symbol(kVNSymReleaseWindow);
     void *targetPostEvent           = vn_skylight_symbol(kVNSymPostEventByConnection);
@@ -3420,14 +3406,14 @@ static void vanish_init(void) {
     }
 
     void *rawRelease = ptrauth_strip(targetRelease, ptrauth_key_function_pointer);
-    MSHookFunction(rawRelease, (void *)vn_hook_release_window, (void **)&vn_orig_release_window);
+    TIL_HOOK("com.doraorak.vanish", rawRelease, vn_hook_release_window, &vn_orig_release_window);
 
     void *rawOrder = ptrauth_strip(targetOrder, ptrauth_key_function_pointer);
-    MSHookFunction(rawOrder, (void *)vn_hook_order_window_list, (void **)&vn_orig_order);
+    TIL_HOOK("com.doraorak.vanish", rawOrder, vn_hook_order_window_list, &vn_orig_order);
 
     if (targetPostEvent) {
         void *rawPost = ptrauth_strip(targetPostEvent, ptrauth_key_function_pointer);
-        MSHookFunction(rawPost, (void *)vn_hook_post_event, (void **)&vn_orig_post_event);
+        TIL_HOOK("com.doraorak.vanish", rawPost, vn_hook_post_event, &vn_orig_post_event);
         VN_DEBUG("hooked CGXPostEventByConnection -> orig %p", vn_orig_post_event);
     } else {
         VN_ERROR("WARNING: CGXPostEventByConnection unresolved");
@@ -3436,7 +3422,7 @@ static void vanish_init(void) {
     void *targetUber = vn_skylight_symbol(kVNSymUberComposite);
     if (targetUber && vn_resolved_create_shader) {
         void *rawUber = ptrauth_strip(targetUber, ptrauth_key_function_pointer);
-        MSHookFunction(rawUber, (void *)vn_hook_uber_composite, (void **)&vn_orig_uber_composite);
+        TIL_HOOK("com.doraorak.vanish", rawUber, vn_hook_uber_composite, &vn_orig_uber_composite);
         VN_DEBUG("hooked ShaderComposer::UberComposite -> orig %p", (void *)vn_orig_uber_composite);
     } else {
         VN_ERROR("WARNING: ShaderComposer::UberComposite unresolved -- shader animations will not draw");
@@ -3445,8 +3431,7 @@ static void vanish_init(void) {
     void *targetSpecialized = vn_skylight_symbol(kVNSymCreateSpecializedShader);
     if (targetSpecialized && vn_resolved_create_shader) {
         void *rawSpecialized = ptrauth_strip(targetSpecialized, ptrauth_key_function_pointer);
-        MSHookFunction(rawSpecialized, (void *)vn_hook_create_specialized_shader,
-                       (void **)&vn_orig_create_specialized_shader);
+        TIL_HOOK("com.doraorak.vanish", rawSpecialized, vn_hook_create_specialized_shader, &vn_orig_create_specialized_shader);
         VN_DEBUG("hooked ShaderComposer::create_specialized_shader -> orig %p",
                  (void *)vn_orig_create_specialized_shader);
     } else {
@@ -3455,7 +3440,7 @@ static void vanish_init(void) {
 
     if (targetEligible) {
         void *rawEligible = ptrauth_strip(targetEligible, ptrauth_key_function_pointer);
-        MSHookFunction(rawEligible, (void *)vn_hook_is_process_eligible, (void **)&vn_orig_is_process_eligible);
+        TIL_HOOK("com.doraorak.vanish", rawEligible, vn_hook_is_process_eligible, &vn_orig_is_process_eligible);
         VN_DEBUG("hooked isProcessEligibleForSetFront -> orig %p", (void *)vn_orig_is_process_eligible);
     } else {
         VN_ERROR("WARNING: isProcessEligibleForSetFront unresolved");
@@ -3471,4 +3456,17 @@ static void vanish_init(void) {
     VN_DEBUG("Registered Darwin notification observer for com.doraorak.vanish/prefsChanged");
 
     VN_INFO("Vanish loaded successfully! Target window close hook active (duration: %.2fs)", (double)vn_duration());
+}
+
+__attribute__((constructor))
+static void vanish_init(void) {
+    char self[1024] = {0};
+    uint32_t len = (uint32_t)sizeof(self);
+    if (_NSGetExecutablePath(self, &len) != 0) return;
+    if (strstr(self, "WindowServer") == NULL) {
+        VN_INFO("not WindowServer (%{public}s) -- doing nothing", self);
+        return;
+    }
+
+    TIL_DISPATCH("com.doraorak.vanish", vanish_init_payload);
 }

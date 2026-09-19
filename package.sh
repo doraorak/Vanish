@@ -36,12 +36,21 @@ if [ ! -f "$ELLEKIT_LIB" ]; then
     fi
 fi
 
+SUPPORT_LIB="$DIR/../../XCode-projects/DYLIB/TI_Support/TI_Support.dylib"
+if [ ! -f "$SUPPORT_LIB" ]; then
+    SUPPORT_LIB="$TWEAKINJECT_DIR/Payload/TI_Support.dylib"
+fi
+if [ ! -f "$SUPPORT_LIB" ]; then
+    SUPPORT_LIB="/Library/TweakInject/TI_Support.dylib"
+fi
+
 clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fblocks -std=c11 \
     -F"$SDK_PATH/System/Library/PrivateFrameworks" \
     -framework CoreFoundation -framework CoreGraphics -framework SkyLight \
     -framework IOKit -framework Security \
     -I"$DIR/../../XCode-projects/DYLIB/TI_Support" \
     "$ELLEKIT_LIB" \
+    "$SUPPORT_LIB" \
     -install_name "/Library/TweakInject/Tweaks/Bundles/$BUNDLE/Contents/MacOS/$NAME" \
     -o "$DIR/$BUNDLE/Contents/MacOS/$NAME" "$DIR/$NAME.c"
 
@@ -52,15 +61,6 @@ PKG_VERSION="$(awk '/^Version:/{print $2}' "$DIR/control")"
 echo "==> 1a. Compiling $PREFS_BUNDLE (arm64 + arm64e)..."
 rm -rf "$PREFS_SRC"
 mkdir -p "$PREFS_SRC/Contents/MacOS" "$PREFS_SRC/Contents/Resources"
-
-SUPPORT_LIB="/Library/TweakInject/TI_Support.dylib"
-if [ ! -f "$SUPPORT_LIB" ]; then
-    if [ -f "$TWEAKINJECT_DIR/Payload/TI_Support.dylib" ]; then
-        SUPPORT_LIB="$TWEAKINJECT_DIR/Payload/TI_Support.dylib"
-    elif [ -f "$DIR/../../XCode-projects/DYLIB/TI_Support/TI_Support.dylib" ]; then
-        SUPPORT_LIB="$DIR/../../XCode-projects/DYLIB/TI_Support/TI_Support.dylib"
-    fi
-fi
 
 clang -bundle -arch arm64 -arch arm64e -isysroot "$SDK_PATH" -fobjc-arc \
     -framework Cocoa -framework IOKit -framework Security \

@@ -20,7 +20,7 @@ Vanish_CFLAGS = -fblocks -std=c11 -fno-modules
 
 # MSHookFunction. Installed at /usr/local/lib/libellekit.dylib, which is also
 # its install name, so -L is a link-time concern only.
-Vanish_LIBRARIES = ellekit
+Vanish_LIBRARIES = ellekit TI_Support
 Vanish_LDFLAGS = -L/Library/TweakInject
 
 # SkyLight is private, so it needs the private-framework path rather than
