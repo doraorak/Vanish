@@ -266,7 +266,7 @@ static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
 static const char * const kVNAnimationKeys[] = {
     "shrink", "squish", "fall", "swirl", "flip", "tilt", "slide", "genie",
     "flag", "spin", "roll", "barrel", "clock", "dissolve", "crt", "shatter",
-    "supernova"
+    "burn"
 };
 #define kVNAnimationKeyCount (sizeof(kVNAnimationKeys) / sizeof(kVNAnimationKeys[0]))
 
@@ -287,7 +287,7 @@ static const float kVNAnimationDefaultDurations[] = {
     0.30f, /* dissolve */
     0.30f, /* crt */
     0.35f, /* shatter */
-    0.35f  /* supernova */
+    0.35f  /* burn */
 };
 _Static_assert(sizeof(kVNAnimationDefaultDurations) / sizeof(kVNAnimationDefaultDurations[0]) == kVNAnimationKeyCount,
                "kVNAnimationDefaultDurations count mismatch");
@@ -1031,7 +1031,7 @@ static const VNAnimationStyle gAnimationStyles[] = {
     { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve" } },
     { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt" } },
     { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter" } },
-    { "supernova", "Supernova", VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_supernova" } },
+    { "burn",      "Burn",      VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_burn" } },
 };
 #define kVNAnimationStyleCount (sizeof(gAnimationStyles) / sizeof(gAnimationStyles[0]))
 

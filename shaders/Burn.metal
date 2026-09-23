@@ -1,20 +1,19 @@
-#ifndef VN_SUPERNOVA_METAL
-#define VN_SUPERNOVA_METAL
+#ifndef VN_BURN_METAL
+#define VN_BURN_METAL
 
 #include "Common.metal"
 
 // ---------------------------------------------------------------------------
-// Supernova (HDR)
+// Burn (HDR)
 // ---------------------------------------------------------------------------
 //
 // Exploits Apple's EDR (Extended Dynamic Range) compositor pipeline:
 // WindowServer renders into an extended-range framebuffer (rgba16float / Display P3).
 //
-// `args.hdr_scale` exposes the display's current headroom multiplier (1.0 on SDR
-// panels, scaling up to 2.0 - 3.5 on Liquid Retina XDR and Pro Display XDR).
 // Color components exceeding 1.0 bypass the standard SDR luminance ceiling and
-// directly drive the display's Mini-LED backlights to peak physical brightness
-// (1000 - 1600 nits).
+// drive the display toward its peak physical brightness. The gain is fixed at
+// kVNBurnHDR, the largest value whose brightest pixel still fits the half-float
+// framebuffer; the display clips to its own peak well before that.
 //
 // The animation ignites at the window's top-left corner and sweeps across the
 // pane as an organic, incandescent burning wavefront:
@@ -22,7 +21,7 @@
 //   AHEAD OF WAVE  : Window is completely intact, unaltered pixels.
 //   AT THE WAVE    : Relativistic burning plasma edge with extreme HDR radiance
 //                    (amber -> solar gold -> blinding blue-white core) scaled by
-//                    `hdr_scale * 3.5` with subtle refractive heat shimmer.
+//                    kVNBurnHDR * 3.5 with subtle refractive heat shimmer.
 //   BEHIND WAVE    : Matter is cleanly consumed and vaporized to void with zero
 //                    lingering artifacts or debris.
 //
@@ -32,10 +31,15 @@
 // When brightness is 1 (t = 0), the displacement and thermal emission are zero,
 // preserving the compositor's byte-identical identity rule.
 
-fragment float4 vn_uber_supernova(VNUberStage in [[stage_in]],
-                                  texture2d<float> tex2D [[texture(0)]],
-                                  constant VNUberArgs &args [[buffer(0)]],
-                                  sampler samp [[sampler(0)]]) {
+// The brightest pixel is base (<= 1) + fire_col (<= 3.5) * heat factor (<= 3.7)
+// * 3.5 * kVNBurnHDR. At 1445 that is about 65500, just under the half-float
+// maximum of 65504; anything larger becomes infinity and renders as garbage.
+constant float kVNBurnHDR = 1445.0;
+
+fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
+                             texture2d<float> tex2D [[texture(0)]],
+                             constant VNUberArgs &args [[buffer(0)]],
+                             sampler samp [[sampler(0)]]) {
     const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
     const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
 
@@ -90,8 +94,7 @@ fragment float4 vn_uber_supernova(VNUberStage in [[stage_in]],
     float4 base = tex2D.sample(samp, clamp(sample_uv, 0.0, 1.0));
     base *= burn_mask * content_mask;
 
-    // Display HDR headroom: 1.0 on SDR, up to 3.5 on Liquid Retina XDR
-    const float hdr = max(args.hdr_scale, 1.0);
+    const float hdr = kVNBurnHDR;
 
     // Planckian / stellar plasma temperature ramp
     const float3 plasma_amber = float3(1.5, 0.45, 0.05);   // Molten gold/orange flame
@@ -117,4 +120,4 @@ fragment float4 vn_uber_supernova(VNUberStage in [[stage_in]],
     return result;
 }
 
-#endif // VN_SUPERNOVA_METAL
+#endif // VN_BURN_METAL

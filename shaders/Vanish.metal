@@ -14,10 +14,10 @@
 //   - Dissolve.metal  : Thanos particle dissolve (vn_uber_dissolve).
 //   - CRT.metal       : Retro CRT collapse (vn_uber_crt).
 //   - Shatter.metal   : Invertible Voronoi glass shatter (vn_uber_shatter).
-//   - Supernova.metal : EDR / HDR stellar explosion & plasma (vn_uber_supernova).
+//   - Burn.metal      : EDR / HDR burning wavefront (vn_uber_burn).
 
 #include "Common.metal"
 #include "Dissolve.metal"
 #include "CRT.metal"
 #include "Shatter.metal"
-#include "Supernova.metal"
+#include "Burn.metal"

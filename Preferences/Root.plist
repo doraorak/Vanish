@@ -63,7 +63,7 @@
 				<string>Dissolve</string>
 				<string>CRT Off</string>
 				<string>Shatter</string>
-				<string>Supernova</string>
+				<string>Burn</string>
 			</array>
 			<key>validValues</key>
 			<array>
@@ -83,7 +83,7 @@
 				<string>dissolve</string>
 				<string>crt</string>
 				<string>shatter</string>
-				<string>supernova</string>
+				<string>burn</string>
 			</array>
 		</dict>
 		<dict>
@@ -484,9 +484,9 @@
 			<key>default</key>
 			<real>0.35</real>
 			<key>key</key>
-			<string>duration_supernova</string>
+			<string>duration_burn</string>
 			<key>label</key>
-			<string>Supernova</string>
+			<string>Burn</string>
 			<key>max</key>
 			<real>2.0</real>
 			<key>min</key>
