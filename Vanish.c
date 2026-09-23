@@ -168,9 +168,9 @@ static void vn_log_to_file(const char *fmt, ...) {
 #define VN_TRACE(fmt, ...) do {} while (0)
 #endif
 
-/// Close animations are described by a registry further down; the structs
-/// that carry a chosen one are defined before it.
-typedef struct VNAnimation VNAnimation;
+/// Close animation styles are described by a registry further down; the
+/// structs that carry a chosen one are defined before it.
+typedef struct VNAnimationStyle VNAnimationStyle;
 
 #pragma mark - Symbol resolution
 
@@ -639,25 +639,39 @@ static uint64_t vn_now_ms(void) {
 
 #pragma mark - Animation State & Multi-Window Tracking
 
+// A clone of a closing window, and the window and app it stands in for. Built
+// on mouse-up and parked in gPendingClones, then moved whole into a
+// VNCloneAnimation when the app's close arrives.
 typedef struct {
-    uint64_t       anim_id;
     uint32_t       orig_wid;
     uint32_t       clone_wid;
     CGXWindow     *clone_win;
-    CGRect         bounds;
-    double         start_time;
-    double         duration;
-    bool           is_animating;
+    CGRect         frame;
     pid_t          pid;
     uint64_t       psn;
     bool           is_whatsapp;
     char           app[64];
-    const VNAnimation *anim;
-} VNCloneAnim;
+    // Resolved once, when the clone is built, and carried to the running
+    // animation: no preference read or string compare per frame, and the
+    // choice cannot change halfway through a close.
+    const VNAnimationStyle *anim;
+    // When the clone was built, which is the mouse-up. A pending clone whose
+    // close has not arrived a second later is discarded.
+    double         created_at;
+} VNClone;
 
-#define MAX_ACTIVE_ANIMS 32
-static VNCloneAnim    gActiveAnims[MAX_ACTIVE_ANIMS];
-static os_unfair_lock gAnimsLock = OS_UNFAIR_LOCK_INIT;
+// A clone on screen, animating. A slot is in use while is_animating is set.
+typedef struct {
+    uint64_t       anim_id;
+    VNClone        clone;
+    double         start_time;
+    double         duration;
+    bool           is_animating;
+} VNCloneAnimation;
+
+#define MAX_CLONE_ANIMATIONS 32
+static VNCloneAnimation    gCloneAnimations[MAX_CLONE_ANIMATIONS];
+static os_unfair_lock gCloneAnimationsLock = OS_UNFAIR_LOCK_INIT;
 static uint64_t       gNextAnimId = 1;
 static _Atomic bool   gAnimTimerRunning = false;
 
@@ -667,14 +681,14 @@ static _Atomic(uint64_t) gLastWhatsAppClosedTimeMs = 0;
 static bool vn_is_whatsapp_closing_or_recently_closed(uint64_t psn) {
     if (psn == 0) return false;
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating && gActiveAnims[i].is_whatsapp && gActiveAnims[i].psn == psn) {
-            os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (gCloneAnimations[i].is_animating && gCloneAnimations[i].clone.is_whatsapp && gCloneAnimations[i].clone.psn == psn) {
+            os_unfair_lock_unlock(&gCloneAnimationsLock);
             return true;
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     uint64_t last_psn = atomic_load_explicit(&gLastWhatsAppClosedPSN, memory_order_relaxed);
     if (last_psn != 0 && last_psn == psn) {
@@ -699,25 +713,28 @@ static bool vn_hook_is_process_eligible(uint32_t sessionID, uint64_t psn, bool f
     return true;
 }
 
+// One running animation's drawing work for one frame. vn_anim_tick copies
+// these out under gCloneAnimationsLock and draws after releasing it, so the
+// compositor calls never run while the close hooks wait on the lock.
 typedef struct {
     CGXWindow *clone_win;
     CGRect     bounds;
     double     p;
-    const VNAnimation *anim;
-} VNAnimSnapshot;
+    const VNAnimationStyle *anim;
+} VNFrameJob;
 
 static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating) {
-            if ((wid != 0 && (gActiveAnims[i].clone_wid == wid || gActiveAnims[i].orig_wid == wid)) ||
-                (win != NULL && gActiveAnims[i].clone_win == win)) {
-                os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (gCloneAnimations[i].is_animating) {
+            if ((wid != 0 && (gCloneAnimations[i].clone.clone_wid == wid || gCloneAnimations[i].clone.orig_wid == wid)) ||
+                (win != NULL && gCloneAnimations[i].clone.clone_win == win)) {
+                os_unfair_lock_unlock(&gCloneAnimationsLock);
                 return true;
             }
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
     return false;
 }
 
@@ -743,47 +760,33 @@ static void vn_delayed_clone_release(void *ctx, double when) {
 }
 
 static void vn_finish_animation_for_id(uint64_t anim_id) {
-    uint32_t clone_wid = 0;
-    CGXWindow *clone_win = NULL;
-    pid_t finished_pid = 0;
-    uint64_t finished_psn = 0;
-    bool finished_is_wa = false;
-    char finished_app[64] = {0};
+    VNClone finished = {0};
     bool found = false;
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating && gActiveAnims[i].anim_id == anim_id) {
-            clone_wid = gActiveAnims[i].clone_wid;
-            clone_win = gActiveAnims[i].clone_win;
-            finished_pid = gActiveAnims[i].pid;
-            finished_psn = gActiveAnims[i].psn;
-            finished_is_wa = gActiveAnims[i].is_whatsapp;
-            strlcpy(finished_app, gActiveAnims[i].app, sizeof(finished_app));
-            gActiveAnims[i].is_animating = false;
-            gActiveAnims[i].clone_wid = 0;
-            gActiveAnims[i].orig_wid = 0;
-            gActiveAnims[i].clone_win = NULL;
-            gActiveAnims[i].pid = 0;
-            gActiveAnims[i].psn = 0;
-            gActiveAnims[i].is_whatsapp = false;
-            gActiveAnims[i].app[0] = '\0';
-            gActiveAnims[i].anim = NULL;
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (gCloneAnimations[i].is_animating && gCloneAnimations[i].anim_id == anim_id) {
+            finished = gCloneAnimations[i].clone;
+            gCloneAnimations[i].is_animating = false;
+            gCloneAnimations[i].clone = (VNClone){0};
             found = true;
             break;
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     if (!found) return;
 
-    if (finished_is_wa && finished_psn != 0) {
-        atomic_store_explicit(&gLastWhatsAppClosedPSN, finished_psn, memory_order_relaxed);
+    uint32_t clone_wid = finished.clone_wid;
+    CGXWindow *clone_win = finished.clone_win;
+
+    if (finished.is_whatsapp && finished.psn != 0) {
+        atomic_store_explicit(&gLastWhatsAppClosedPSN, finished.psn, memory_order_relaxed);
         atomic_store_explicit(&gLastWhatsAppClosedTimeMs, vn_now_ms(), memory_order_relaxed);
     }
 
     VN_DEBUG("finish_animation: hiding and ordering out clone wid=%u win=%p (app='%s' pid=%d psn=0x%llx is_wa=%d release deferred 100ms)",
-           clone_wid, clone_win, finished_app, finished_pid, finished_psn, finished_is_wa);
+           clone_wid, clone_win, finished.app, finished.pid, finished.psn, finished.is_whatsapp);
     if (clone_win && vn_resolved_update_ca_visibility) {
         vn_resolved_update_ca_visibility(clone_win, false);
     }
@@ -801,72 +804,47 @@ static void vn_finish_animation_for_id(uint64_t anim_id) {
 
 #pragma mark - Window Pre-Cloning & Surface Capture
 
-#define MAX_PRECLONES 32
+#define MAX_PENDING_CLONES 32
 
-typedef struct {
-    uint32_t       orig_wid;
-    uint32_t       clone_wid;
-    CGXWindow     *clone;
-    CGRect         frame;
-    double         created_at;
-    CGPoint        mouseDownScreenPt;
-    CGPoint        mouseDownLocalPt;
-    double         mouseUpTime;
-    pid_t          pid;
-    uint64_t       psn;
-    bool           is_whatsapp;
-    char           app[64];
-    // Resolved once, when the clone is built, and carried to the running
-    // animation: no preference read or string compare per frame, and the
-    // choice cannot change halfway through a close.
-    const VNAnimation *anim;
-} VNPreClone;
+// Clones built on mouse-up, waiting for the app's real close. A slot is in
+// use while orig_wid is non-zero.
+static VNClone        gPendingClones[MAX_PENDING_CLONES] = {0};
+static os_unfair_lock gPendingClonesLock = OS_UNFAIR_LOCK_INIT;
 
-static VNPreClone     gPreClones[MAX_PRECLONES] = {0};
-static os_unfair_lock gPreCloneLock = OS_UNFAIR_LOCK_INIT;
-
-static int vn_preclone_find_slot_locked(uint32_t orig_wid) {
+static int vn_pending_clone_find_slot_locked(uint32_t orig_wid) {
     if (orig_wid == 0) return -1;
-    for (int i = 0; i < MAX_PRECLONES; i++) {
-        if (gPreClones[i].orig_wid == orig_wid) return i;
+    for (int i = 0; i < MAX_PENDING_CLONES; i++) {
+        if (gPendingClones[i].orig_wid == orig_wid) return i;
     }
     return -1;
 }
 
-static int vn_preclone_find_empty_slot_locked(void) {
-    for (int i = 0; i < MAX_PRECLONES; i++) {
-        if (gPreClones[i].orig_wid == 0) return i;
+static int vn_pending_clone_find_empty_slot_locked(void) {
+    for (int i = 0; i < MAX_PENDING_CLONES; i++) {
+        if (gPendingClones[i].orig_wid == 0) return i;
     }
     return 0;
 }
 
-static CGXWindow *vn_preclone_take_locked(uint32_t orig_wid, uint32_t *out_clone_wid, CGRect *out_frame,
-                                          const VNAnimation **out_anim,
-                                          pid_t *out_pid, uint64_t *out_psn, bool *out_is_wa, char *out_app, size_t app_len) {
-    int idx = vn_preclone_find_slot_locked(orig_wid);
-    if (idx < 0) return NULL;
+// Moves the pending clone for orig_wid out of its slot, which is freed.
+static bool vn_pending_clone_take_locked(uint32_t orig_wid, VNClone *out) {
+    int idx = vn_pending_clone_find_slot_locked(orig_wid);
+    if (idx < 0) return false;
 
-    CGXWindow *clone = gPreClones[idx].clone;
-    if (out_clone_wid) *out_clone_wid = gPreClones[idx].clone_wid;
-    if (out_frame) *out_frame = gPreClones[idx].frame;
-    if (out_anim) *out_anim = gPreClones[idx].anim;
-    if (out_pid) *out_pid = gPreClones[idx].pid;
-    if (out_psn) *out_psn = gPreClones[idx].psn;
-    if (out_is_wa) *out_is_wa = gPreClones[idx].is_whatsapp;
-    if (out_app && app_len > 0) {
-        strlcpy(out_app, gPreClones[idx].app, app_len);
-    }
-    memset(&gPreClones[idx], 0, sizeof(VNPreClone));
-    return clone;
+    *out = gPendingClones[idx];
+    memset(&gPendingClones[idx], 0, sizeof(VNClone));
+    return true;
 }
 
-static void vn_preclone_discard_wid(uint32_t orig_wid) {
+static void vn_pending_clone_discard_wid(uint32_t orig_wid) {
     if (orig_wid == 0) return;
-    uint32_t clone_wid = 0;
-    os_unfair_lock_lock(&gPreCloneLock);
-    CGXWindow *clone = vn_preclone_take_locked(orig_wid, &clone_wid, NULL, NULL, NULL, NULL, NULL, NULL, 0);
-    os_unfair_lock_unlock(&gPreCloneLock);
+    VNClone taken = {0};
+    os_unfair_lock_lock(&gPendingClonesLock);
+    vn_pending_clone_take_locked(orig_wid, &taken);
+    os_unfair_lock_unlock(&gPendingClonesLock);
 
+    CGXWindow *clone = taken.clone_win;
+    uint32_t clone_wid = taken.clone_wid;
     if (clone) {
         VN_DEBUG("pre-clone: discarding and hiding unused clone wid=%u for orig=%u", clone_wid, orig_wid);
         if (vn_resolved_update_ca_visibility) {
@@ -883,37 +861,27 @@ static void vn_preclone_discard_wid(uint32_t orig_wid) {
     }
 }
 
-static void vn_preclone_cleanup_timer(void *ctx, double when) {
+static void vn_pending_clone_cleanup_timer(void *ctx, double when) {
     (void)ctx; (void)when;
     double now = SLSCurrentRealTime();
-    CGXWindow *clones_to_free[MAX_PRECLONES];
-    uint32_t   wids_to_free[MAX_PRECLONES];
+    CGXWindow *clones_to_free[MAX_PENDING_CLONES];
+    uint32_t   wids_to_free[MAX_PENDING_CLONES];
     int        free_count = 0;
 
-    os_unfair_lock_lock(&gPreCloneLock);
-    for (int i = 0; i < MAX_PRECLONES; i++) {
-        if (gPreClones[i].orig_wid == 0) continue;
+    os_unfair_lock_lock(&gPendingClonesLock);
+    for (int i = 0; i < MAX_PENDING_CLONES; i++) {
+        if (gPendingClones[i].orig_wid == 0) continue;
 
-        bool expired = false;
-        if (gPreClones[i].mouseUpTime > 0.0) {
-            if ((now - gPreClones[i].mouseUpTime) >= 1.0) {
-                expired = true;
-            }
-        } else {
-            if ((now - gPreClones[i].created_at) >= 30.0) {
-                expired = true;
-            }
-        }
-        if (expired) {
+        if ((now - gPendingClones[i].created_at) >= 1.0) {
             VN_DEBUG("pre-clone: slot %d (wid=%u, age=%.2fs) timed out without close -- cleaning up",
-                   i, gPreClones[i].orig_wid, now - gPreClones[i].created_at);
-            clones_to_free[free_count] = gPreClones[i].clone;
-            wids_to_free[free_count]   = gPreClones[i].clone_wid;
+                   i, gPendingClones[i].orig_wid, now - gPendingClones[i].created_at);
+            clones_to_free[free_count] = gPendingClones[i].clone_win;
+            wids_to_free[free_count]   = gPendingClones[i].clone_wid;
             free_count++;
-            memset(&gPreClones[i], 0, sizeof(VNPreClone));
+            memset(&gPendingClones[i], 0, sizeof(VNClone));
         }
     }
-    os_unfair_lock_unlock(&gPreCloneLock);
+    os_unfair_lock_unlock(&gPendingClonesLock);
 
     for (int i = 0; i < free_count; i++) {
         if (clones_to_free[i]) {
@@ -959,7 +927,7 @@ static void vn_preclone_cleanup_timer(void *ctx, double when) {
 // Two rules for anything added here:
 //
 //   At t = 0 the mesh MUST be the identity (every point drawn where it
-//   lives). vn_make_snapshot primes the warp path with a t = 0 fill so the
+//   lives). vn_make_clone primes the warp path with a t = 0 fill so the
 //   first animated frame does not also have to realize the clone's surface,
 //   and that priming is only invisible if t = 0 changes nothing.
 //
@@ -1015,7 +983,7 @@ typedef enum {
     VN_ANIM_SHADER = 1,
 } VNAnimKind;
 
-struct VNAnimation {
+struct VNAnimationStyle {
     const char *key;      // stored in prefs -- stable, do not rename
     const char *title;    // shown in the preferences pane
     VNAnimKind  kind;
@@ -1046,7 +1014,7 @@ static void vn_anim_barrel(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_clock(VNPointWarp *mesh, CGRect bounds, double t);
 
 // The first entry is the fallback for a missing or unrecognised preference.
-static const VNAnimation gAnimations[] = {
+static const VNAnimationStyle gAnimationStyles[] = {
     { "shrink",   "Shrink",   VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_shrink } },
     { "squish",   "Squish",   VN_ANIM_MESH, .mesh = { 2, 3, vn_anim_squish } },
     { "fall",     "Fall",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_fall } },
@@ -1065,18 +1033,18 @@ static const VNAnimation gAnimations[] = {
     { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter" } },
     { "supernova", "Supernova", VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_supernova" } },
 };
-#define kVNAnimationCount (sizeof(gAnimations) / sizeof(gAnimations[0]))
+#define kVNAnimationStyleCount (sizeof(gAnimationStyles) / sizeof(gAnimationStyles[0]))
 
-static const VNAnimation *vn_animation_for_key(const char *key) {
+static const VNAnimationStyle *vn_animation_style_for_key(const char *key) {
     if (key && key[0]) {
-        for (size_t i = 0; i < kVNAnimationCount; i++) {
-            if (strcasecmp(gAnimations[i].key, key) == 0) return &gAnimations[i];
+        for (size_t i = 0; i < kVNAnimationStyleCount; i++) {
+            if (strcasecmp(gAnimationStyles[i].key, key) == 0) return &gAnimationStyles[i];
         }
     }
-    return &gAnimations[0];
+    return &gAnimationStyles[0];
 }
 
-static float vn_duration_for_anim(const VNAnimation *anim) {
+static float vn_duration_for_anim(const VNAnimationStyle *anim) {
     return vn_duration_for_key(anim ? anim->key : NULL);
 }
 
@@ -1219,14 +1187,13 @@ static void vn_filter_detach(CGXWindow *clone) {
 
 
 
-static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
-                                   uint32_t *out_wid, CGRect *out_frame,
-                                   const VNAnimation **out_anim,
-                                   CGSOrderOp place) {
+// Clones win and places it relative to the original. Fills out's window,
+// frame and style; the owner fields are the caller's.
+static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp place, VNClone *out) {
     const uint32_t orig_wid = win->window_id;
     if (!vn_resolved_create_clone || !vn_resolved_window_get_display || !vn_resolved_screen_rect_from_rect ||
         !vn_resolved_window_get_id) {
-        VN_ERROR("snapshot: symbols unresolved (clone=%p disp=%p rect=%p id=%p)",
+        VN_ERROR("clone: symbols unresolved (clone=%p disp=%p rect=%p id=%p)",
                (void *)vn_resolved_create_clone, (void *)vn_resolved_window_get_display,
                (void *)vn_resolved_screen_rect_from_rect, (void *)vn_resolved_window_get_id);
         return NULL;
@@ -1234,7 +1201,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
 
     double t_snap0 = SLSCurrentRealTime();
     const void *display = vn_resolved_window_get_display(win);
-    if (!display) { VN_ERROR("snapshot: no display for wid=%u", orig_wid); return NULL; }
+    if (!display) { VN_ERROR("clone: no display for wid=%u", orig_wid); return NULL; }
 
     CGRect bounds = vn_resolved_clipped_frame_bounds ? vn_resolved_clipped_frame_bounds(win) : CGRectZero;
     CGRect content = CGRectZero;
@@ -1258,11 +1225,11 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     }
 
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
-        VN_ERROR("snapshot: no usable frame for wid=%u -- not cloning", orig_wid);
+        VN_ERROR("clone: no usable frame for wid=%u -- not cloning", orig_wid);
         return NULL;
     }
 
-    const VNAnimation *anim = vn_animation_for_key(prefs.animation);
+    const VNAnimationStyle *anim = vn_animation_style_for_key(prefs.animation);
 
     // Diagnostic: the selected animation silently falling back to the first
     // registry entry is indistinguishable, on screen, from the shader path
@@ -1278,16 +1245,18 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     double t_clone0 = SLSCurrentRealTime();
     CGXWindow *clone = vn_resolved_create_clone(win, frame, display, true);
     double clone_ms = (SLSCurrentRealTime() - t_clone0) * 1000.0;
-    if (!clone) { VN_ERROR("snapshot: CreateCloneOfWindow returned NULL"); return NULL; }
+    if (!clone) { VN_ERROR("clone: CreateCloneOfWindow returned NULL"); return NULL; }
 
     uint32_t wid = vn_resolved_window_get_id(clone);
     if (wid != 0) {
         CGSOrderOp op  = place;
         uint32_t   rel = orig_wid;
         vn_orig_order(conn, &wid, &op, &rel, 1, false);
-        if (out_wid) *out_wid = wid;
-        if (out_frame) *out_frame = frame;
-        if (out_anim) *out_anim = anim;
+        out->orig_wid  = orig_wid;
+        out->clone_wid = wid;
+        out->clone_win = clone;
+        out->frame     = frame;
+        out->anim      = anim;
     }
 
     // Pre-warm the warp path.
@@ -1315,7 +1284,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
         if (wid != 0 && vn_resolved_set_window_shadow_parameters) {
             vn_resolved_set_window_shadow_parameters(0, wid, 0.0f, 0.0f, 0.0f, 0.0f);
         }
-        VN_DEBUG("snapshot: disabled shadow property on clone wid=%u win=%p", wid, clone);
+        VN_DEBUG("clone: disabled shadow property on clone wid=%u win=%p", wid, clone);
     }
 
     if (anim->kind == VN_ANIM_SHADER) {
@@ -1331,7 +1300,7 @@ static CGXWindow *vn_make_snapshot(CGXWindow *win, CGXConnection *conn,
     // The clone is built synchronously in the event hook, before the app is
     // even handed the mouse-up, so anything slow here is felt as a hitch at
     // the click itself rather than as a dropped animation frame.
-    VN_DEBUG("snapshot: clone=%p wid=%u %s %u frame=(%.1f,%.1f %.1fx%.1f) display=%p build=%.2fms total=%.2fms",
+    VN_DEBUG("clone: clone=%p wid=%u %s %u frame=(%.1f,%.1f %.1fx%.1f) display=%p build=%.2fms total=%.2fms",
            clone, wid, place == kVNOrderBelow ? "below" : "above", orig_wid,
            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
            display, clone_ms, (SLSCurrentRealTime() - t_snap0) * 1000.0);
@@ -1802,46 +1771,46 @@ static void vn_anim_tick(void *ctx, double when) {
     (void)ctx; (void)when;
 
     double now = SLSCurrentRealTime();
-    VNAnimSnapshot snapshots[MAX_ACTIVE_ANIMS];
-    int snapshot_count = 0;
-    uint64_t finished[MAX_ACTIVE_ANIMS];
+    VNFrameJob jobs[MAX_CLONE_ANIMATIONS];
+    int job_count = 0;
+    uint64_t finished[MAX_CLONE_ANIMATIONS];
     int finished_count = 0;
     bool more = false;
     CGXWindow *first_active_win = NULL;
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (!gActiveAnims[i].is_animating) continue;
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (!gCloneAnimations[i].is_animating) continue;
 
-        double dur = gActiveAnims[i].duration > 0.0 ? gActiveAnims[i].duration : 0.25;
-        double p = (now - gActiveAnims[i].start_time) / dur;
+        double dur = gCloneAnimations[i].duration > 0.0 ? gCloneAnimations[i].duration : 0.25;
+        double p = (now - gCloneAnimations[i].start_time) / dur;
 
         if (p >= 1.0) {
-            finished[finished_count++] = gActiveAnims[i].anim_id;
+            finished[finished_count++] = gCloneAnimations[i].anim_id;
         } else {
             more = true;
-            if (!first_active_win && gActiveAnims[i].clone_win) {
-                first_active_win = gActiveAnims[i].clone_win;
+            if (!first_active_win && gCloneAnimations[i].clone.clone_win) {
+                first_active_win = gCloneAnimations[i].clone.clone_win;
             }
-            if (snapshot_count < MAX_ACTIVE_ANIMS) {
-                snapshots[snapshot_count++] = (VNAnimSnapshot){
-                    .clone_win = gActiveAnims[i].clone_win,
-                    .bounds = gActiveAnims[i].bounds,
+            if (job_count < MAX_CLONE_ANIMATIONS) {
+                jobs[job_count++] = (VNFrameJob){
+                    .clone_win = gCloneAnimations[i].clone.clone_win,
+                    .bounds = gCloneAnimations[i].clone.frame,
                     .p = p,
-                    .anim = gActiveAnims[i].anim,
+                    .anim = gCloneAnimations[i].clone.anim,
                 };
             }
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     for (int i = 0; i < finished_count; i++) {
         vn_finish_animation_for_id(finished[i]);
     }
 
-    for (int i = 0; i < snapshot_count; i++) {
-        const VNAnimation *anim = snapshots[i].anim ? snapshots[i].anim : &gAnimations[0];
-        if (!snapshots[i].clone_win) continue;
+    for (int i = 0; i < job_count; i++) {
+        const VNAnimationStyle *anim = jobs[i].anim ? jobs[i].anim : &gAnimationStyles[0];
+        if (!jobs[i].clone_win) continue;
 
         // Dispatch on kind rather than assuming a mesh, so a shader animation
         // can be added here without disturbing this path.
@@ -1849,15 +1818,15 @@ static void vn_anim_tick(void *ctx, double when) {
         case VN_ANIM_MESH:
             if (vn_resolved_set_mesh_warp && anim->mesh.fill) {
                 VNPointWarp mesh[kVNMeshMaxCount];
-                anim->mesh.fill(mesh, snapshots[i].bounds, snapshots[i].p);
-                vn_resolved_set_mesh_warp(snapshots[i].clone_win, NULL,
+                anim->mesh.fill(mesh, jobs[i].bounds, jobs[i].p);
+                vn_resolved_set_mesh_warp(jobs[i].clone_win, NULL,
                                           anim->mesh.w, anim->mesh.h, (const float *)mesh);
             }
             break;
         case VN_ANIM_SHADER:
             // The tag routes the clone to our substituted ubershader; all that
             // changes per frame is the progress it reads.
-            vn_shader_set_phase(snapshots[i].clone_win, snapshots[i].p);
+            vn_shader_set_phase(jobs[i].clone_win, jobs[i].p);
             break;
         }
     }
@@ -1870,7 +1839,7 @@ static void vn_anim_tick(void *ctx, double when) {
         double spent = (SLSCurrentRealTime() - now) * 1000.0;
         double gap   = s_prev_tick > 0.0 ? (now - s_prev_tick) * 1000.0 : 0.0;
         s_prev_tick = now;
-        VN_TRACE("anim_tick: %d clone(s) gap=%.2fms work=%.2fms", snapshot_count, gap, spent);
+        VN_TRACE("anim_tick: %d clone(s) gap=%.2fms work=%.2fms", job_count, gap, spent);
     }
 #endif
 
@@ -1899,29 +1868,30 @@ static void vn_anim_tick(void *ctx, double when) {
     }
 }
 
-static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CGRect frame,
-                                     const VNAnimation *anim,
-                                     pid_t pid, uint64_t psn, bool is_wa, const char *app_name) {
+static void vn_start_clone_animation(VNClone clone) {
+    CGXWindow *clone_win = clone.clone_win;
     if (!clone_win) return;
     uint32_t clone_wid = vn_resolved_window_get_id ? vn_resolved_window_get_id(clone_win) : 0;
-    float dur = vn_duration_for_anim(anim);
+    clone.clone_wid = clone_wid;
+    float dur = vn_duration_for_anim(clone.anim);
 
-    if ((pid == 0 || psn == 0) && orig_wid != 0 && vn_resolved_window_by_id) {
-        CGXWindow *orig_win = vn_resolved_window_by_id(orig_wid);
+    if ((clone.pid == 0 || clone.psn == 0) && clone.orig_wid != 0 && vn_resolved_window_by_id) {
+        CGXWindow *orig_win = vn_resolved_window_by_id(clone.orig_wid);
         if (orig_win) {
-            if (pid == 0 && vn_resolved_window_get_owning_pid) pid = vn_resolved_window_get_owning_pid(orig_win);
+            if (clone.pid == 0 && vn_resolved_window_get_owning_pid) clone.pid = vn_resolved_window_get_owning_pid(orig_win);
             CGXConnection *c = vn_window_connection(orig_win);
             if (c) {
-                if (pid == 0) pid = vn_conn_get_pid(c);
-                if (psn == 0) psn = vn_conn_get_psn(c);
+                if (clone.pid == 0) clone.pid = vn_conn_get_pid(c);
+                if (clone.psn == 0) clone.psn = vn_conn_get_psn(c);
             }
         }
     }
 
-    if (!is_wa && app_name && (strcasecmp(app_name, "WhatsApp") == 0)) {
-        is_wa = true;
+    if (!clone.is_whatsapp && strcasecmp(clone.app, "WhatsApp") == 0) {
+        clone.is_whatsapp = true;
     }
 
+    CGRect frame = clone.frame;
     if (frame.size.width < 1.0 || frame.size.height < 1.0) {
         VNPreferences prefs = vn_get_prefs();
         CGRect b = vn_resolved_clipped_frame_bounds ? vn_resolved_clipped_frame_bounds(clone_win) : CGRectZero;
@@ -1942,18 +1912,18 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     int slot = -1;
     uint64_t anim_id = 0;
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating && gActiveAnims[i].clone_wid != 0 && gActiveAnims[i].clone_wid != clone_wid) {
-            if (gActiveAnims[i].anim_id > max_anim_id) {
-                max_anim_id = gActiveAnims[i].anim_id;
-                lowest_clone_wid = gActiveAnims[i].clone_wid;
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (gCloneAnimations[i].is_animating && gCloneAnimations[i].clone.clone_wid != 0 && gCloneAnimations[i].clone.clone_wid != clone_wid) {
+            if (gCloneAnimations[i].anim_id > max_anim_id) {
+                max_anim_id = gCloneAnimations[i].anim_id;
+                lowest_clone_wid = gCloneAnimations[i].clone.clone_wid;
             }
         }
     }
 
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (!gActiveAnims[i].is_animating) {
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (!gCloneAnimations[i].is_animating) {
             slot = i;
             break;
         }
@@ -1961,25 +1931,16 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     if (slot == -1) slot = 0;
 
     anim_id = gNextAnimId++;
-    if (!anim) anim = &gAnimations[0];
-    gActiveAnims[slot] = (VNCloneAnim){
-        .clone_wid = clone_wid,
-        .orig_wid = orig_wid,
-        .clone_win = clone_win,
+    if (!clone.anim) clone.anim = &gAnimationStyles[0];
+    clone.frame = frame;
+    gCloneAnimations[slot] = (VNCloneAnimation){
         .anim_id = anim_id,
+        .clone = clone,
         .is_animating = true,
-        .bounds = frame,
         .start_time = SLSCurrentRealTime(),
         .duration = (double)dur,
-        .pid = pid,
-        .psn = psn,
-        .is_whatsapp = is_wa,
-        .anim = anim,
     };
-    if (app_name && app_name[0] != '\0') {
-        strlcpy(gActiveAnims[slot].app, app_name, sizeof(gActiveAnims[slot].app));
-    }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     if (clone_wid != 0) {
         CGSOrderOp op = lowest_clone_wid != 0 ? kVNOrderBelow : kVNOrderAbove;
@@ -1994,7 +1955,7 @@ static void vn_start_clone_animation(CGXWindow *clone_win, uint32_t orig_wid, CG
     gAnimFrameInterval = interval;
 
     VN_INFO("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx is_wa=%d) win=%p anim='%s' duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
-            clone_wid, orig_wid, app_name ? app_name : "", pid, psn, is_wa, clone_win, anim ? anim->key : "?", dur, interval * 1000.0, hz, anim_id);
+            clone_wid, clone.orig_wid, clone.app, clone.pid, clone.psn, clone.is_whatsapp, clone_win, clone.anim->key, dur, interval * 1000.0, hz, anim_id);
 
     if (vn_resolved_schedule_callback) {
         bool expected = false;
@@ -2195,29 +2156,29 @@ static os_unfair_lock  gTrackedLock = OS_UNFAIR_LOCK_INIT;
 static bool vn_is_clone_wid(uint32_t wid, CGXWindow *win) {
     if (wid == 0 && win == NULL) return false;
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating) {
-            if ((wid != 0 && gActiveAnims[i].clone_wid == wid) ||
-                (win != NULL && gActiveAnims[i].clone_win == win)) {
-                os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (gCloneAnimations[i].is_animating) {
+            if ((wid != 0 && gCloneAnimations[i].clone.clone_wid == wid) ||
+                (win != NULL && gCloneAnimations[i].clone.clone_win == win)) {
+                os_unfair_lock_unlock(&gCloneAnimationsLock);
                 return true;
             }
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
-    os_unfair_lock_lock(&gPreCloneLock);
-    for (int i = 0; i < MAX_PRECLONES; i++) {
-        if (gPreClones[i].orig_wid != 0) {
-            if ((wid != 0 && gPreClones[i].clone_wid == wid) ||
-                (win != NULL && gPreClones[i].clone == win)) {
-                os_unfair_lock_unlock(&gPreCloneLock);
+    os_unfair_lock_lock(&gPendingClonesLock);
+    for (int i = 0; i < MAX_PENDING_CLONES; i++) {
+        if (gPendingClones[i].orig_wid != 0) {
+            if ((wid != 0 && gPendingClones[i].clone_wid == wid) ||
+                (win != NULL && gPendingClones[i].clone_win == win)) {
+                os_unfair_lock_unlock(&gPendingClonesLock);
                 return true;
             }
         }
     }
-    os_unfair_lock_unlock(&gPreCloneLock);
+    os_unfair_lock_unlock(&gPendingClonesLock);
 
     return false;
 }
@@ -2309,61 +2270,54 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
         pid = vn_resolved_window_get_owning_pid(win);
     }
 
-    bool has_preclone = false;
+    bool has_pending_clone = false;
     if (wid != 0) {
-        os_unfair_lock_lock(&gPreCloneLock);
-        has_preclone = (vn_preclone_find_slot_locked(wid) >= 0);
-        os_unfair_lock_unlock(&gPreCloneLock);
+        os_unfair_lock_lock(&gPendingClonesLock);
+        has_pending_clone = (vn_pending_clone_find_slot_locked(wid) >= 0);
+        os_unfair_lock_unlock(&gPendingClonesLock);
     }
 
     int other_visible = vn_count_visible_windows_for_pid(pid, wid);
 
-    CGXWindow *clones_to_release[MAX_ACTIVE_ANIMS] = {0};
-    uint32_t clone_wids[MAX_ACTIVE_ANIMS] = {0};
+    CGXWindow *clones_to_release[MAX_CLONE_ANIMATIONS] = {0};
+    uint32_t clone_wids[MAX_CLONE_ANIMATIONS] = {0};
     int release_count = 0;
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (!gActiveAnims[i].is_animating) continue;
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (!gCloneAnimations[i].is_animating) continue;
 
         bool match = false;
-        if ((wid != 0 && (gActiveAnims[i].clone_wid == wid || gActiveAnims[i].orig_wid == wid)) ||
-            (win != NULL && gActiveAnims[i].clone_win == win)) {
+        if ((wid != 0 && (gCloneAnimations[i].clone.clone_wid == wid || gCloneAnimations[i].clone.orig_wid == wid)) ||
+            (win != NULL && gCloneAnimations[i].clone.clone_win == win)) {
             match = true;
         }
-        else if (pid != 0 && gActiveAnims[i].pid == pid && !has_preclone) {
+        else if (pid != 0 && gCloneAnimations[i].clone.pid == pid && !has_pending_clone) {
             if (was_already_ordered_in) {
                 VN_DEBUG("Window wid=%u was already ordered in (AppKit sibling restack/focus) -> NOT canceling clone wid=%u",
-                       wid, gActiveAnims[i].clone_wid);
+                       wid, gCloneAnimations[i].clone.clone_wid);
             } else {
                 if (other_visible == 0) {
                     VN_DEBUG("Process pid=%d had 0 other visible windows and wid=%u is newly ordering in -> Dock/launch reopen, canceling clone wid=%u",
-                           pid, wid, gActiveAnims[i].clone_wid);
+                           pid, wid, gCloneAnimations[i].clone.clone_wid);
                     match = true;
                 } else {
                     VN_DEBUG("Process pid=%d still has %d other visible window(s); wid=%u is a sibling -> NOT canceling clone wid=%u",
-                           pid, other_visible, wid, gActiveAnims[i].clone_wid);
+                           pid, other_visible, wid, gCloneAnimations[i].clone.clone_wid);
                 }
             }
         }
 
         if (match) {
-            clones_to_release[release_count] = gActiveAnims[i].clone_win;
-            clone_wids[release_count] = gActiveAnims[i].clone_wid;
+            clones_to_release[release_count] = gCloneAnimations[i].clone.clone_win;
+            clone_wids[release_count] = gCloneAnimations[i].clone.clone_wid;
             release_count++;
 
-            gActiveAnims[i].is_animating = false;
-            gActiveAnims[i].clone_wid = 0;
-            gActiveAnims[i].orig_wid = 0;
-            gActiveAnims[i].clone_win = NULL;
-            gActiveAnims[i].pid = 0;
-            gActiveAnims[i].psn = 0;
-            gActiveAnims[i].is_whatsapp = false;
-            gActiveAnims[i].app[0] = '\0';
-            gActiveAnims[i].anim = NULL;
+            gCloneAnimations[i].is_animating = false;
+            gCloneAnimations[i].clone = (VNClone){0};
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     for (int j = 0; j < release_count; j++) {
         CGXWindow *clone_to_release = clones_to_release[j];
@@ -2389,7 +2343,7 @@ static void vn_cancel_window_animation_if_ordering_in(uint32_t wid, CGXWindow *w
     }
 
     if (wid != 0) {
-        vn_preclone_discard_wid(wid);
+        vn_pending_clone_discard_wid(wid);
     }
 }
 
@@ -2409,61 +2363,50 @@ static void vn_hook_release_window(CGXConnection *conn, CGXWindow *win) {
         vn_early_hidden_forget(rel_wid);
     }
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (!gActiveAnims[i].is_animating) continue;
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (!gCloneAnimations[i].is_animating) continue;
 
-        bool match_self = (gActiveAnims[i].clone_win == win) || (rel_wid != 0 && gActiveAnims[i].clone_wid == rel_wid);
+        bool match_self = (gCloneAnimations[i].clone.clone_win == win) || (rel_wid != 0 && gCloneAnimations[i].clone.clone_wid == rel_wid);
 
         if (match_self) {
             VN_DEBUG("release_window arrived for animating clone wid=%u win=%p; removing from animation table",
-                   gActiveAnims[i].clone_wid, win);
-            gActiveAnims[i].is_animating = false;
-            gActiveAnims[i].clone_wid = 0;
-            gActiveAnims[i].orig_wid = 0;
-            gActiveAnims[i].clone_win = NULL;
-            gActiveAnims[i].anim = NULL;
+                   gCloneAnimations[i].clone.clone_wid, win);
+            gCloneAnimations[i].is_animating = false;
+            gCloneAnimations[i].clone = (VNClone){0};
             break;
-        } else if (rel_wid != 0 && gActiveAnims[i].orig_wid == rel_wid) {
+        } else if (rel_wid != 0 && gCloneAnimations[i].clone.orig_wid == rel_wid) {
             VN_DEBUG("release_window arrived for orig_wid=%u while clone wid=%u is animating (normal AppKit teardown); clone continues",
-                   rel_wid, gActiveAnims[i].clone_wid);
-            gActiveAnims[i].orig_wid = 0;
+                   rel_wid, gCloneAnimations[i].clone.clone_wid);
+            gCloneAnimations[i].clone.orig_wid = 0;
             break;
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
-    CGXWindow     *clone_to_animate = NULL;
-    uint32_t clone_wid = 0, orig_wid = 0;
-    CGRect clone_frame = CGRectZero;
-    pid_t anim_pid = 0;
-    uint64_t anim_psn = 0;
-    bool anim_is_wa = false;
-    char anim_app[64] = {0};
-    const VNAnimation *anim_desc = NULL;
+    VNClone taken = {0};
 
-    os_unfair_lock_lock(&gPreCloneLock);
-    for (int i = 0; i < MAX_PRECLONES; i++) {
-        if (gPreClones[i].clone == win) {
-            memset(&gPreClones[i], 0, sizeof(VNPreClone));
+    os_unfair_lock_lock(&gPendingClonesLock);
+    for (int i = 0; i < MAX_PENDING_CLONES; i++) {
+        if (gPendingClones[i].clone_win == win) {
+            memset(&gPendingClones[i], 0, sizeof(VNClone));
             break;
         }
-        if (gPreClones[i].orig_wid != 0 &&
-            ((rel_wid != 0 && gPreClones[i].orig_wid == rel_wid) ||
-             (vn_resolved_window_by_id && vn_resolved_window_by_id(gPreClones[i].orig_wid) == win))) {
-            orig_wid = gPreClones[i].orig_wid;
-            clone_to_animate = vn_preclone_take_locked(orig_wid, &clone_wid, &clone_frame, &anim_desc, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
+        if (gPendingClones[i].orig_wid != 0 &&
+            ((rel_wid != 0 && gPendingClones[i].orig_wid == rel_wid) ||
+             (vn_resolved_window_by_id && vn_resolved_window_by_id(gPendingClones[i].orig_wid) == win))) {
+            vn_pending_clone_take_locked(gPendingClones[i].orig_wid, &taken);
             break;
         }
     }
-    os_unfair_lock_unlock(&gPreCloneLock);
+    os_unfair_lock_unlock(&gPendingClonesLock);
 
     vn_orig_release_window(conn, win);
 
-    if (clone_to_animate) {
+    if (taken.clone_win) {
         VN_INFO(">>> Close seen at release_window for wid=%u (app='%s' pid=%d psn=0x%llx is_wa=%d) -- animating pre-clone wid=%u",
-               orig_wid, anim_app, anim_pid, anim_psn, anim_is_wa, clone_wid);
-        vn_start_clone_animation(clone_to_animate, orig_wid, clone_frame, anim_desc, anim_pid, anim_psn, anim_is_wa, anim_app);
+               taken.orig_wid, taken.app, taken.pid, taken.psn, taken.is_whatsapp, taken.clone_wid);
+        vn_start_clone_animation(taken);
     }
 }
 
@@ -2485,7 +2428,6 @@ static void vn_hook_release_window(CGXConnection *conn, CGXWindow *win) {
 typedef struct {
     uint32_t orig_wid;
     CGPoint  down_screen_pt;
-    CGPoint  down_local_pt;
     bool     active;
     bool     invalidated;   // a drag, or a move off the button, disqualified it
 } VNPendingRedClick;
@@ -2583,9 +2525,9 @@ static void vn_close_watch_tick(void *ctx, double when) {
 
     // Only while this window's pre-clone is still waiting to be used. If the
     // order-out beat us to it, the normal path already consumed it.
-    os_unfair_lock_lock(&gPreCloneLock);
-    bool pending = (vn_preclone_find_slot_locked(wid) >= 0);
-    os_unfair_lock_unlock(&gPreCloneLock);
+    os_unfair_lock_lock(&gPendingClonesLock);
+    bool pending = (vn_pending_clone_find_slot_locked(wid) >= 0);
+    os_unfair_lock_unlock(&gPendingClonesLock);
     if (!pending) { gAlphaProbeWid = 0; return; }
 
     // Relative to the alpha at mouse-up, not to 1.0: plenty of windows are
@@ -2594,34 +2536,25 @@ static void vn_close_watch_tick(void *ctx, double when) {
     if (alpha < gAlphaProbeBaseline - 0.01f) {
         gAlphaProbeWid = 0;
 
-        uint32_t clone_wid = 0;
-        CGRect   clone_frame = CGRectZero;
-        pid_t    anim_pid = 0;
-        uint64_t anim_psn = 0;
-        bool     anim_is_wa = false;
-        char     anim_app[64] = {0};
-
         // Checked before taking the pre-clone, so discarding it goes through
         // the normal path and nothing has to be released by hand.
-        const VNAnimation *anim_desc = NULL;
         pid_t owner = vn_resolved_window_get_owning_pid ? vn_resolved_window_get_owning_pid(win) : 0;
         if (vn_system_close_animation_in_flight(wid, owner)) {
             VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
                     wid, owner);
-            vn_preclone_discard_wid(wid);
+            vn_pending_clone_discard_wid(wid);
             return;
         }
 
-        os_unfair_lock_lock(&gPreCloneLock);
-        CGXWindow *clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_desc,
-                                                   &anim_pid, &anim_psn, &anim_is_wa,
-                                                   anim_app, sizeof(anim_app));
-        os_unfair_lock_unlock(&gPreCloneLock);
+        VNClone taken = {0};
+        os_unfair_lock_lock(&gPendingClonesLock);
+        vn_pending_clone_take_locked(wid, &taken);
+        os_unfair_lock_unlock(&gPendingClonesLock);
 
-        if (!clone || clone_wid == 0) return;
+        if (!taken.clone_win || taken.clone_wid == 0) return;
 
         VN_INFO(">>> Close detected via fade for wid=%u (app='%s' alpha=%.3f from %.3f) at +%.0fms -- animating now, %.0fms before order-out would have arrived",
-               wid, anim_app, (double)alpha, (double)gAlphaProbeBaseline,
+               wid, taken.app, (double)alpha, (double)gAlphaProbeBaseline,
                elapsed * 1000.0, 250.0);
 
         if (vn_resolved_update_ca_visibility) {
@@ -2633,7 +2566,7 @@ static void vn_close_watch_tick(void *ctx, double when) {
             }
         }
 
-        vn_start_clone_animation(clone, wid, clone_frame, anim_desc, anim_pid, anim_psn, anim_is_wa, anim_app);
+        vn_start_clone_animation(taken);
         return;
     }
 
@@ -2648,8 +2581,7 @@ static void vn_close_watch_tick(void *ctx, double when) {
 
 // Builds the pre-clone for a red-button press that has now been confirmed by
 // a release still inside the button.
-static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn,
-                               CGPoint down_screen_pt, CGPoint down_local_pt) {
+static bool vn_create_pending_clone(CGXWindow *win, CGXConnection *conn) {
     const uint32_t wid = win->window_id;
     char app[256] = {0};
     pid_t pid = 0;
@@ -2664,46 +2596,32 @@ static bool vn_create_preclone(CGXWindow *win, CGXConnection *conn,
     CGXConnection *c = conn ? conn : vn_window_connection(win);
     uint64_t psn = vn_conn_get_psn(c);
 
-    vn_preclone_discard_wid(wid);
+    vn_pending_clone_discard_wid(wid);
     atomic_store_explicit(&gNonCloseWid, 0, memory_order_relaxed);
 
-    uint32_t clone_wid = 0;
-    CGRect clone_frame = CGRectZero;
-    const VNAnimation *anim = NULL;
-    CGXWindow *clone = vn_make_snapshot(win, conn, &clone_wid, &clone_frame, &anim, kVNOrderBelow);
-    if (!clone || clone_wid == 0) {
+    VNClone made = {0};
+    CGXWindow *clone = vn_make_clone(win, conn, kVNOrderBelow, &made);
+    if (!clone || made.clone_wid == 0) {
         VN_ERROR("pre-clone: failed to create clone for wid=%u", wid);
         return false;
     }
 
-    os_unfair_lock_lock(&gPreCloneLock);
-    int slot = vn_preclone_find_slot_locked(wid);
-    if (slot < 0) slot = vn_preclone_find_empty_slot_locked();
-    gPreClones[slot] = (VNPreClone){
-        .orig_wid = wid,
-        .clone_wid = clone_wid,
-        .clone = clone,
-        .frame = clone_frame,
-        .created_at = SLSCurrentRealTime(),
-        .mouseDownScreenPt = down_screen_pt,
-        .mouseDownLocalPt  = down_local_pt,
-        // Set now, not on a later mouse-up: the clone is born at release, so
-        // the cleanup timer's "released but no close ever came" 1s window
-        // starts here.
-        .mouseUpTime = SLSCurrentRealTime(),
-        .pid = pid,
-        .psn = psn,
-        .is_whatsapp = (strcasecmp(app, "WhatsApp") == 0),
-        .anim = anim,
-    };
-    strlcpy(gPreClones[slot].app, app, sizeof(gPreClones[slot].app));
-    os_unfair_lock_unlock(&gPreCloneLock);
+    os_unfair_lock_lock(&gPendingClonesLock);
+    int slot = vn_pending_clone_find_slot_locked(wid);
+    if (slot < 0) slot = vn_pending_clone_find_empty_slot_locked();
+    made.pid = pid;
+    made.psn = psn;
+    made.is_whatsapp = (strcasecmp(app, "WhatsApp") == 0);
+    strlcpy(made.app, app, sizeof(made.app));
+    made.created_at = SLSCurrentRealTime();
+    gPendingClones[slot] = made;
+    os_unfair_lock_unlock(&gPendingClonesLock);
 
     VN_INFO(">>> Mouse up on RED CLOSE box of '%s' (pid=%d, psn=0x%llx, wid=%u) -- pre-clone ready! clone_wid=%u slot=%d",
-           app, pid, psn, wid, clone_wid, slot);
+           app, pid, psn, wid, made.clone_wid, slot);
 
     if (vn_resolved_schedule_callback) {
-        vn_resolved_schedule_callback(vn_preclone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.0);
+        vn_resolved_schedule_callback(vn_pending_clone_cleanup_timer, NULL, SLSCurrentRealTime() + 1.0);
     }
 
     gAlphaProbeWid      = wid;
@@ -2774,7 +2692,7 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
                     VN_DEBUG("hit-test: double-click detected on wid=%u (pt=%.1f,%.1f) -- discarding pre-clone and suppressing for 600ms",
                            wid, lx, ly);
                     vn_pending_red_clear();
-                    vn_preclone_discard_wid(wid);
+                    vn_pending_clone_discard_wid(wid);
                     gDoubleClickSuppressUntilMs = now_ms + 600;
                     goto dispatch;
                 }
@@ -2782,7 +2700,7 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
                 if (suppressed_by_double_click) {
                     VN_DEBUG("hit-test: click on wid=%u suppressed due to active double-click window", wid);
                     vn_pending_red_clear();
-                    vn_preclone_discard_wid(wid);
+                    vn_pending_clone_discard_wid(wid);
                     goto dispatch;
                 }
 
@@ -2802,18 +2720,17 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
 
                 if (is_red) {
                     // Record the press only. The clone is built on release
-                    // (see vn_create_preclone), so a press that turns into a
+                    // (see vn_create_pending_clone), so a press that turns into a
                     // drag never leaves a clone behind to be exposed.
                     VN_DEBUG(">>> Mouse down in RED CLOSE box of wid=%u (pt=(%.1f, %.1f)) -- waiting for release before cloning",
                            wid, lx, ly);
 
-                    vn_preclone_discard_wid(wid);
+                    vn_pending_clone_discard_wid(wid);
 
                     os_unfair_lock_lock(&gPendingRedLock);
                     gPendingRed = (VNPendingRedClick){
                         .orig_wid = wid,
                         .down_screen_pt = *screen_pt,
-                        .down_local_pt  = *local_pt,
                         .active = true,
                         .invalidated = false,
                     };
@@ -2822,12 +2739,12 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
                     VN_DEBUG(">>> Mouse down in YELLOW/GREEN button of wid=%u (pt=(%.1f, %.1f)) -- ignoring close animation",
                            wid, lx, ly);
                     vn_pending_red_clear();
-                    vn_preclone_discard_wid(wid);
+                    vn_pending_clone_discard_wid(wid);
                     atomic_store_explicit(&gNonCloseWid, wid, memory_order_relaxed);
                     atomic_store_explicit(&gNonCloseTimeMs, vn_now_ms(), memory_order_relaxed);
                 } else {
                     vn_pending_red_clear();
-                    vn_preclone_discard_wid(wid);
+                    vn_pending_clone_discard_wid(wid);
                 }
             }
         }
@@ -2875,7 +2792,7 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
                     // an ordinary close -- the same graceful fallback as any
                     // close we did not pre-clone.
                     if (vn_orig_post_event) vn_orig_post_event(conn, event);
-                    vn_create_preclone(win, conn, pend.down_screen_pt, pend.down_local_pt);
+                    vn_create_pending_clone(win, conn);
                     return;
                 }
             }
@@ -2916,12 +2833,12 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
         // close (40-300ms). A drag starting in that window could still expose
         // it, so drop it if one somehow appears.
         int slot = -1;
-        os_unfair_lock_lock(&gPreCloneLock);
-        if (wid != 0) slot = vn_preclone_find_slot_locked(wid);
-        os_unfair_lock_unlock(&gPreCloneLock);
+        os_unfair_lock_lock(&gPendingClonesLock);
+        if (wid != 0) slot = vn_pending_clone_find_slot_locked(wid);
+        os_unfair_lock_unlock(&gPendingClonesLock);
         if (slot >= 0) {
             VN_DEBUG("pre-clone: drag on wid=%u while a clone exists -- discarding it", wid);
-            vn_preclone_discard_wid(wid);
+            vn_pending_clone_discard_wid(wid);
         }
     }
 
@@ -3020,40 +2937,34 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         return;
                     }
 
-                    uint32_t clone_wid = 0;
-                    CGXWindow *clone = NULL;
-                    CGRect clone_frame = CGRectZero;
-                    pid_t anim_pid = 0;
-                    uint64_t anim_psn = 0;
-                    bool anim_is_wa = false;
-                    char anim_app[64] = {0};
-                    const VNAnimation *anim_desc = NULL;
+                    VNClone taken = {0};
                 
                     if (vn_system_close_animation_in_flight(wid, pid)) {
                         VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
                                 wid, pid);
-                        vn_preclone_discard_wid(wid);
+                        vn_pending_clone_discard_wid(wid);
                     }
 
-                    os_unfair_lock_lock(&gPreCloneLock);
-                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_desc, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
-                    os_unfair_lock_unlock(&gPreCloneLock);
+                    os_unfair_lock_lock(&gPendingClonesLock);
+                    vn_pending_clone_take_locked(wid, &taken);
+                    os_unfair_lock_unlock(&gPendingClonesLock);
 
-                    if (!clone || clone_wid == 0) {
+                    if (!taken.clone_win || taken.clone_wid == 0) {
                         VN_DEBUG("Window wid=%u orderOut has no pre-clone (not closed via red button) -- passing through directly", wid);
                         vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
                         return;
                     }
 
-                    const char *final_app = anim_app[0] ? anim_app : app;
-                    if (!anim_is_wa && (strcasecmp(final_app, "WhatsApp") == 0)) {
-                        anim_is_wa = true;
+                    if (!taken.app[0]) strlcpy(taken.app, app, sizeof(taken.app));
+                    if (!taken.pid) taken.pid = pid;
+                    if (!taken.is_whatsapp && (strcasecmp(taken.app, "WhatsApp") == 0)) {
+                        taken.is_whatsapp = true;
                     }
                     VN_INFO(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
-                           wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
+                           wid, win, taken.app, taken.pid, taken.psn, taken.is_whatsapp);
 
                     vn_orig_order(conn, wids, ops, relativeTo, 1, spaceSwitch);
-                    vn_start_clone_animation(clone, wid, clone_frame, anim_desc, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
+                    vn_start_clone_animation(taken);
                     return;
                 } else {
                     VN_TRACE("Target order op: app='%s' pid=%d count=1 wid=%u op=%d lvl=%d",
@@ -3115,26 +3026,19 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         continue;
                     }
 
-                    uint32_t clone_wid = 0;
-                    CGXWindow *clone = NULL;
-                    CGRect clone_frame = CGRectZero;
-                    pid_t anim_pid = 0;
-                    uint64_t anim_psn = 0;
-                    bool anim_is_wa = false;
-                    char anim_app[64] = {0};
-                    const VNAnimation *anim_desc = NULL;
+                    VNClone taken = {0};
                 
                     if (vn_system_close_animation_in_flight(wid, pid)) {
                         VN_INFO(">>> Deferring to the system's close animation for wid=%u (pid=%d) -- app just spawned a new window, ours would collide",
                                 wid, pid);
-                        vn_preclone_discard_wid(wid);
+                        vn_pending_clone_discard_wid(wid);
                     }
 
-                    os_unfair_lock_lock(&gPreCloneLock);
-                    clone = vn_preclone_take_locked(wid, &clone_wid, &clone_frame, &anim_desc, &anim_pid, &anim_psn, &anim_is_wa, anim_app, sizeof(anim_app));
-                    os_unfair_lock_unlock(&gPreCloneLock);
+                    os_unfair_lock_lock(&gPendingClonesLock);
+                    vn_pending_clone_take_locked(wid, &taken);
+                    os_unfair_lock_unlock(&gPendingClonesLock);
 
-                    if (!clone || clone_wid == 0) {
+                    if (!taken.clone_win || taken.clone_wid == 0) {
                         VN_DEBUG("Window wid=%u multi-orderOut has no pre-clone (not closed via red button) -- passing through", wid);
                         pass_wids[pass_count] = wid;
                         pass_ops[pass_count] = ops[i];
@@ -3143,15 +3047,14 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
                         continue;
                     }
 
-                    if (clone && clone_wid != 0) {
-                        const char *final_app = anim_app[0] ? anim_app : app;
-                        if (!anim_is_wa && (strcasecmp(final_app, "WhatsApp") == 0)) {
-                            anim_is_wa = true;
-                        }
-                        VN_INFO(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
-                               wid, win, final_app, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa);
-                        vn_start_clone_animation(clone, wid, clone_frame, anim_desc, anim_pid ? anim_pid : pid, anim_psn, anim_is_wa, final_app);
+                    if (!taken.app[0]) strlcpy(taken.app, app, sizeof(taken.app));
+                    if (!taken.pid) taken.pid = pid;
+                    if (!taken.is_whatsapp && (strcasecmp(taken.app, "WhatsApp") == 0)) {
+                        taken.is_whatsapp = true;
                     }
+                    VN_INFO(">>> Intercepted close for target window %u (%p, app: '%s' pid=%d psn=0x%llx is_wa=%d)",
+                           wid, win, taken.app, taken.pid, taken.psn, taken.is_whatsapp);
+                    vn_start_clone_animation(taken);
                     pass_wids[pass_count] = wid;
                     pass_ops[pass_count] = ops[i];
                     pass_rel[pass_count] = relativeTo ? relativeTo[i] : 0;
@@ -3188,19 +3091,19 @@ static void vn_hook_order_window_list(CGXConnection *conn, const uint32_t *wids,
 static const char *vn_shader_fragment_name(void) {
     const char *name = NULL;
 
-    os_unfair_lock_lock(&gAnimsLock);
-    for (int i = 0; i < MAX_ACTIVE_ANIMS; i++) {
-        if (gActiveAnims[i].is_animating && gActiveAnims[i].anim &&
-            gActiveAnims[i].anim->kind == VN_ANIM_SHADER) {
-            name = gActiveAnims[i].anim->shader.frag;
+    os_unfair_lock_lock(&gCloneAnimationsLock);
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (gCloneAnimations[i].is_animating && gCloneAnimations[i].clone.anim &&
+            gCloneAnimations[i].clone.anim->kind == VN_ANIM_SHADER) {
+            name = gCloneAnimations[i].clone.anim->shader.frag;
             break;
         }
     }
-    os_unfair_lock_unlock(&gAnimsLock);
+    os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     if (!name) {
-        for (size_t i = 0; i < kVNAnimationCount; i++) {
-            if (gAnimations[i].kind == VN_ANIM_SHADER) { name = gAnimations[i].shader.frag; break; }
+        for (size_t i = 0; i < kVNAnimationStyleCount; i++) {
+            if (gAnimationStyles[i].kind == VN_ANIM_SHADER) { name = gAnimationStyles[i].shader.frag; break; }
         }
     }
     return name ? name : "vn_uber_dissolve";
