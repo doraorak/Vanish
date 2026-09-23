@@ -11,17 +11,21 @@
 // WindowServer renders into an extended-range framebuffer (rgba16float / Display P3).
 //
 // Color components exceeding 1.0 bypass the standard SDR luminance ceiling and
-// drive the display toward its peak physical brightness. The gain is fixed at
-// kVNBurnHDR, the largest value whose brightest pixel still fits the half-float
-// framebuffer; the display clips to its own peak well before that.
+// drive the display toward its peak physical brightness. Vanish asks the
+// display for EDR headroom while a Burn clone exists, and `args.hdr_scale` is
+// the headroom in effect. The flame's colour is scaled so its brightest channel
+// lands exactly on that headroom: brighter would clip every channel to the same
+// value and turn the flame white.
 //
-// The animation ignites at the window's top-left corner and sweeps across the
-// pane as an organic, incandescent burning wavefront:
+// The animation ignites at a point Vanish picks per close (VNShaderExtra
+// params[0..1], in the window's unit square; the top-left corner when unbound)
+// and sweeps across the pane as an organic, incandescent burning wavefront:
 //
 //   AHEAD OF WAVE  : Window is completely intact, unaltered pixels.
 //   AT THE WAVE    : Relativistic burning plasma edge with extreme HDR radiance
-//                    (amber -> solar gold -> blinding blue-white core) scaled by
-//                    kVNBurnHDR * 3.5 with subtle refractive heat shimmer.
+//                    (amber -> solar gold -> blinding blue-white core) at the
+//                    display's full headroom, with subtle refractive heat
+//                    shimmer.
 //   BEHIND WAVE    : Matter is cleanly consumed and vaporized to void with zero
 //                    lingering artifacts or debris.
 //
@@ -31,14 +35,10 @@
 // When brightness is 1 (t = 0), the displacement and thermal emission are zero,
 // preserving the compositor's byte-identical identity rule.
 
-// The brightest pixel is base (<= 1) + fire_col (<= 3.5) * heat factor (<= 3.7)
-// * 3.5 * kVNBurnHDR. At 1445 that is about 65500, just under the half-float
-// maximum of 65504; anything larger becomes infinity and renders as garbage.
-constant float kVNBurnHDR = 1445.0;
-
 fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
                              texture2d<float> tex2D [[texture(0)]],
                              constant VNUberArgs &args [[buffer(0)]],
+                             constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                              sampler samp [[sampler(0)]]) {
     const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
     const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
@@ -66,18 +66,23 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     const float2 size   = 1.0 / px;
     const float  aspect = size.x / size.y;
 
-    // Detonation origin anchored directly at the window's top-left corner (0.0, 0.0)
-    const float2 p      = uv * float2(aspect, 1.0);
+    // Ignition point, and the distance from it to the farthest corner, so the
+    // wavefront reaches every corner at the end wherever it started.
+    const float2 origin = extra.bound > 0.5 ? clamp(float2(extra.params[0], extra.params[1]), 0.0, 1.0)
+                                            : float2(0.0);
+    const float2 p      = (uv - origin) * float2(aspect, 1.0);
+    const float2 far    = float2(max(origin.x, 1.0 - origin.x), max(origin.y, 1.0 - origin.y));
     const float  dist   = length(p);
-    const float  span   = length(float2(aspect, 1.0));
+    const float  span   = length(far * float2(aspect, 1.0));
     const float  norm_d = dist / max(span, 1e-4);
+    const float2 np     = uv * float2(aspect, 1.0);   // noise stays fixed to the window
 
     // Wavefront expands smoothly from the corner to consume the full window
     const float front = pow(t, 0.88) * 1.25;
 
     // Multi-octave procedural turbulence for organic burning flame contours
-    const float n = vn_fast_noise(p * 5.5 - float2(t * 2.2)) * 0.70
-                  + vn_fast_noise(p * 14.0 + float2(t * 3.5)) * 0.30;
+    const float n = vn_fast_noise(np * 5.5 - float2(t * 2.2)) * 0.70
+                  + vn_fast_noise(np * 14.0 + float2(t * 3.5)) * 0.30;
 
     const float delta = norm_d - front + (n - 0.5) * 0.08;
 
@@ -89,12 +94,12 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     const float burn_mask = smoothstep(-0.04, 0.01, delta);
 
     // Sample window content with slight refractive heat shimmer at the flame
-    const float2 shock_dir = dist > 1e-4 ? normalize(uv) : float2(0.7071, 0.7071);
+    const float2 shock_dir = dist > 1e-4 ? normalize(uv - origin) : float2(0.7071, 0.7071);
     const float2 sample_uv = uv - shock_dir * (heat * 0.020);
     float4 base = tex2D.sample(samp, clamp(sample_uv, 0.0, 1.0));
     base *= burn_mask * content_mask;
 
-    const float hdr = kVNBurnHDR;
+    const float hdr = max(args.hdr_scale, 1.0);
 
     // Planckian / stellar plasma temperature ramp
     const float3 plasma_amber = float3(1.5, 0.45, 0.05);   // Molten gold/orange flame
@@ -107,12 +112,17 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     // Content luminance drives thermal conductivity (brighter elements glow hotter)
     const float lum = dot(base.rgb, float3(0.2126, 0.7152, 0.0722));
 
-    // HDR radiant emission along the flame crest: strictly locked to window content
-    float3 emission = fire_col * (heat * 2.2 + lum * 1.5 * heat) * (hdr * 3.5) * content_mask;
+    // How strongly this pixel burns, 0..1: the crest, brighter where the
+    // content underneath is brighter.
+    const float intensity = saturate(heat * (2.2 + 1.5 * lum) / 3.7) * content_mask;
 
-    // Assemble final color: pure burning wave, completely clean wake, zero overflow
+    // The flame's hue at the display's full headroom: its brightest channel is
+    // exactly `hdr`, so nothing clips and the colour survives at peak.
+    const float3 hue = fire_col / max(max(fire_col.r, fire_col.g), max(fire_col.b, 1e-4));
+
+    // Assemble final color: the crest replaces the content with light, the wake is clean
     float4 result;
-    result.rgb = base.rgb + emission;
+    result.rgb = base.rgb * (1.0 - intensity) + hue * (hdr * intensity);
     result.a   = clamp(base.a + heat, 0.0, 1.0);
 
     // Smooth exit into void at end of animation

@@ -234,6 +234,11 @@ static VNCreateShaderFn             vn_resolved_create_shader;
 static VNCreateSpecializedShaderFn  vn_orig_create_specialized_shader;
 static VNUberCompositeFn            vn_orig_uber_composite;
 static VNShapeWindowWithRectFn      vn_resolved_shape_window_with_rect;
+static VNMetalCompositeLayerFn      vn_orig_metal_composite_layer;
+static VNSetPipelineStateFn         vn_orig_set_pipeline_state;
+static VNRenderEncoderFn            vn_resolved_render_encoder;
+static VNCopyPipelineStateFn        vn_orig_copy_pipeline_state;
+static VNReevaluateHDRRequestFn     vn_resolved_reevaluate_hdr_request;
 
 /// Non-zero while at least one clone carries a shader animation's tag. The
 /// substitution hook tests this first: macOS's own Invert Colours accessibility
@@ -740,12 +745,57 @@ static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
 
 static void vn_filter_detach(CGXWindow *clone);
 
-/// Every path that releases a clone goes through here, so a filter can never
-/// outlive the window it hangs off. There are four of them -- the animation
-/// finishing, a pre-clone discarded, the pre-clone cleanup timer, and the
-/// release-window hook -- and a detach missing from any one leaks the object.
+#pragma mark - EDR headroom
+
+/// Where CGXWindow keeps its desired EDR headroom, decoded from the first
+/// `ldr s<n>, [x0, #imm]` in reevaluate_hdr_request. -1 until found.
+static intptr_t gVNHeadroomOffset = -1;
+
+/// The headroom a Burn clone asks for. The display caps it at what the panel can
+/// do (16 on this generation of built-in XDR panels), so asking for the most
+/// costs nothing where there is less.
+#define kVNBurnHeadroom 16.0f
+
+static void vn_headroom_resolve(void) {
+    if (!vn_resolved_reevaluate_hdr_request) return;
+    const uint32_t *ins = ptrauth_strip((const void *)vn_resolved_reevaluate_hdr_request,
+                                        ptrauth_key_function_pointer);
+    for (int i = 0; i < 32; i++) {
+        // LDR (immediate, SIMD&FP, 32-bit, unsigned offset) with base x0.
+        if ((ins[i] & 0xFFC003E0u) == 0xBD400000u) {
+            intptr_t off = (intptr_t)((ins[i] >> 10) & 0xFFF) * 4;
+            if (off > 0 && off < 0x1000) gVNHeadroomOffset = off;
+            break;
+        }
+    }
+    VN_INFO("edr: reevaluate_hdr_request=%p headroom offset=0x%lx",
+            (void *)vn_resolved_reevaluate_hdr_request, (long)gVNHeadroomOffset);
+}
+
+static float vn_window_headroom(CGXWindow *win) {
+    if (!win || gVNHeadroomOffset < 0) return 0.0f;
+    return *(float *)((char *)win + gVNHeadroomOffset);
+}
+
+/// Sets the headroom a clone asks the display for and has the server act on it.
+/// 1.0 withdraws the request.
+static void vn_window_request_headroom(CGXWindow *win, float headroom) {
+    if (!win || gVNHeadroomOffset < 0 || !vn_resolved_reevaluate_hdr_request) return;
+    float before = vn_window_headroom(win);
+    *(float *)((char *)win + gVNHeadroomOffset) = headroom;
+    vn_resolved_reevaluate_hdr_request(win);
+    VN_INFO("edr: clone %p headroom %.2f -> %.2f", win, (double)before, (double)headroom);
+    (void)before;
+}
+
+/// Every path that releases a clone goes through here, so neither a filter nor
+/// an EDR headroom request can outlive the window it belongs to. There are four
+/// of them -- the animation finishing, a pre-clone discarded, the pre-clone
+/// cleanup timer, and the release-window hook -- and a cleanup missing from any
+/// one leaks the object or leaves the display bright.
 static void vn_release_clone(CGXWindow *clone) {
     if (!clone) return;
+    if (vn_window_headroom(clone) > 1.0f) vn_window_request_headroom(clone, 1.0f);
     vn_filter_detach(clone);
     if (vn_resolved_system_window_release) vn_resolved_system_window_release(clone);
 }
@@ -995,6 +1045,7 @@ struct VNAnimationStyle {
         struct {
             uint32_t    type;   // kVNFilterType*, the tag that routes the clone
             const char *frag;   // fragment function in Vanish.metallib
+            bool        hdr;    // asks the display for EDR headroom while it runs
         } shader;
     };
 };
@@ -1028,10 +1079,10 @@ static const VNAnimationStyle gAnimationStyles[] = {
     { "roll",     "Roll",     VN_ANIM_MESH, .mesh = { 6, 12, vn_anim_roll } },
     { "barrel",   "Barrel",   VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_barrel } },
     { "clock",    "Clock",    VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_clock } },
-    { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve" } },
-    { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt" } },
-    { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter" } },
-    { "burn",      "Burn",      VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_burn" } },
+    { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve", false } },
+    { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt", false } },
+    { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter", false } },
+    { "burn",      "Burn",      VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_burn", true } },
 };
 #define kVNAnimationStyleCount (sizeof(gAnimationStyles) / sizeof(gAnimationStyles[0]))
 
@@ -1063,7 +1114,9 @@ static float vn_duration_for_anim(const VNAnimationStyle *anim) {
 // We still detach explicitly, so the lifetime does not depend on the
 // destructor running.
 
-static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader) {
+/// `params` reach our fragment functions as VNShaderExtra::params (see
+/// kVNLayerFilterParamsOffset); NULL leaves them zero.
+static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader, const float params[5]) {
     if (!clone || !vn_resolved_window_set_filter) return false;
 
     VNWindowFilter *f = calloc(1, sizeof(VNWindowFilter));
@@ -1072,8 +1125,7 @@ static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader) {
     f->refcount  = 1;     // so a server-side release frees it exactly once
     f->type      = type;
     f->filter_id = is_shader ? kVNFilterMarkerShader : 0;
-    // params stay zero: nothing reads them on this path -- the tag is what
-    // routes the clone, and the animation's progress rides on brightness.
+    if (params) memcpy(f->params, params, sizeof(f->params));
 
     if (is_shader) atomic_fetch_add_explicit(&gShaderFilterCount, 1, memory_order_acq_rel);
 
@@ -1288,7 +1340,15 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
     }
 
     if (anim->kind == VN_ANIM_SHADER) {
-        vn_filter_attach(clone, anim->shader.type, true);
+        // Per-close values for the shader. Burn ignites at params[0..1], a
+        // point in the window's unit square.
+        const float params[5] = {
+            (float)arc4random_uniform(1001) / 1000.0f,
+            (float)arc4random_uniform(1001) / 1000.0f,
+            0.0f, 0.0f, 0.0f,
+        };
+        vn_filter_attach(clone, anim->shader.type, true, params);
+        if (anim->shader.hdr) vn_window_request_headroom(clone, kVNBurnHeadroom);
         vn_shader_widen_bounds(clone, frame);
         vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
@@ -1954,8 +2014,9 @@ static void vn_start_clone_animation(VNClone clone) {
     double hz = interval > 0.0 ? (1.0 / interval) : 120.0;
     gAnimFrameInterval = interval;
 
-    VN_INFO("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx is_wa=%d) win=%p anim='%s' duration=%.2fs interval=%.2fms (%.0fHz) (anim_id=%llu)",
-            clone_wid, clone.orig_wid, clone.app, clone.pid, clone.psn, clone.is_whatsapp, clone_win, clone.anim->key, dur, interval * 1000.0, hz, anim_id);
+    VN_INFO("starting fade animation for clone wid=%u (orig=%u, app='%s' pid=%d psn=0x%llx is_wa=%d) win=%p anim='%s' duration=%.2fs interval=%.2fms (%.0fHz) headroom=%.2f (anim_id=%llu)",
+            clone_wid, clone.orig_wid, clone.app, clone.pid, clone.psn, clone.is_whatsapp, clone_win, clone.anim->key, dur, interval * 1000.0, hz,
+            (double)vn_window_headroom(clone_win), anim_id);
 
     if (vn_resolved_schedule_callback) {
         bool expected = false;
@@ -3163,8 +3224,9 @@ static void *vn_shader_library(void *their_lib) {
 /// shader would lock the first effect in for the life of the process and make
 /// switching animations impossible. Keying on the fragment name instead means
 /// each effect is built once and switching between them is free.
+static struct { const char *frag; void *shader; } gVNShaders[8];
+
 static void *vn_shader_for_fragment(const char *frag_name) {
-    static struct { const char *frag; void *shader; } cache[8];
 
     if (!frag_name || !vn_resolved_create_shader || !gUberLibrary || !gUberVertexDescriptor) {
         return NULL;
@@ -3172,8 +3234,8 @@ static void *vn_shader_for_fragment(const char *frag_name) {
 
     // Registry strings are static, so identity is enough and costs no strcmp on
     // the frames that hit.
-    for (size_t i = 0; i < sizeof(cache) / sizeof(cache[0]); i++) {
-        if (cache[i].frag == frag_name) return cache[i].shader;
+    for (size_t i = 0; i < sizeof(gVNShaders) / sizeof(gVNShaders[0]); i++) {
+        if (gVNShaders[i].frag == frag_name) return gVNShaders[i].shader;
     }
 
     void *lib = vn_shader_library(gUberLibrary);
@@ -3192,10 +3254,108 @@ static void *vn_shader_for_fragment(const char *frag_name) {
     }
     VN_INFO("shader: built pipeline for '%s' -> %p", frag_name, shader);
 
-    for (size_t i = 0; i < sizeof(cache) / sizeof(cache[0]); i++) {
-        if (!cache[i].frag) { cache[i].frag = frag_name; cache[i].shader = shader; break; }
+    for (size_t i = 0; i < sizeof(gVNShaders) / sizeof(gVNShaders[0]); i++) {
+        if (!gVNShaders[i].frag) { gVNShaders[i].frag = frag_name; gVNShaders[i].shader = shader; break; }
     }
     return shader;
+}
+
+#pragma mark - Per-window shader arguments
+
+/// The fragment buffer index VNShaderExtra is bound at. Must match
+/// kVNShaderExtraIndex in Common.metal. The compositor binds only buffer(0) on
+/// this path, so this index is ours.
+#define kVNShaderExtraIndex 8
+
+/// Must match VNShaderExtra in Common.metal.
+typedef struct {
+    float params[5];   // the layer's filter params, set per close in vn_make_clone
+    float bound;       // 1 when params came from a layer; 0 leaves the shader on its defaults
+} VNShaderExtra;
+
+/// True once every hook the argument buffer needs is in place. Our fragment
+/// functions declare that buffer, and drawing one without it bound reads
+/// unbound GPU memory, so without all of them we do not substitute at all.
+static bool gVNShaderArgsReady;
+
+/// The layer MetalCompositeLayer is drawing on this thread, so SetPipelineState
+/// can find its params. The compositor draws on more than one thread.
+static __thread void *tl_vn_layer;
+
+/// Pipeline states made from our MetalShaders, recorded as CopyPipelineState
+/// hands them out.
+static _Atomic(void *) gVNPipelines[16];
+
+static bool vn_is_our_shader(void *shader) {
+    for (size_t i = 0; i < sizeof(gVNShaders) / sizeof(gVNShaders[0]); i++) {
+        if (gVNShaders[i].shader == shader) return shader != NULL;
+    }
+    return false;
+}
+
+static bool vn_is_our_pipeline(void *pipeline) {
+    for (size_t i = 0; i < sizeof(gVNPipelines) / sizeof(gVNPipelines[0]); i++) {
+        void *p = atomic_load_explicit(&gVNPipelines[i], memory_order_acquire);
+        if (!p) return false;
+        if (p == pipeline) return true;
+    }
+    return false;
+}
+
+static uint64_t vn_hook_metal_composite_layer(void *context, void *layer, void *destination, uint64_t flags) {
+    void *outer = tl_vn_layer;
+    tl_vn_layer = layer;
+    uint64_t result = vn_orig_metal_composite_layer(context, layer, destination, flags);
+    tl_vn_layer = outer;
+    return result;
+}
+
+static void *vn_hook_copy_pipeline_state(void *shader, void *context, bool a, bool b) {
+    void *pipeline = vn_orig_copy_pipeline_state(shader, context, a, b);
+    if (!pipeline || !vn_is_our_shader(shader) || vn_is_our_pipeline(pipeline)) return pipeline;
+
+    for (size_t i = 0; i < sizeof(gVNPipelines) / sizeof(gVNPipelines[0]); i++) {
+        void *expected = NULL;
+        if (atomic_compare_exchange_strong_explicit(&gVNPipelines[i], &expected, pipeline,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            VN_INFO("shader args: recorded pipeline %p from shader %p (slot %zu)", pipeline, shader, i);
+            break;
+        }
+        if (expected == pipeline) break;
+    }
+    return pipeline;
+}
+
+/// Binds VNShaderExtra whenever one of our pipelines is set, whatever the path:
+/// our fragment functions read it, so it must be bound on every draw of theirs.
+static void vn_hook_set_pipeline_state(void *context, void *pipeline) {
+    vn_orig_set_pipeline_state(context, pipeline);
+    if (!pipeline || !vn_is_our_pipeline(pipeline)) return;
+
+    static void (*msg)(void *, void *, const void *, unsigned long, unsigned long);
+    static void *sel_set_bytes;
+    if (!msg) {
+        sel_set_bytes = ((void *(*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName"))("setFragmentBytes:length:atIndex:");
+        msg = (void (*)(void *, void *, const void *, unsigned long, unsigned long))dlsym(RTLD_DEFAULT, "objc_msgSend");
+    }
+
+    VNShaderExtra extra = {0};
+    void *layer = tl_vn_layer;
+    if (layer && *(uint32_t *)((char *)layer + kVNLayerFilterTypeOffset) == kVNFilterTypeShaderTag) {
+        memcpy(extra.params, (char *)layer + kVNLayerFilterParamsOffset, sizeof(extra.params));
+        extra.bound = 1.0f;
+    }
+
+    void *encoder = vn_resolved_render_encoder(context);
+    if (encoder && msg && sel_set_bytes) {
+        msg(encoder, sel_set_bytes, &extra, sizeof(extra), kVNShaderExtraIndex);
+    }
+
+    static _Atomic int s_logged;
+    if (atomic_fetch_add_explicit(&s_logged, 1, memory_order_relaxed) < 6) {
+        VN_INFO("shader args: bound on encoder %p for pipeline %p layer %p bound=%.0f params=(%.3f, %.3f)",
+                encoder, pipeline, layer, (double)extra.bound, (double)extra.params[0], (double)extra.params[1]);
+    }
 }
 
 /// The substitution, placed ahead of Apple's shader cache rather than inside it.
@@ -3209,7 +3369,7 @@ static void *vn_shader_for_fragment(const char *frag_name) {
 /// Everything else stays Apple's: their pixel formats, vertex descriptor, quad,
 /// texture binds and uniform buffer. Only the two functions differ.
 static void *vn_hook_uber_composite(void *composer, unsigned fmt, uint64_t options) {
-    if ((options & kVNUberOptionShaderTag) &&
+    if ((options & kVNUberOptionShaderTag) && gVNShaderArgsReady &&
         atomic_load_explicit(&gShaderFilterCount, memory_order_acquire) > 0) {
 
         void *shader = vn_shader_for_fragment(vn_shader_fragment_name());
@@ -3342,6 +3502,31 @@ static void vanish_init_payload(void) {
     } else {
         VN_ERROR("WARNING: create_specialized_shader/create_shader unresolved -- shader animations will not draw");
     }
+
+    // Per-window shader arguments. All three hooks or none: see gVNShaderArgsReady.
+    void *targetCompositeLayer = vn_skylight_symbol(kVNSymMetalCompositeLayer);
+    void *targetSetPipeline    = vn_skylight_symbol(kVNSymMetalContextSetPipelineState);
+    void *targetCopyPipeline   = vn_skylight_symbol(kVNSymMetalShaderCopyPipelineState);
+    vn_resolved_render_encoder = (VNRenderEncoderFn)vn_skylight_symbol(kVNSymMetalContextRenderEncoder);
+    if (targetCompositeLayer && targetSetPipeline && targetCopyPipeline && vn_resolved_render_encoder) {
+        TIL_HOOK("com.doraorak.vanish", ptrauth_strip(targetCopyPipeline, ptrauth_key_function_pointer),
+                 vn_hook_copy_pipeline_state, &vn_orig_copy_pipeline_state);
+        TIL_HOOK("com.doraorak.vanish", ptrauth_strip(targetSetPipeline, ptrauth_key_function_pointer),
+                 vn_hook_set_pipeline_state, &vn_orig_set_pipeline_state);
+        TIL_HOOK("com.doraorak.vanish", ptrauth_strip(targetCompositeLayer, ptrauth_key_function_pointer),
+                 vn_hook_metal_composite_layer, &vn_orig_metal_composite_layer);
+        gVNShaderArgsReady = vn_orig_copy_pipeline_state && vn_orig_set_pipeline_state &&
+                             vn_orig_metal_composite_layer;
+    }
+    VN_INFO("shader args: composite_layer=%p set_pipeline=%p copy_pipeline=%p render_encoder=%p ready=%d",
+            targetCompositeLayer, targetSetPipeline, targetCopyPipeline,
+            (void *)vn_resolved_render_encoder, gVNShaderArgsReady);
+    if (!gVNShaderArgsReady) {
+        VN_ERROR("WARNING: shader argument hooks missing -- shader animations fall back to the stock invert");
+    }
+
+    vn_resolved_reevaluate_hdr_request = (VNReevaluateHDRRequestFn)vn_skylight_symbol(kVNSymReevaluateHDRRequest);
+    vn_headroom_resolve();
 
     if (targetEligible) {
         void *rawEligible = ptrauth_strip(targetEligible, ptrauth_key_function_pointer);

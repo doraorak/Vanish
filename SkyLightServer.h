@@ -166,6 +166,46 @@ _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.param
 #define kVNSymCreateShader \
     "__ZN14ShaderComposer13create_shaderEPU21objcproto10MTLLibrary11objc_objectP8NSStringS3_P19MTLVertexDescriptor"
 
+/// Per-window arguments for our fragment functions.
+///
+/// The five filter params reach the layer every frame --
+/// generate_layers_for_window copies them there --
+///
+///     +8212: ldr w8, [filter, #0xc]  -> str w8, [layer, #0x228]   ; type
+///     +8220: ldr d0, [filter, #0x18] -> str d0, [layer, #0x230]   ; params[0..1]
+///     +8228: ldr d0, [filter, #0x20] -> str d0, [layer, #0x238]   ; params[2..3]
+///     +8236: ldr s0, [filter, #0x28] -> str s0, [layer, #0x240]   ; params[4]
+///
+/// but the type-2 draw never binds them: MetalCompositeLayer reads only the
+/// brightness at +0x224 and the fade at +0x18c. So we bind them ourselves.
+/// MetalCompositeLayer(context, layer, destination, flags) draws each layer and
+/// calls MetalContext::SetPipelineState on the way; when the pipeline being set
+/// is one made from our shaders, we push the current layer's params to the
+/// encoder at kVNShaderExtraIndex. Our pipelines are recognised by the object
+/// MetalShader::CopyPipelineState returns for our MetalShaders.
+#define kVNSymMetalCompositeLayer "_MetalCompositeLayer"
+#define kVNSymMetalContextSetPipelineState \
+    "__ZN12MetalContext16SetPipelineStateEPU33objcproto22MTLRenderPipelineState11objc_object"
+#define kVNSymMetalContextRenderEncoder "__ZN12MetalContext13RenderEncoderEv"
+#define kVNSymMetalShaderCopyPipelineState "__ZN11MetalShader17CopyPipelineStateEP12MetalContextbb"
+
+#define kVNLayerFilterTypeOffset  0x228
+#define kVNLayerFilterParamsOffset 0x230
+
+/// `CGXWindow::reevaluate_hdr_request()`: turns the window's desired EDR
+/// headroom into a request on the display. It reads the headroom as a float at
+/// a fixed offset in CGXWindow --
+///
+///     +44:  ldr  s8, [x0, #0x98]
+///     +60:  fcmp s8, #1.0           ; 1.0 -> drop this window's request
+///     +992: str  s8, [request, #0x14]
+///     +996: bl   reevaluate_max_headroom_request()
+///     +1004: bl  update_edr_request()
+///
+/// -- and the display then raises its headroom toward the largest request. The
+/// offset is decoded from that first load at runtime rather than hardcoded.
+#define kVNSymReevaluateHDRRequest "__ZN9CGXWindow22reevaluate_hdr_requestEv"
+
 typedef struct CGXWindow {
     uint32_t       window_id;                           // 0x000
     uint32_t       window_type;                         // 0x004
@@ -564,6 +604,15 @@ typedef void  *(*VNCreateShaderFn)(void *library, void *vtx, void *frag, void *v
 /// NON-static -- x0 is the ShaderComposer, unlike its create_* siblings.
 typedef void  *(*VNUberCompositeFn)(void *composer, unsigned fmt, uint64_t options);
 typedef void   (*VNShapeWindowWithRectFn)(CGXWindow *, CGRect, uint32_t);
+
+/// All four are ordinary member functions: x0 is `this`, confirmed from each
+/// prologue. CopyPipelineState's `this` is the MetalShader and its first
+/// argument the MetalContext.
+typedef uint64_t (*VNMetalCompositeLayerFn)(void *context, void *layer, void *destination, uint64_t flags);
+typedef void     (*VNSetPipelineStateFn)(void *context, void *pipeline);
+typedef void    *(*VNRenderEncoderFn)(void *context);
+typedef void    *(*VNCopyPipelineStateFn)(void *shader, void *context, bool a, bool b);
+typedef void     (*VNReevaluateHDRRequestFn)(CGXWindow *window);
 typedef void  *(*VNCreateSpecializedShaderFn)(void *library, void *vtx, void *frag,
                                               void *constants_fn, uint64_t options, void *vdesc);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);

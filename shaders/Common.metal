@@ -53,6 +53,18 @@ struct VNUberArgs {
     float hdr_scale;    // 8
 };
 
+// Per-window arguments, bound by Vanish at buffer(kVNShaderExtraIndex) whenever
+// one of our pipelines is set. Must match VNShaderExtra and kVNShaderExtraIndex
+// in Vanish.c. `params` are the five floats Vanish puts on the clone's filter;
+// `bound` is 1 when they came from the layer being drawn, and 0 means use
+// defaults.
+#define kVNShaderExtraIndex 8
+
+struct VNShaderExtra {
+    float params[5];
+    float bound;
+};
+
 vertex VNUberStage vn_uber_vertex(VNUberIn in [[stage_in]],
                                   constant float4x4 &mvp [[buffer(1)]]) {
     VNUberStage out;
