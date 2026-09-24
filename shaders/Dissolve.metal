@@ -25,9 +25,23 @@
 fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
                                  texture2d<float> tex2D [[texture(0)]],
                                  constant VNUberArgs &args [[buffer(0)]],
+                                 constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                                  sampler samp [[sampler(0)]]) {
     const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
-    const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
+    const float  t  = vn_phase(args, extra);
+
+    // New on every close: each fleck's timing and wander, and the drift of the
+    // whole cloud -- a sideways wind, how fast it climbs and how wide it fans.
+    // The dissolve still begins at the close button. Unbound, the drift is the
+    // fixed one.
+    const float2 seed   = vn_close_seed(extra);
+    const bool   seeded = extra.bound > 0.5;
+    const float3 k      = fract(float3(seed.x, seed.y, seed.x + seed.y) * float3(0.731, 0.577, 0.419));
+    const float  wind   = seeded ? (k.x - 0.5) * 0.24 : 0.0;
+    // Kept near the fixed 0.45 even after each fleck's own variation below, so
+    // the two-step inversion of the drift still holds.
+    const float  rise   = seeded ? mix(0.36, 0.46, k.y) : 0.45;
+    const float  spread = seeded ? mix(0.28, 0.42, k.z) : 0.35;
 
     // Fleck size fixed in screen pixels, not texture coordinates, so it does not
     // scale with the window.
@@ -41,7 +55,8 @@ fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
     float  age = 0.0;
     for (int i = 0; i < 2; ++i) {
         const float2 cell = floor(src / grain);
-        const float  r    = vn_hash(cell);
+        const float  r    = vn_hash(cell + seed);
+        const float  r2   = vn_hash(cell + seed + 7.13);
 
         // The dissolve begins at the top-left and spreads outward. That corner
         // is where the close button is, so it is where the pointer is and where
@@ -64,8 +79,8 @@ fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
 
         const float2 rel = src - float2(0.5);
         float2 drift;
-        drift.x = rel.x * 0.35 * age + (r - 0.5) * 0.12 * age;
-        drift.y = rel.y * 0.15 * age - age * age * 0.45;   // rises, accelerating
+        drift.x = rel.x * spread * age + (r - 0.5) * 0.12 * age + wind * age;
+        drift.y = rel.y * 0.15 * age - age * age * rise * (seeded ? mix(0.85, 1.1, r2) : 1.0);   // rises, accelerating
         src = uv - drift;
     }
 

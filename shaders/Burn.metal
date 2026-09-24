@@ -46,10 +46,9 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     // rect, and the flame lives in it. Unbound, the window is the whole frame.
     const bool   bound = extra.bound > 0.5;
     const float2 fuv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
-    const float  t   = clamp(1.0 - args.brightness, 0.0, 1.0);
-    const float2 w0  = bound ? float2(extra.params[2], extra.params[3]) : float2(0.0);
-    const float2 w1  = bound ? float2(1.0 - extra.params[2], extra.params[4]) : float2(1.0);
-    const float2 wsz = max(w1 - w0, float2(1e-4));
+    const float  t   = vn_phase(args, extra);
+    float2 w0, wsz;
+    vn_window_rect(extra, w0, wsz);
     const float2 uv  = (fuv - w0) / wsz;
     const float2 px  = max(fwidth(fuv) / wsz, float2(1e-6));   // before any early return
     const float2 size   = 1.0 / px;                              // the window, in pixels
@@ -61,14 +60,11 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     const float4 src = tex2D.sample(samp, fuv);
     if (t <= 0.0) return src;
 
-    // Ignition point (params[0]: whole thousandths of x plus y) and the corner
-    // radius (params[1], a fraction of the window's height).
+    // Ignition point (params[0]: whole thousandths of x plus y).
     float2 origin = float2(0.0);
-    float  radius = 0.0;
     if (bound) {
         const float xi = floor(extra.params[0]);
         origin = clamp(float2(xi / 1000.0, extra.params[0] - xi), 0.0, 1.0);
-        radius = extra.params[1] * size.y;
     }
 
     // The burning front, evaluated at the nearest point of the window, so the
@@ -97,11 +93,7 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
 
     // The window's own shape: its rect with rounded corners, antialiased over a
     // pixel. Everything in the frame outside it is shadow.
-    const float2 half_size = 0.5 * size;
-    const float  r   = min(radius, min(half_size.x, half_size.y));
-    const float2 d   = abs(uv * size - half_size) - (half_size - r);
-    const float  sdf = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - r;
-    const float  window_mask = saturate(0.5 - sdf);
+    const float  window_mask = vn_window_shape(uv, size, vn_window_radius(extra, size));
 
     // Multi-octave procedural turbulence for organic burning flame contours
     const float2 np = q * float2(aspect, 1.0);   // noise stays fixed to the window

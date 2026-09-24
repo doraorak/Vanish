@@ -661,6 +661,9 @@ typedef struct {
     // animation: no preference read or string compare per frame, and the
     // choice cannot change halfway through a close.
     const VNAnimationStyle *anim;
+    // The per-close random value in a shader clone's params[0]. The draw hook
+    // finds a layer's animation by it (see vn_phase_publish).
+    float          seed;
     // When the clone was built, which is the mouse-up. A pending clone whose
     // close has not arrived a second later is discarded.
     double         created_at;
@@ -678,6 +681,53 @@ typedef struct {
 #define MAX_CLONE_ANIMATIONS 32
 static VNCloneAnimation    gCloneAnimations[MAX_CLONE_ANIMATIONS];
 static os_unfair_lock gCloneAnimationsLock = OS_UNFAIR_LOCK_INIT;
+
+/// Where each running shader animation is in time, readable from the render
+/// thread without gCloneAnimationsLock: the draw hook runs inside the
+/// compositor, and nothing that holds that lock may wait on the compositor.
+///
+/// Each composited frame takes its phase from the clock at the moment it is
+/// drawn, rather than whatever the last tick left on the window. The tick is a
+/// timer that is not locked to the display's refresh, so a phase it sets can
+/// be drawn twice while the next is skipped; a phase read at draw time is
+/// always that frame's own.
+///
+/// A ring keyed by the clone's per-close seed. Entries are never cleared: a
+/// seed is only looked up while its clone is being drawn, and a new close
+/// brings a new seed.
+typedef struct {
+    _Atomic uint64_t key;       // (1 << 32) | seed bits; 0 while being written
+    double           start;
+    double           duration;
+} VNPhaseEntry;
+
+static VNPhaseEntry     gVNPhases[MAX_CLONE_ANIMATIONS];
+static _Atomic uint32_t gVNPhaseNext;
+
+static void vn_phase_publish(float seed, double start, double duration) {
+    VNPhaseEntry *e = &gVNPhases[atomic_fetch_add_explicit(&gVNPhaseNext, 1, memory_order_relaxed)
+                                 % MAX_CLONE_ANIMATIONS];
+    uint32_t bits;
+    memcpy(&bits, &seed, sizeof(bits));
+    atomic_store_explicit(&e->key, 0, memory_order_relaxed);
+    e->start    = start;
+    e->duration = duration > 0.0 ? duration : 0.25;
+    atomic_store_explicit(&e->key, (1ull << 32) | bits, memory_order_release);
+}
+
+/// The phase, 0..1, of the animation whose clone carries `seed`, at `now`; -1
+/// when it has not started, which leaves the shader on the tick's phase.
+static float vn_phase_for_seed(float seed, double now) {
+    uint32_t bits;
+    memcpy(&bits, &seed, sizeof(bits));
+    const uint64_t want = (1ull << 32) | bits;
+    for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
+        if (atomic_load_explicit(&gVNPhases[i].key, memory_order_acquire) != want) continue;
+        const double p = (now - gVNPhases[i].start) / gVNPhases[i].duration;
+        return (float)(p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
+    }
+    return -1.0f;
+}
 static uint64_t       gNextAnimId = 1;
 static _Atomic bool   gAnimTimerRunning = false;
 
@@ -1375,8 +1425,10 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
 
     if (anim->kind == VN_ANIM_SHADER) {
         // Per-close values for the shader, in the window's unit square:
-        //   params[0]  ignition point, packed as whole thousandths of x plus y
-        //              (y < 1), which a float holds to about 6e-5
+        //   params[0]  a fresh random value per close: Burn reads it as its
+        //              ignition point, packed as whole thousandths of x plus y
+        //              (y < 1), which a float holds to about 6e-5; Dissolve and
+        //              Shatter seed their randomness with it
         //   params[1]  corner radius as a fraction of the window's height
         //   params[2]  inset of the window's left and right edges within the
         //              clone's frame, which also holds the shadow when shadows
@@ -1403,6 +1455,7 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             (float)arc4random_uniform(1001) + (float)arc4random_uniform(1000) / 1000.0f,
             radius, inset_x, top, bottom,
         };
+        out->seed = params[0];
         vn_filter_attach(clone, anim->shader.type, true, params);
         if (anim->shader.hdr) {
             if (atomic_fetch_add_explicit(&gVNHDRClones, 1, memory_order_acq_rel) == 0) vn_edr_ramp_override(true);
@@ -1969,8 +2022,14 @@ static void vn_anim_tick(void *ctx, double when) {
         // parse, on the compositor's timer thread once per frame. The refresh
         // rate cannot meaningfully change inside a 240ms animation, so it is
         // sampled once at the start and reused.
-        double interval = gAnimFrameInterval;
-        if (interval <= 0.0) interval = 1.0 / 120.0;
+        // Twice per refresh. The tick only marks the clone dirty -- each frame
+        // reads its own phase when it is drawn -- but the compositor redraws a
+        // window only once it is dirty, and a timer that is not locked to the
+        // display beats against it: at one tick per refresh, some refreshes
+        // get two and the next gets none, and that frame repeats. At two per
+        // refresh every refresh has one to draw. The tick's work is ~0.01ms.
+        double interval = gAnimFrameInterval * 0.5;
+        if (interval <= 0.0) interval = 1.0 / 240.0;
 
         // Advance the deadline rather than measuring from now, so the timer's
         // own lateness does not compound frame over frame. If we have fallen
@@ -2052,13 +2111,15 @@ static void vn_start_clone_animation(VNClone clone) {
     anim_id = gNextAnimId++;
     if (!clone.anim) clone.anim = &gAnimationStyles[0];
     clone.frame = frame;
+    const double start_time = SLSCurrentRealTime();
     gCloneAnimations[slot] = (VNCloneAnimation){
         .anim_id = anim_id,
         .clone = clone,
         .is_animating = true,
-        .start_time = SLSCurrentRealTime(),
+        .start_time = start_time,
         .duration = (double)dur,
     };
+    if (clone.anim->kind == VN_ANIM_SHADER) vn_phase_publish(clone.seed, start_time, (double)dur);
     os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     if (clone_wid != 0) {
@@ -2081,7 +2142,7 @@ static void vn_start_clone_animation(VNClone clone) {
         bool expected = false;
         if (atomic_compare_exchange_strong_explicit(&gAnimTimerRunning, &expected, true,
                                                     memory_order_acq_rel, memory_order_acquire)) {
-            gAnimNextDeadline = SLSCurrentRealTime() + interval;
+            gAnimNextDeadline = SLSCurrentRealTime() + interval * 0.5;
             vn_resolved_schedule_callback(vn_anim_tick, NULL, gAnimNextDeadline);
         } else {
             VN_DEBUG("anim_tick timer loop already active -- clone wid=%u animating concurrently", clone_wid);
@@ -3330,6 +3391,7 @@ static void *vn_shader_for_fragment(const char *frag_name) {
 typedef struct {
     float params[5];   // the layer's filter params, set per close in vn_make_clone
     float bound;       // 1 when params came from a layer; 0 leaves the shader on its defaults
+    float phase;       // the animation's phase when this frame is drawn; -1 = use the tick's
 } VNShaderExtra;
 
 /// True once every hook the argument buffer needs is in place. Our fragment
@@ -3401,11 +3463,14 @@ static void vn_hook_set_pipeline_state(void *context, void *pipeline) {
         msg = (void (*)(void *, void *, const void *, unsigned long, unsigned long))dlsym(RTLD_DEFAULT, "objc_msgSend");
     }
 
-    VNShaderExtra extra = {0};
+    VNShaderExtra extra = { .phase = -1.0f };
     void *layer = tl_vn_layer;
     if (layer && *(uint32_t *)((char *)layer + kVNLayerFilterTypeOffset) == kVNFilterTypeShaderTag) {
         memcpy(extra.params, (char *)layer + kVNLayerFilterParamsOffset, sizeof(extra.params));
         extra.bound = 1.0f;
+        const double now = SLSCurrentRealTime();
+        extra.phase = vn_phase_for_seed(extra.params[0], now);
+        VN_TRACE("draw: layer %p phase %.4f at %.4f", layer, (double)extra.phase, now);
     }
 
     void *encoder = vn_resolved_render_encoder(context);

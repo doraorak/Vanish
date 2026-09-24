@@ -13,9 +13,10 @@
 fragment float4 vn_uber_crt(VNUberStage in [[stage_in]],
                             texture2d<float> tex2D [[texture(0)]],
                             constant VNUberArgs &args [[buffer(0)]],
+                            constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                             sampler samp [[sampler(0)]]) {
     const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
-    const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
+    const float  t  = vn_phase(args, extra);
 
     const float vert  = clamp(t / 0.62, 0.0, 1.0);          // squeeze to a line
     const float horiz = clamp((t - 0.62) / 0.38, 0.0, 1.0); // then to a dot

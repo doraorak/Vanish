@@ -52,19 +52,20 @@
 
 // Sites are the lattice jittered by up to half a cell: irregular and angular,
 // the way glass actually breaks, without the near-degenerate slivers that full
-// jitter produces.
-static inline float2 vn_shard_site(float2 g) {
-    return g + 0.5 + (vn_hash22(g) - 0.5) * 0.95;
+// jitter produces. `seed` changes the jitter on every close, so the glass
+// breaks along different lines each time.
+static inline float2 vn_shard_site(float2 g, float2 seed) {
+    return g + 0.5 + (vn_hash22(g + seed) - 0.5) * 0.95;
 }
 
 /// Which shard owns a point, and where that shard's centroid is. Cell space.
-static inline void vn_shard_at(float2 c, thread float2 &id, thread float2 &site) {
+static inline void vn_shard_at(float2 c, float2 seed, thread float2 &id, thread float2 &site) {
     const float2 base = floor(c);
     float best = 1e9;
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
             const float2 g = base + float2(i, j);
-            const float2 s = vn_shard_site(g);
+            const float2 s = vn_shard_site(g, seed);
             const float  d = distance_squared(c, s);
             if (d < best) { best = d; id = g; site = s; }
         }
@@ -84,14 +85,34 @@ static inline void vn_shard_at(float2 c, thread float2 &id, thread float2 &site)
 fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
                                 texture2d<float> tex2D [[texture(0)]],
                                 constant VNUberArgs &args [[buffer(0)]],
+                                constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                                 sampler samp [[sampler(0)]]) {
-    const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
-    const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
+    // `fuv` spans the clone's frame -- the window plus its shadow when shadows
+    // are on. The glass is the window alone: `uv` spans just the window's rect,
+    // the shards are cut from it, and each shard is masked to the window's
+    // rounded shape, so no piece carries shadow away with it.
+    const float2 fuv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
+    const float  t   = vn_phase(args, extra);
+    float2 w0, wsz;
+    vn_window_rect(extra, w0, wsz);
+    const float2 uv  = (fuv - w0) / wsz;
+
+    // New on every close: which pieces the glass breaks into, and how each one
+    // lets go, tumbles and drifts. The impact stays at the close button.
+    const float2 seed = vn_close_seed(extra);
 
     // Derivatives have to be taken in uniform control flow, so the pixel size
     // is read once here, before anything branches.
-    const float2 px   = max(fwidth(uv), float2(1e-6));
-    const float2 size = 1.0 / px;                  // the window, in pixels
+    const float2 px     = max(fwidth(fuv) / wsz, float2(1e-6));
+    const float2 size   = 1.0 / px;                  // the window, in pixels
+    const float  radius = vn_window_radius(extra, size);
+
+    // The frame -- window and shadow -- only exists inside [0,1]; the quad's
+    // margin beyond it is empty until shards fall into it, so nothing here may
+    // return early for a pixel outside the frame.
+    const bool   in_frame    = all(fuv >= 0.0) && all(fuv <= 1.0);
+    const float4 frame_texel = in_frame ? tex2D.sample(samp, fuv) : float4(0.0);
+    if (t <= 0.0) return frame_texel;
 
     // Big enough to read as shards of glass on a large window, not so small
     // that closing a dialog turns it to grit.
@@ -103,6 +124,18 @@ fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
     // than ellipses on a window that is not square.
     const float2 c    = uv / cell_uv;
     const float  span = max(length(1.0 / cell_uv), 1e-4);   // diagonal, in cells
+
+    // The shadow stays where the window was and goes as the glass beside it
+    // does: a shadow pixel lasts until the shard nearest to it lets go.
+    float4 shadow = float4(0.0);
+    const float outside = in_frame ? 1.0 - vn_window_shape(uv, size, radius) : 0.0;
+    if (outside > 0.0) {
+        float2 rest_id = float2(0.0), rest_site = float2(0.0);
+        vn_shard_at(clamp(uv, 0.0, 1.0) / cell_uv, seed, rest_id, rest_site);
+        const float rest_start = length(rest_site) / span * 0.42
+                               + vn_hash22(rest_id + seed + 0.37).x * 0.12;
+        shadow = frame_texel * outside * (1.0 - smoothstep(rest_start, rest_start + 0.08, t));
+    }
 
     const float te = t * t;
 
@@ -117,10 +150,10 @@ fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
     // One lookup, and it is exact: the local part only ever shrinks a shard
     // towards its own centroid, so it cannot have left its cell.
     float2 id = float2(0.0), site = float2(0.0);
-    vn_shard_at(y, id, site);
+    vn_shard_at(y, seed, id, site);
 
-    const float2 h1 = vn_hash22(id + 0.37);
-    const float2 h2 = vn_hash22(id + 11.13);
+    const float2 h1 = vn_hash22(id + seed + 0.37);
+    const float2 h2 = vn_hash22(id + seed + 11.13);
 
     // Pieces let go in the order the crack reached them.
     const float reach = length(site) / span;
@@ -145,18 +178,21 @@ fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
     // it started in. That is not an error: it is the gap that opened between
     // this piece and the next one.
     float2 id2 = float2(0.0), site2 = float2(0.0);
-    vn_shard_at(q, id2, site2);
-    if (any(id2 != id)) return float4(0.0);
-
-    if (age >= 1.0) return float4(0.0);
+    vn_shard_at(q, seed, id2, site2);
+    if (any(id2 != id) || age >= 1.0) return shadow;
 
     const float2 src = q * cell_uv;
-    if (any(src < 0.0) || any(src > 1.0)) return float4(0.0);
+    if (any(src < 0.0) || any(src > 1.0)) return shadow;
 
     // No shading of any kind: a shard carries its own pixels at their own
     // colour, and the only thing that touches them is the fade that takes a
-    // spent piece out without a pop. The motion is the effect.
-    return tex2D.sample(samp, src) * clamp(1.3 - age, 0.0, 1.0);
+    // spent piece out without a pop. The motion is the effect. The window's
+    // rounded corners are cut from it here, where they would otherwise carry
+    // the shadow sitting behind them.
+    const float4 shard = tex2D.sample(samp, w0 + src * wsz)
+                       * vn_window_shape(src, size, radius)
+                       * clamp(1.3 - age, 0.0, 1.0);
+    return shard + shadow * (1.0 - shard.a);
 }
 
 #endif // VN_SHATTER_METAL

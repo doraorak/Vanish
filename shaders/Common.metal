@@ -63,7 +63,54 @@ struct VNUberArgs {
 struct VNShaderExtra {
     float params[5];
     float bound;
+    float phase;    // the animation's phase when this frame is drawn; -1 = none
 };
+
+// The animation's progress, 0..1, for the frame being drawn. Vanish computes it
+// from the clock at draw time, so every composited frame shows its own moment;
+// before the animation starts, or unbound, it falls back to the phase the last
+// tick left in `brightness`.
+static inline float vn_phase(constant VNUberArgs &args, constant VNShaderExtra &extra) {
+    return extra.phase >= 0.0 ? extra.phase : clamp(1.0 - args.brightness, 0.0, 1.0);
+}
+
+// Where the window itself sits within the clone's frame, which also holds the
+// drop shadow when shadows are on: VNShaderExtra params[2] is the inset of its
+// left and right edges (the shadow is centred horizontally), params[3] and
+// params[4] its top and bottom. Unbound, the window is the whole frame.
+static inline void vn_window_rect(constant VNShaderExtra &extra, thread float2 &w0, thread float2 &wsz) {
+    const bool bound = extra.bound > 0.5;
+    w0 = bound ? float2(extra.params[2], extra.params[3]) : float2(0.0);
+    const float2 w1 = bound ? float2(1.0 - extra.params[2], extra.params[4]) : float2(1.0);
+    wsz = max(w1 - w0, float2(1e-4));
+}
+
+// The window's corner radius in pixels (params[1] is a fraction of its height),
+// for a window `size` pixels big. Zero unbound.
+static inline float vn_window_radius(constant VNShaderExtra &extra, float2 size) {
+    return extra.bound > 0.5 ? extra.params[1] * size.y : 0.0;
+}
+
+// How much of the window's rounded shape covers a point given in the window's
+// unit square: 1 inside, 0 outside, antialiased over a pixel.
+static inline float vn_window_shape(float2 uv, float2 size, float radius) {
+    const float2 half_size = 0.5 * size;
+    const float  r   = min(radius, min(half_size.x, half_size.y));
+    const float2 d   = abs(uv * size - half_size) - (half_size - r);
+    const float  sdf = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - r;
+    return saturate(0.5 - sdf);
+}
+
+// An offset for hash inputs that is different on every close, so a shader's
+// randomness -- where pieces break, how flecks drift -- is new each time.
+// params[0] is a fresh random value per close (Burn reads it as its ignition
+// point); unbound, the offset is zero and the shader keeps its fixed pattern.
+// Kept under 100 so the sin-based vn_hash stays precise.
+static inline float2 vn_close_seed(constant VNShaderExtra &extra) {
+    if (extra.bound <= 0.5) return float2(0.0);
+    const float s = extra.params[0];
+    return float2(fract(s * 0.6180339), fract(s * 0.4142136)) * 97.0;
+}
 
 vertex VNUberStage vn_uber_vertex(VNUberIn in [[stage_in]],
                                   constant float4x4 &mvp [[buffer(1)]]) {
