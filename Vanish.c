@@ -3389,6 +3389,9 @@ static void *vn_hook_copy_pipeline_state(void *shader, void *context, bool a, bo
 /// our fragment functions read it, so it must be bound on every draw of theirs.
 static void vn_hook_set_pipeline_state(void *context, void *pipeline) {
     vn_orig_set_pipeline_state(context, pipeline);
+    // Every layer of every window comes through here, every frame; only while
+    // a shader clone exists can one of our pipelines be among them.
+    if (atomic_load_explicit(&gShaderFilterCount, memory_order_acquire) <= 0) return;
     if (!pipeline || !vn_is_our_pipeline(pipeline)) return;
 
     static void (*msg)(void *, void *, const void *, unsigned long, unsigned long);

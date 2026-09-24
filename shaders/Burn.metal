@@ -71,6 +71,30 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
         radius = extra.params[1] * size.y;
     }
 
+    // The burning front, evaluated at the nearest point of the window, so the
+    // shadow beside any part of the window goes exactly when that part does.
+    const float2 q      = clamp(uv, 0.0, 1.0);
+    const float2 p      = (q - origin) * float2(aspect, 1.0);
+    const float2 far    = float2(max(origin.x, 1.0 - origin.x), max(origin.y, 1.0 - origin.y));
+    const float  dist   = length(p);
+    const float  span   = length(far * float2(aspect, 1.0));
+    const float  norm_d = dist / max(span, 1e-4);
+
+    // Wavefront expands smoothly from the ignition point to consume the full window
+    const float front = pow(t, 0.88) * 1.25;
+
+    // Smooth exit into void at end of animation
+    const float exit = 1.0 - smoothstep(0.92, 1.0, t);
+
+    // The turbulence below moves the front by less than 0.04 either way, and
+    // the burn and the crest only change within (-0.07, 0.02) of it. Far enough
+    // ahead of the front a pixel is untouched and far enough behind it is gone,
+    // whatever the noise -- so only the narrow band around the front pays for
+    // the noise, the window's shape and a second texture read.
+    const float delta0 = norm_d - front;
+    if (delta0 >=  0.06) return src * exit;
+    if (delta0 <= -0.11) return float4(0.0);
+
     // The window's own shape: its rect with rounded corners, antialiased over a
     // pixel. Everything in the frame outside it is shadow.
     const float2 half_size = 0.5 * size;
@@ -79,30 +103,15 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     const float  sdf = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - r;
     const float  window_mask = saturate(0.5 - sdf);
 
-    // The burning front, evaluated at the nearest point of the window, so the
-    // shadow beside any part of the window goes exactly when that part does.
-    const float2 q      = clamp(uv, 0.0, 1.0);
-    const float2 p      = (q - origin) * float2(aspect, 1.0);
-    const float2 far    = float2(max(origin.x, 1.0 - origin.x), max(origin.y, 1.0 - origin.y));
-    const float  dist   = length(p);
-    const float  span   = length(far * float2(aspect, 1.0));
-    const float2 np     = q * float2(aspect, 1.0);   // noise stays fixed to the window
-    const float  norm_d = dist / max(span, 1e-4);
-
-    // Wavefront expands smoothly from the ignition point to consume the full window
-    const float front = pow(t, 0.88) * 1.25;
-
     // Multi-octave procedural turbulence for organic burning flame contours
+    const float2 np = q * float2(aspect, 1.0);   // noise stays fixed to the window
     const float n = vn_fast_noise(np * 5.5 - float2(t * 2.2)) * 0.70
                   + vn_fast_noise(np * 14.0 + float2(t * 3.5)) * 0.30;
 
-    const float delta = norm_d - front + (n - 0.5) * 0.08;
+    const float delta = delta0 + (n - 0.5) * 0.08;
 
     // Matter burn mask: 1.0 ahead of the wave, falling sharply to 0.0 across the flame
     const float burn_mask = smoothstep(-0.04, 0.01, delta);
-
-    // Smooth exit into void at end of animation
-    const float exit = 1.0 - smoothstep(0.92, 1.0, t);
 
     const float4 shadow = src * burn_mask * (1.0 - window_mask);
     if (window_mask <= 0.0) return shadow * exit;
@@ -111,10 +120,14 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     const float fire_crest = smoothstep(0.02, -0.01, delta) * smoothstep(-0.07, -0.01, delta);
     const float heat = pow(fire_crest, 0.75) * window_mask;
 
-    // Sample window content with slight refractive heat shimmer at the flame
-    const float2 shock_dir = dist > 1e-4 ? normalize(q - origin) : float2(0.7071, 0.7071);
-    const float2 sample_uv = q - shock_dir * (heat * 0.020);
-    float4 base = tex2D.sample(samp, w0 + clamp(sample_uv, 0.0, 1.0) * wsz);
+    // Window content, with slight refractive heat shimmer at the flame; off the
+    // crest there is no shimmer and the texel is the one already read.
+    float4 base = src;
+    if (heat > 0.0) {
+        const float2 shock_dir = dist > 1e-4 ? normalize(q - origin) : float2(0.7071, 0.7071);
+        const float2 sample_uv = q - shock_dir * (heat * 0.020);
+        base = tex2D.sample(samp, w0 + clamp(sample_uv, 0.0, 1.0) * wsz);
+    }
     base *= burn_mask * window_mask;
 
     // Display HDR headroom: 1.0 on SDR, up to 3.5 on Liquid Retina XDR
