@@ -266,6 +266,11 @@ static VNPostEventByConnectionFn    vn_orig_post_event;
 static VNUpdateCAVisibilityFn       vn_resolved_update_ca_visibility;
 static VNUnobscuredContentShapeFn        vn_resolved_unobscured_content_shape;
 static VNGetRegionBoundsFn               vn_resolved_get_region_bounds;
+static void                            **vn_resolved_session_control_ref;
+static VNCopyScreenShapeFn               vn_resolved_copy_screen_frame_shape;
+static VNCopyScreenShapeFn               vn_resolved_copy_screen_content_shape;
+static int (*vn_region_union)(void *, void *, void **);
+static int (*vn_region_diff)(void *, void *, void **);
 static VNClearShadowDensityFn            vn_resolved_clear_shadow_density;
 static VNWSWindowSetShadowEnableFn        vn_resolved_window_set_shadow_enable;
 static VNWSWindowReleaseShadowResourcesFn vn_resolved_window_release_shadow_resources;
@@ -2796,6 +2801,72 @@ static void vn_track_window_release(uint32_t wid) {
 /// inflated rect would overlap windows that merely sit near the closing one,
 /// drop them from the list, and the water would fall straight through the first
 /// thing under it.
+/// Whether `w` is one of ours: a water clone in a slot, any clone the
+/// animation table knows, or the window being closed -- which is on its way
+/// out, and whose shadow would otherwise hide the edges of its neighbours.
+static bool vn_water_ignores_as_cover(CGXWindow *w, uint32_t closing_wid) {
+    const uint32_t wid = vn_resolved_window_get_id ? vn_resolved_window_get_id(w) : 0;
+    if (wid != 0 && wid == closing_wid) return true;
+    for (int i = 0; i < kVNWaterSlots; i++) {
+        if (gVNWaterSlots[i].generation != 0 && gVNWaterSlots[i].clone_win == w) return true;
+    }
+    return vn_is_clone_wid(wid, w);
+}
+
+/// The bounds of the part of `w` you can see, leaving our own windows out of
+/// what covers it. The same computation as
+/// CGXCreateScreenUnobscuredContentShapeForWindow -- content shape minus the
+/// frame shapes of every window above -- over the same window stack, with
+/// vn_water_ignores_as_cover skipped. See kVNSymSessionControlRef.
+///
+/// 1 with `out` set when some of it is visible, 0 when none is, and -1 when
+/// the stack could not be read, which sends the caller back to SkyLight's own
+/// answer.
+static int vn_water_visible_bounds(CGXWindow *w, uint32_t closing_wid, CGRect *out) {
+    if (!vn_resolved_session_control_ref || !vn_resolved_copy_screen_frame_shape ||
+        !vn_resolved_copy_screen_content_shape || !vn_region_union || !vn_region_diff ||
+        !vn_resolved_get_region_bounds) return -1;
+
+    const char *session = *(const char **)vn_resolved_session_control_ref;
+    if (!session) return -1;
+    const char *windows = *(const char * const *)(session + kVNSessionWindowsOuterOffset);
+    if (!windows) return -1;
+    windows = *(const char * const *)(windows + kVNSessionWindowsInnerOffset);
+    if (!windows) return -1;
+    const struct { CGXWindow **items; int32_t count; } *stack = (const void *)(windows + kVNSessionWindowStackOffset);
+    if (!stack->items || stack->count <= 0 || stack->count > 16384) return -1;
+
+    // Front to back: everything before `w` is above it. Not finding it at all
+    // means this is not the stack the window lives in.
+    int32_t index = -1;
+    for (int32_t i = 0; i < stack->count; i++) {
+        if (stack->items[i] == w) { index = i; break; }
+    }
+    if (index < 0) return -1;
+
+    void *visible = vn_resolved_copy_screen_content_shape(w, 0);
+    if (!visible) return 0;
+    for (int32_t i = 0; i < index; i++) {
+        CGXWindow *above = stack->items[i];
+        if (!above || vn_water_ignores_as_cover(above, closing_wid)) continue;
+        void *frame = vn_resolved_copy_screen_frame_shape(above, 0);
+        if (!frame) continue;
+        void *rest = NULL;
+        vn_region_diff(visible, frame, &rest);
+        CFRelease(frame);
+        CFRelease(visible);
+        visible = rest;
+        if (!visible) return 0;
+    }
+
+    CGRect bounds = CGRectZero;
+    vn_resolved_get_region_bounds(visible, &bounds);
+    CFRelease(visible);
+    if (bounds.size.width < 1.0 || bounds.size.height < 1.0) return 0;
+    *out = bounds;
+    return 1;
+}
+
 static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_pt,
                                            CGRect display_pt, CGRect out[kVNMaxObstacles]) {
     const double t0 = SLSCurrentRealTime();
@@ -2866,17 +2937,32 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
         //
         // The bounding box of that shape becomes the obstacle, so a window
         // half-covered from one side only blocks along the half you can see.
-        if (vn_resolved_unobscured_content_shape && vn_resolved_get_region_bounds) {
+        //
+        // Our own windows are left out of what covers it. SkyLight's answer
+        // counts every window above, and a water clone still fading from the
+        // last close is the whole display: asked while one is up, every
+        // window is buried and the water falls through all of them.
+        CGRect visible = CGRectZero;
+        int seen_state = vn_water_visible_bounds(w, closing_wid, &visible);
+        if (seen_state < 0 && vn_resolved_unobscured_content_shape && vn_resolved_get_region_bounds) {
             void *shape = vn_resolved_unobscured_content_shape(w);
-            if (!shape) {
-                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is not visible -- skipped",
-                         wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
-                continue;
+            seen_state = shape ? 1 : 0;
+            if (shape) {
+                vn_resolved_get_region_bounds(shape, &visible);
+                CFRelease(shape);
             }
-            CGRect visible = CGRectZero;
-            vn_resolved_get_region_bounds(shape, &visible);
-            CFRelease(shape);
-
+            static bool s_reported;
+            if (!s_reported) {
+                s_reported = true;
+                VN_ERROR("water: the window stack could not be read -- visibility counts our own clones as cover");
+            }
+        }
+        if (seen_state == 0) {
+            VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is not visible -- skipped",
+                     wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
+            continue;
+        }
+        if (seen_state > 0) {
             // Mostly buried counts as buried: landing on a sliver reads as
             // landing on nothing.
             const double full = r.size.width * r.size.height;
@@ -4961,6 +5047,16 @@ static void vanish_init_payload(void) {
     // behaviour this replaces rather than a failure.
     vn_resolved_unobscured_content_shape =
         (VNUnobscuredContentShapeFn)vn_skylight_symbol(kVNSymUnobscuredContentShape);
+    // A data symbol: strip the function-pointer signature vn_skylight_symbol puts on.
+    vn_resolved_session_control_ref = (void **)ptrauth_strip(vn_skylight_symbol(kVNSymSessionControlRef),
+                                                             ptrauth_key_function_pointer);
+    vn_resolved_copy_screen_frame_shape   = (VNCopyScreenShapeFn)vn_skylight_symbol(kVNSymCopyScreenFrameShape);
+    vn_resolved_copy_screen_content_shape = (VNCopyScreenShapeFn)vn_skylight_symbol(kVNSymCopyScreenContentShape);
+    vn_region_union = (int (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "CGSUnionRegion");
+    vn_region_diff  = (int (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "CGSDiffRegion");
+    VN_INFO("water: window stack %p, frame shape %p, content shape %p, union %p, diff %p",
+            (void *)vn_resolved_session_control_ref, (void *)vn_resolved_copy_screen_frame_shape,
+            (void *)vn_resolved_copy_screen_content_shape, (void *)vn_region_union, (void *)vn_region_diff);
     vn_resolved_get_region_bounds = (VNGetRegionBoundsFn)dlsym(RTLD_DEFAULT, "CGSGetRegionBounds");
     VN_INFO("water: unobscured_content_shape=%p get_region_bounds=%p",
             (void *)vn_resolved_unobscured_content_shape, (void *)vn_resolved_get_region_bounds);

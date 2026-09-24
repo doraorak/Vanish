@@ -674,6 +674,35 @@ typedef void   (*VNFreezeContentFn)(CGXWindow *);
 /// CGSGetRegionBounds(region, &rect) writes its bounding box as four doubles.
 #define kVNSymUnobscuredContentShape "_CGXCreateScreenUnobscuredContentShapeForWindow"
 
+/// The pieces CGXCreateScreenUnobscuredContentShapeForWindow is built from, so
+/// the same answer can be had with some windows left out of it.
+///
+/// That function subtracts the FRAME shape of every window stacked above --
+/// and a water clone is shaped to the whole display and ordered above
+/// everything, so while one is on screen every window reads as buried. With
+/// long closes and fades one nearly always is. The windows above come from the
+/// session's window stack, front to back, index 0 topmost; the function takes
+/// items[0 .. index(window)):
+///
+///     create_frame_shape_above_for_window:
+///       +124: adrp x8, __sessionControlRef@PAGE ; ldr x8, [x8, @PAGEOFF]
+///       +132: ldr x8, [x8, #0x20]
+///       +136: ldr x8, [x8, #0x90]
+///       +140: add x0, x8, #0x38          ; the stack: { CGXWindow **items; int32 count }
+///       +160: bl  CGXWindowArraySubArrayBetween(stack, 1, NULL, 1, window)
+///       ...   union of CGXCopyScreenFrameShapeForWindow(above[i], 0)
+///
+///     window_array_offset_relative_to(stack, NULL, 1) = 0,
+///     window_array_offset_relative_to(stack, win, 1)  = its index.
+///
+/// Both shape functions return a region the caller owns (CFRelease).
+#define kVNSymSessionControlRef       "___sessionControlRef"
+#define kVNSymCopyScreenFrameShape    "_CGXCopyScreenFrameShapeForWindow"
+#define kVNSymCopyScreenContentShape  "_CGXCopyScreenContentShapeForWindow"
+#define kVNSessionWindowsOuterOffset  0x20
+#define kVNSessionWindowsInnerOffset  0x90
+#define kVNSessionWindowStackOffset   0x38
+
 /// Window shadow management
 #define kVNSymClearShadowDensity "__ZL20clear_shadow_densityP9CGXWindow"
 #define kVNSymWSWindowSetShadowEnable "_WSWindowSetShadowEnable"
@@ -721,6 +750,7 @@ typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);
 typedef double (*VNCornerRadiusFn)(CGXWindow *);
 
 typedef void *(*VNUnobscuredContentShapeFn)(CGXWindow *);
+typedef void *(*VNCopyScreenShapeFn)(CGXWindow *, int);
 typedef int   (*VNGetRegionBoundsFn)(void *region, CGRect *out);
 
 typedef void (*VNClearShadowDensityFn)(CGXWindow *);
