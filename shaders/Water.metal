@@ -67,10 +67,11 @@ struct VNSimParams {
     uint  bin_slots;
     uint  field_w, field_h;
     uint  obstacles;                 // how many of the obstacle buffer is live
-    uint  valid;                     // 0 = no simulation behind this frame
+    uint  valid;                     // 0 = no simulation yet, 1 = draw it, 2 = this close's water is gone
     float tint;                      // 0..1, how far it settles toward water blue
-    float seed_phase;                // the close's phase when the fluid was seeded
+    float age;                       // seconds since the fluid was seeded
     uint  drains;                    // bit 0 left corner, 1 middle, 2 right corner
+    float fade;                      // 1 while the water is shown, down to 0 as it goes
 };
 
 /// Must match VNParticle in Vanish.c. `uv0` is where in the window this parcel
@@ -92,7 +93,7 @@ struct VNObstacle {
     float _pad;
 };
 
-static_assert(sizeof(VNSimParams) == 124, "VNSimParams must match WaterSim.h");
+static_assert(sizeof(VNSimParams) == 128, "VNSimParams must match WaterSim.h");
 static_assert(sizeof(VNParticle) == 48, "VNParticle must match WaterSim.h");
 static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match WaterSim.h");
 
@@ -159,6 +160,10 @@ constant float kVNCornerDrainFraction = 0.075;
 /// field in one move -- it stops existing for everything downstream without
 /// needing a second buffer or a compaction pass.
 #define VN_DRAINED (1u << 31)
+
+/// How long the tint takes to run its course, in seconds from the fluid's
+/// birth. The length of the close it used to be measured against.
+constant float kVNTintSeconds = 1.6;
 
 static inline bool vn_inside_obstacle(float2 p, VNObstacle o, float margin) {
     return p.x > o.min_x - margin && p.x < o.max_x + margin &&
@@ -524,6 +529,18 @@ kernel void vn_pbf_vel_commit(device VNParticle *P     [[buffer(0)]],
     P[id].dp  = float2(0.0);
 }
 
+/// How much of the fluid is still on screen. The CPU reads the count back when
+/// the frame's command buffer completes, and a close whose water has all
+/// drained ends there instead of running out its duration. The slot is zeroed
+/// by the CPU after reading, so nothing here has to clear it.
+kernel void vn_pbf_census(const device VNParticle *P [[buffer(0)]],
+                          constant VNSimParams &sp   [[buffer(2)]],
+                          device atomic_uint *live   [[buffer(5)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= sp.count) return;
+    if ((P[id].ignore & VN_DRAINED) == 0u) atomic_fetch_add_explicit(live, 1u, memory_order_relaxed);
+}
+
 #pragma mark - Surface field
 
 /// Gathers the density and the window colour the fluid is carrying into one
@@ -641,6 +658,10 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     // The registry's identity rule: the clone composites once with the tag on
     // before the animation starts, and that frame has to be the untouched
     // window. The same branch covers a frame with no simulation behind it.
+    // Its simulation was handed to a newer close: nothing of it is left to draw,
+    // and the untouched window would be a window coming back.
+    if (sp.valid == 2u) return float4(0.0);
+
     if (t <= 0.0 || sp.valid == 0) {
         return inside_window ? tex2D.sample(samp, uv) : float4(0.0);
     }
@@ -708,11 +729,10 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     // both, because they are the same question asked twice: at 0 the liquid
     // keeps the window's own colours the whole way, and at 1 it is water almost
     // immediately.
-    // Measured from when the fluid was born, not from when the close began.
-    // Those differ by however long the first step took to get going, and using
-    // the close's own phase meant a late-starting simulation appeared already
-    // at the end of its transition.
-    const float  wt = saturate((t - sp.seed_phase) / max(1.0 - sp.seed_phase, 0.05));
+    // Measured in seconds from when the fluid was born, not as a share of the
+    // close: a close can run for half a minute, and the water has to look like
+    // water long before that.
+    const float  wt = saturate(sp.age / kVNTintSeconds);
 
     const float3 kWaterBlue = float3(0.30, 0.52, 0.78);
     const float  amount = saturate(sp.tint);
@@ -729,7 +749,7 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     liquid.rgb += spec * 0.9 + fresnel * 0.35;
     liquid.a = saturate(mix(0.72, 1.0, thickness));
 
-    return mix(out, liquid, cover * liquid.a);
+    return mix(out, liquid, cover * liquid.a * saturate(sp.fade));
 }
 
 #endif // VN_WATER_METAL

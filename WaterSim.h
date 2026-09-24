@@ -171,18 +171,14 @@ typedef struct {
     /// blue, 0..1, from the preferences. 0 keeps the window's colours for the
     /// whole close; 1 turns it almost at once.
     float    tint;
-    /// The animation's phase at the moment the fluid was seeded.
-    ///
-    /// The close's clock starts when the window starts closing; the fluid's
-    /// starts when there is fluid, and the two are not the same instant. The
-    /// first step of a close has to build fourteen pipelines, three buffers and
-    /// two textures before it can run, and the animation is already under way
-    /// while that happens. Anything the shader ramps over the close has to be
-    /// measured from here, or the liquid is born partway through its own
-    /// transition -- which looked like a window turning up already blue.
-    float    seed_phase;
+    /// Seconds since the fluid was seeded. The tint runs on this rather than on
+    /// the close's phase, so it takes the same time whatever the duration.
+    float    age;
     /// Which floor openings are open: kVNDrainLeft | kVNDrainMiddle | kVNDrainRight.
     uint32_t drains;
+    /// 1 while the water is shown, falling to 0 as it fades out -- at the end
+    /// of its duration, or when a newer water close takes over.
+    float    fade;
 } VNSimParams;
 
 /// Must match VNObstacle in Water.metal.
@@ -195,7 +191,7 @@ typedef struct {
 #define kVNMaxObstacles 24
 
 _Static_assert(sizeof(VNParticle) == 48, "VNParticle must match Water.metal");
-_Static_assert(sizeof(VNSimParams) == 124, "VNSimParams must match Water.metal");
+_Static_assert(sizeof(VNSimParams) == 128, "VNSimParams must match Water.metal");
 _Static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match Water.metal");
 
 /// The 2D kernels, in the same form the shader uses them. 2D, not 3D: this

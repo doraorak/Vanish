@@ -287,7 +287,18 @@ static const VNAnimationMeta kAnimations[] = {
     _durationTitle = [self createLabel:@"Animation Duration"];
     [_rowDuration addSubview:_durationTitle];
     
+    // Editable, and not bounded by the slider: the slider covers the everyday
+    // range, and anything up to a minute can be typed here -- a water close
+    // can usefully run for thirty seconds.
     _durationLabel = [self createBadgeLabel:@"0.25s"];
+    _durationLabel.editable = YES;
+    _durationLabel.selectable = YES;
+    _durationLabel.bezeled = YES;
+    _durationLabel.bezelStyle = NSTextFieldRoundedBezel;
+    _durationLabel.drawsBackground = YES;
+    _durationLabel.target = self;
+    _durationLabel.action = @selector(durationFieldCommitted:);
+    _durationLabel.toolTip = @"Seconds, 0.05 to 60";
     [_rowDuration addSubview:_durationLabel];
     
     _resetDurationBtn = [NSButton buttonWithTitle:@"Reset" target:self action:@selector(resetDurationClicked:)];
@@ -426,10 +437,10 @@ static const VNAnimationMeta kAnimations[] = {
     
     // Row 2: Single Duration Slider
     _rowDuration.frame = NSMakeRect(0, 37, w, 52.0);
-    CGFloat durLabelW = 42.0;
+    CGFloat durLabelW = 56.0;
     CGSize rsz = [_resetDurationBtn fittingSize];
     CGFloat resetW = MAX(rsz.width + 6, 40.0);
-    _durationLabel.frame = NSMakeRect(w - 12 - durLabelW, 5, durLabelW, 15);
+    _durationLabel.frame = NSMakeRect(w - 12 - durLabelW, 2, durLabelW, 19);
     _resetDurationBtn.frame = NSMakeRect(w - 12 - durLabelW - 4 - resetW, 4, resetW, 18);
     _durationTitle.frame = NSMakeRect(12, 5, w - 24 - durLabelW - 4 - resetW - 6, 15);
     _durationSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
@@ -677,6 +688,23 @@ static const VNAnimationMeta kAnimations[] = {
     double dur = sender.doubleValue;
     _durationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", dur];
     
+    NSString *animKey = _animPopUp.selectedItem.representedObject ?: @"shrink";
+    NSString *durKey = [NSString stringWithFormat:@"duration_%@", animKey];
+    [self writePrefValue:@(dur) forKey:durKey];
+}
+
+- (void)durationFieldCommitted:(NSTextField *)sender {
+    // "30", "30s" and "30.0" all read as thirty seconds. Out of range is
+    // clamped to what the tweak accepts rather than silently ignored there.
+    double dur = sender.stringValue.doubleValue;
+    if (!(dur > 0.0)) {
+        [self updateDurationSliderForActiveAnimation];
+        return;
+    }
+    dur = MIN(MAX(dur, 0.05), 60.0);
+    _durationSlider.doubleValue = MIN(dur, _durationSlider.maxValue);
+    _durationLabel.stringValue = [NSString stringWithFormat:@"%.2fs", dur];
+
     NSString *animKey = _animPopUp.selectedItem.representedObject ?: @"shrink";
     NSString *durKey = [NSString stringWithFormat:@"duration_%@", animKey];
     [self writePrefValue:@(dur) forKey:durKey];
