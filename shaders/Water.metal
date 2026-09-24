@@ -72,6 +72,7 @@ struct VNSimParams {
     float age;                       // seconds since the fluid was seeded
     uint  drains;                    // bit 0 left corner, 1 middle, 2 right corner
     float fade;                      // 1 while the water is shown, down to 0 as it goes
+    uint  fresh;                     // obstacles that appeared this step, a bit per index
 };
 
 /// Must match VNParticle in Vanish.c. `uv0` is where in the window this parcel
@@ -93,7 +94,7 @@ struct VNObstacle {
     float _pad;
 };
 
-static_assert(sizeof(VNSimParams) == 128, "VNSimParams must match WaterSim.h");
+static_assert(sizeof(VNSimParams) == 132, "VNSimParams must match WaterSim.h");
 static_assert(sizeof(VNParticle) == 48, "VNParticle must match WaterSim.h");
 static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match WaterSim.h");
 
@@ -185,8 +186,9 @@ static inline bool vn_inside_obstacle(float2 p, VNObstacle o, float margin) {
 /// cannot push it, until it leaves of its own accord -- at which point the bit
 /// clears and the window becomes solid to it like any other. Water poured onto
 /// a stack of windows runs off the one it started on and lands on the next.
-static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
-                                const device VNObstacle *obstacles, uint ignore) {
+/// The display's edges, with the floor and the lower side walls open wherever
+/// a drain is switched on.
+static inline float2 vn_collide_walls(float2 p, constant VNSimParams &sp) {
     const float r = sp.radius;
     const float2 lo = float2(r);
     const float2 hi = max(float2(sp.domain_x, sp.domain_y) - r, lo + 1.0);
@@ -213,6 +215,13 @@ static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
     const bool over_corner = (left_open  && p.x < corner_w) ||
                              (right_open && p.x > sp.domain_x - corner_w);
     if (!over_middle && !over_corner) p.y = min(p.y, hi.y);
+    return p;
+}
+
+static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
+                                const device VNObstacle *obstacles, uint ignore) {
+    const float r = sp.radius;
+    p = vn_collide_walls(p, sp);
 
     for (uint i = 0; i < sp.obstacles; ++i) {
         if (i < 32u && (ignore & (1u << i)) != 0u) continue;
@@ -235,7 +244,10 @@ static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
         else n *= sign(p - 0.5 * (lo + hi));
         p += n * (r - sdf);
     }
-    return p;
+    // The walls again, last, so they win. A window dragged into the edge of
+    // the display would otherwise push whatever it traps there straight
+    // through it; held here, the solver squeezes it up and out instead.
+    return vn_collide_walls(p, sp);
 }
 
 #pragma mark - Solver
@@ -279,6 +291,12 @@ kernel void vn_pbf_predict(device VNParticle *P          [[buffer(0)]],
 
     // Parked: it went out through the drain and is no longer part of the fluid.
     if ((p.ignore & VN_DRAINED) != 0u) { P[id] = p; return; }
+
+    // A window that has just become an obstacle may be left by whatever is
+    // already inside it, as the ones it is born inside may.
+    for (uint i = 0; sp.fresh != 0u && i < sp.obstacles && i < 32u; ++i) {
+        if ((sp.fresh & (1u << i)) != 0u && vn_inside_obstacle(p.pos, obs[i], sp.radius)) p.ignore |= (1u << i);
+    }
 
     p.vel.y += sp.gravity * sp.dt;
 

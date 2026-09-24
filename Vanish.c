@@ -838,13 +838,15 @@ typedef struct {
     CGXWindow       *clone_win;
     CGRect           window_pt;   // the closing window, in the display's points
     CGRect           display_pt;  // that display's bounds, in points
-    // The other windows on screen, for the fluid to land on. Sampled once, when
-    // the clone is built: a window that moves during the close keeps the shape
-    // the fluid was told about, which is cheaper than re-reading the window
-    // list on the compositor's thread every frame and wrong by less than a
-    // window moves in a second.
+    // The other windows on screen, for the fluid to land on. Collected when the
+    // clone is built and again whenever the windows on screen change -- so a
+    // window dragged through the water pushes it. Each window keeps its index
+    // for as long as it stays in the list, because a particle's ignore mask is
+    // indexed the same way; an index with no window behind it is a hole
+    // (wid 0), which the step places where nothing can be inside it.
     CGRect           obstacles[kVNMaxObstacles];
-    uint32_t         obstacle_count;
+    uint32_t         obstacle_wids[kVNMaxObstacles];
+    uint32_t         obstacle_count;   // highest index in use, plus one
     float            tint;        // read from prefs here, never on the render thread
     uint32_t         drains;      // likewise; see kVNDrain*
     /// The owning clone's per-close seed -- its filter params[0], the same value
@@ -856,6 +858,13 @@ typedef struct {
     /// Atomic on its own, outside the sequence, because the compositor's thread
     /// brings it forward too.
     _Atomic double   end;
+
+    // Close path and animation tick only, never read by the compositor.
+    uint32_t         closing_wid;
+    uint32_t         overlapped[kVNMaxObstacles];   // skipped for overlapping it at the start; 0-terminated
+    uint64_t         scene_hash;  // of the windows on screen when obstacles were last collected
+    uint32_t         refreshes;   // how many times, and the slowest, reported when it retires
+    double           refresh_max_ms;
 } VNWaterSlot;
 
 static VNWaterSlot gVNWaterSlots[kVNWaterSlots];
@@ -872,6 +881,7 @@ typedef struct {
     CGRect   window_pt;
     CGRect   display_pt;
     CGRect   obstacles[kVNMaxObstacles];
+    uint32_t obstacle_wids[kVNMaxObstacles];
     uint32_t obstacle_count;
     float    tint;
     uint32_t drains;
@@ -882,7 +892,9 @@ typedef struct {
 /// The windows the fluid should flow around. Defined with the window tracking
 /// table it reads, further down.
 static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_pt,
-                                           CGRect display_pt, CGRect out[kVNMaxObstacles]);
+                                           CGRect display_pt, CGRect out[kVNMaxObstacles],
+                                           uint32_t out_wids[kVNMaxObstacles],
+                                           const uint32_t *excluded, uint32_t overlapped[kVNMaxObstacles]);
 
 static void vn_water_write_begin(VNWaterSlot *s) {
     const uint32_t seq = atomic_load_explicit(&s->seq, memory_order_relaxed);
@@ -921,8 +933,8 @@ static VNWaterSlot *vn_water_slot_for_clone(CGXWindow *clone) {
 /// whole display, so asking which windows are unobscured once it is on screen
 /// answers "none of them" -- our own clone covers the lot.
 static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_pt,
-                             const CGRect *obstacles, uint32_t obstacle_count, float tint, float seed,
-                             uint32_t drains) {
+                             const CGRect *obstacles, const uint32_t *obstacle_wids, uint32_t obstacle_count,
+                             const uint32_t *overlapped, uint32_t closing_wid, float tint, float seed, uint32_t drains) {
     // A free slot, or else the oldest close's -- which by now has been told to
     // fade by every close since, and whose clone draws nothing once its slot
     // belongs to someone else.
@@ -950,10 +962,18 @@ static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_
     s->drains     = drains;
     s->seed       = seed;
     s->obstacle_count = obstacle_count <= kVNMaxObstacles ? obstacle_count : kVNMaxObstacles;
-    if (s->obstacle_count > 0 && obstacles) {
+    memset(s->obstacle_wids, 0, sizeof(s->obstacle_wids));
+    if (s->obstacle_count > 0 && obstacles && obstacle_wids) {
         memcpy(s->obstacles, obstacles, s->obstacle_count * sizeof(CGRect));
+        memcpy(s->obstacle_wids, obstacle_wids, s->obstacle_count * sizeof(uint32_t));
     }
     vn_water_write_end(s);
+    s->closing_wid = closing_wid;
+    memset(s->overlapped, 0, sizeof(s->overlapped));
+    if (overlapped) memcpy(s->overlapped, overlapped, sizeof(s->overlapped));
+    s->scene_hash  = 0;
+    s->refreshes   = 0;
+    s->refresh_max_ms = 0.0;   // the first refresh after it starts recollects
     vn_water_count_clones();
 
     VN_INFO("water: clone %p generation %u in slot %ld, %u obstacle(s), drains=%s%s%s, "
@@ -997,6 +1017,8 @@ static void vn_particles_report(void);
 static void vn_water_retire(CGXWindow *clone) {
     VNWaterSlot *s = vn_water_slot_for_clone(clone);
     if (!s) return;
+    VN_INFO("water: slot %ld done -- obstacles recollected %u time(s), slowest %.2fms",
+            (long)(s - gVNWaterSlots), s->refreshes, s->refresh_max_ms);
     vn_water_write_begin(s);
     s->generation = 0;
     s->clone_win  = NULL;
@@ -1022,10 +1044,76 @@ static VNWaterSnapshot vn_water_snapshot(const VNWaterSlot *s) {
     out.seed       = s->seed;
     out.obstacle_count = s->obstacle_count <= kVNMaxObstacles ? s->obstacle_count : 0;
     memcpy(out.obstacles, s->obstacles, sizeof(out.obstacles));
+    memcpy(out.obstacle_wids, s->obstacle_wids, sizeof(out.obstacle_wids));
 
     atomic_thread_fence(memory_order_acquire);
     out.valid = out.generation != 0 && (atomic_load_explicit(&s->seq, memory_order_relaxed) == s1);
     return out;
+}
+
+/// A fingerprint of the windows on screen: which are ordered in, where they
+/// are, and in what order they stack. Obstacles are only recollected when it
+/// changes, so a still screen costs this and nothing more.
+static uint64_t vn_water_scene_hash(void);
+
+static double gAnimFrameInterval;   // defined with the animation tick
+
+/// Recollects the obstacles of every running water close whose screen has
+/// changed since, keeping each window at the index it already had. Runs on the
+/// animation tick, the same thread the close path collects on.
+static void vn_water_refresh_obstacles(double now) {
+    static double s_last;
+    const double interval = gAnimFrameInterval > 0.0 ? gAnimFrameInterval : 1.0 / 120.0;
+    if (now - s_last < interval * 0.9) return;
+    s_last = now;
+
+    uint64_t hash = 0;
+    for (int i = 0; i < kVNWaterSlots; i++) {
+        VNWaterSlot *s = &gVNWaterSlots[i];
+        if (s->generation == 0 || !(s->start < INFINITY)) continue;
+        if (now >= atomic_load_explicit(&s->end, memory_order_acquire)) continue;
+        if (hash == 0) hash = vn_water_scene_hash();
+        if (hash == s->scene_hash) continue;
+        s->scene_hash = hash;
+        const double t0 = SLSCurrentRealTime();
+
+        CGRect   rects[kVNMaxObstacles];
+        uint32_t wids[kVNMaxObstacles];
+        const uint32_t n = vn_water_collect_obstacles(s->closing_wid, s->window_pt, s->display_pt, rects, wids,
+                                                      s->overlapped, NULL);
+
+        // Stable indices: a window already in the list stays where it is, a
+        // new one takes the first hole, a window that is gone leaves one.
+        CGRect   next[kVNMaxObstacles] = {0};
+        uint32_t next_wids[kVNMaxObstacles] = {0};
+        bool     placed[kVNMaxObstacles] = { false };
+        for (uint32_t k = 0; k < n; k++) {
+            for (uint32_t j = 0; j < kVNMaxObstacles; j++) {
+                if (s->obstacle_wids[j] == wids[k]) {
+                    next[j] = rects[k]; next_wids[j] = wids[k]; placed[k] = true;
+                    break;
+                }
+            }
+        }
+        for (uint32_t k = 0; k < n; k++) {
+            if (placed[k]) continue;
+            for (uint32_t j = 0; j < kVNMaxObstacles; j++) {
+                if (next_wids[j] == 0) { next[j] = rects[k]; next_wids[j] = wids[k]; break; }
+            }
+        }
+        uint32_t count = 0;
+        for (uint32_t j = 0; j < kVNMaxObstacles; j++) if (next_wids[j] != 0) count = j + 1;
+
+        vn_water_write_begin(s);
+        memcpy(s->obstacles, next, sizeof(next));
+        memcpy(s->obstacle_wids, next_wids, sizeof(next_wids));
+        s->obstacle_count = count;
+        vn_water_write_end(s);
+
+        const double ms = (SLSCurrentRealTime() - t0) * 1000.0;
+        s->refreshes++;
+        if (ms > s->refresh_max_ms) s->refresh_max_ms = ms;
+    }
 }
 
 static uint64_t       gNextAnimId = 1;
@@ -1721,13 +1809,16 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
     // Before the clone exists, while the screen still looks the way the user
     // is looking at it.
     CGRect   water_obstacles[kVNMaxObstacles];
+    uint32_t water_obstacle_wids[kVNMaxObstacles];
+    uint32_t water_overlapped[kVNMaxObstacles] = {0};
     uint32_t water_obstacle_count = 0;
     CGRect   water_screen = CGRectZero;
     if (anim->kind == VN_ANIM_SHADER && anim->shader.particles) {
         water_screen = vn_resolved_display_get_bounds ? vn_resolved_display_get_bounds(display) : CGRectZero;
         water_obstacle_count = vn_water_collect_obstacles(orig_wid,
                                                           content.size.width >= 1.0 ? content : frame,
-                                                          water_screen, water_obstacles);
+                                                          water_screen, water_obstacles, water_obstacle_wids,
+                                                          NULL, water_overlapped);
     }
 
     double t_clone0 = SLSCurrentRealTime();
@@ -1820,8 +1911,8 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             // it knows the destination it is stepping against. The obstacles
             // were collected above, before this clone went on screen.
             vn_water_publish(clone, content.size.width >= 1.0 ? content : frame,
-                             water_screen, water_obstacles, water_obstacle_count,
-                             prefs.waterTint, params[0], prefs.waterDrains);
+                             water_screen, water_obstacles, water_obstacle_wids, water_obstacle_count,
+                             water_overlapped, orig_wid, prefs.waterTint, params[0], prefs.waterDrains);
         }
         vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
@@ -2304,6 +2395,7 @@ static void vn_anim_tick(void *ctx, double when) {
     (void)ctx; (void)when;
 
     double now = SLSCurrentRealTime();
+    vn_water_refresh_obstacles(now);
     VNFrameJob jobs[MAX_CLONE_ANIMATIONS];
     int job_count = 0;
     uint64_t finished[MAX_CLONE_ANIMATIONS];
@@ -2868,8 +2960,13 @@ static int vn_water_visible_bounds(CGXWindow *w, uint32_t closing_wid, CGRect *o
 }
 
 static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_pt,
-                                           CGRect display_pt, CGRect out[kVNMaxObstacles]) {
+                                           CGRect display_pt, CGRect out[kVNMaxObstacles],
+                                           uint32_t out_wids[kVNMaxObstacles],
+                                           const uint32_t *excluded, uint32_t overlapped[kVNMaxObstacles]) {
     const double t0 = SLSCurrentRealTime();
+    // The close-time collection explains itself; the refreshes that follow
+    // every frame of a drag do not.
+    const bool verbose = excluded == NULL;
     uint32_t wids[MAX_TRACKED_WINDOWS];
     int n = 0;
 
@@ -2902,7 +2999,7 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
         if (display_pt.size.width >= 1.0 && display_pt.size.height >= 1.0) {
             const double screen_area = display_pt.size.width * display_pt.size.height;
             if (r.size.width * r.size.height >= screen_area * 0.85) {
-                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) covers the display -- skipped",
+                if (verbose) VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) covers the display -- skipped",
                          wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
                 continue;
             }
@@ -2918,8 +3015,19 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
         // pours the other half through it. That is the rectangle that became
         // visible. The question is about the window, so it is answered once
         // here rather than per particle.
-        if (closing_pt.size.width >= 1.0 && CGRectIntersectsRect(r, closing_pt)) {
-            VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) overlaps the closing window "
+        //
+        // Decided once, when the close begins. Afterwards the windows that were
+        // skipped here stay skipped, by id, and nothing else is: a window
+        // dragged into where the fluid started later is as solid as any other.
+        if (excluded) {
+            bool skip = false;
+            for (int k = 0; k < kVNMaxObstacles && excluded[k] != 0 && !skip; k++) skip = excluded[k] == wids[i];
+            if (skip) continue;
+        } else if (closing_pt.size.width >= 1.0 && CGRectIntersectsRect(r, closing_pt)) {
+            if (overlapped) {
+                for (int k = 0; k < kVNMaxObstacles; k++) if (overlapped[k] == 0) { overlapped[k] = wids[i]; break; }
+            }
+            if (verbose) VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) overlaps the closing window "
                      "(%.0f,%.0f %.0fx%.0f) -- skipped",
                      wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height,
                      closing_pt.origin.x, closing_pt.origin.y, closing_pt.size.width, closing_pt.size.height);
@@ -2958,7 +3066,7 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
             }
         }
         if (seen_state == 0) {
-            VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is not visible -- skipped",
+            if (verbose) VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is not visible -- skipped",
                      wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
             continue;
         }
@@ -2969,13 +3077,13 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
             const double seen = visible.size.width * visible.size.height;
             if (visible.size.width < 32.0 || visible.size.height < 32.0 ||
                 (full > 0.0 && seen < full * 0.2)) {
-                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is %.0f%% covered -- skipped",
+                if (verbose) VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is %.0f%% covered -- skipped",
                          wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height,
                          full > 0.0 ? (1.0 - seen / full) * 100.0 : 100.0);
                 continue;
             }
             if (!CGRectEqualToRect(visible, r)) {
-                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) -> visible part "
+                if (verbose) VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) -> visible part "
                          "(%.0f,%.0f %.0fx%.0f)",
                          wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height,
                          visible.origin.x, visible.origin.y, visible.size.width, visible.size.height);
@@ -2983,17 +3091,55 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
             r = visible;
         }
 
-        VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f)",
+        VN_TRACE("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f)",
                  wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
+        out_wids[count] = wids[i];
         out[count++] = r;
     }
 
     // This runs on the mouse-up, between the click and the app hearing about
     // it, and the shape query is the one expensive thing in it -- so it is
     // measured rather than assumed.
-    VN_INFO("water: %u obstacle(s) from %d window(s) in %.2fms",
-            count, n, (SLSCurrentRealTime() - t0) * 1000.0);
+    if (verbose) VN_DEBUG("water: %u obstacle(s) from %d window(s) in %.2fms",
+             count, n, (SLSCurrentRealTime() - t0) * 1000.0);
     return count;
+}
+
+static uint64_t vn_water_scene_hash(void) {
+    uint64_t h = 1469598103934665603ull;
+#define VN_MIX(v) do { uint64_t _v = (uint64_t)(v); h = (h ^ _v) * 1099511628211ull; } while (0)
+    uint32_t wids[MAX_TRACKED_WINDOWS];
+    int n = 0;
+    os_unfair_lock_lock(&gTrackedLock);
+    for (int i = 0; i < MAX_TRACKED_WINDOWS; i++) {
+        if (gTrackedWindows[i].wid != 0 && gTrackedWindows[i].is_ordered_in) wids[n++] = gTrackedWindows[i].wid;
+    }
+    os_unfair_lock_unlock(&gTrackedLock);
+
+    for (int i = 0; i < n; i++) {
+        CGXWindow *w = vn_resolved_window_by_id ? vn_resolved_window_by_id(wids[i]) : NULL;
+        if (!w) continue;
+        const CGRect r = vn_resolved_screen_rect ? vn_resolved_screen_rect(w) : CGRectZero;
+        VN_MIX(wids[i]);
+        VN_MIX((int64_t)(r.origin.x * 4.0)); VN_MIX((int64_t)(r.origin.y * 4.0));
+        VN_MIX((int64_t)(r.size.width * 4.0)); VN_MIX((int64_t)(r.size.height * 4.0));
+    }
+
+    // Stacking changes what is visible without moving anything: bring a
+    // window to the front and the one it covered loses its ledge.
+    if (vn_resolved_session_control_ref) {
+        const char *session = *(const char **)vn_resolved_session_control_ref;
+        const char *windows = session ? *(const char * const *)(session + kVNSessionWindowsOuterOffset) : NULL;
+        windows = windows ? *(const char * const *)(windows + kVNSessionWindowsInnerOffset) : NULL;
+        if (windows) {
+            const struct { CGXWindow **items; int32_t count; } *stack = (const void *)(windows + kVNSessionWindowStackOffset);
+            if (stack->items && stack->count > 0 && stack->count <= 16384) {
+                for (int32_t i = 0; i < stack->count; i++) VN_MIX((uintptr_t)stack->items[i]);
+            }
+        }
+    }
+#undef VN_MIX
+    return h ? h : 1;
 }
 
 static int vn_count_visible_windows_for_pid(pid_t pid, uint32_t exclude_wid) {
@@ -4127,6 +4273,12 @@ typedef struct {
     _Atomic uint64_t domain_bits;     // the stepped destination's size in pixels, two floats
     _Atomic uint64_t origin_bits;     // and its origin in points, two int32s
     _Atomic uint64_t seeded_at_bits;  // double: when the fluid was seeded
+    // Where the obstacles were on the last step, compositor thread only, so a
+    // window that moved since is swept across the substeps rather than
+    // jumping -- a jump of more than a particle's width goes straight past it.
+    VNObstacle       prev_obstacles[kVNMaxObstacles];
+    uint32_t         prev_wids[kVNMaxObstacles];
+    uint32_t         prev_generation;
 } VNSimSlot;
 
 static VNSimSlot gVNSims[kVNWaterSlots];
@@ -4437,10 +4589,15 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     sp.drains  = water->drains;
     sp.fade    = 1.0f;
 
-    // The windows the fluid has to flow around, converted the same way.
+    // The windows the fluid has to flow around, converted the same way. A hole
+    // in the list goes far off the display, where nothing is inside it.
     VNObstacle obstacles[kVNMaxObstacles] = {0};
     uint32_t nobs = water->obstacle_count <= kVNMaxObstacles ? water->obstacle_count : kVNMaxObstacles;
     for (uint32_t i = 0; i < nobs; i++) {
+        if (water->obstacle_wids[i] == 0) {
+            obstacles[i] = (VNObstacle){ -1e6f, -1e6f, -1e6f, -1e6f, 0.0f, 0.0f };
+            continue;
+        }
         const CGRect r = water->obstacles[i];
         obstacles[i].min_x  = (float)((CGRectGetMinX(r) - ox) * scale);
         obstacles[i].min_y  = (float)((CGRectGetMinY(r) - oy) * scale);
@@ -4459,12 +4616,48 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     }
 
     vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), sim->particles, 0, kVNParticleBufferIndex);
-    vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), obstacles, sizeof(obstacles), kVNObstacleIndex);
+
+    // A window that appeared, or a new close, starts where it is; one that was
+    // there last step moves from there to here across the substeps.
+    if (seeding || sim->prev_generation != water->generation) {
+        memcpy(sim->prev_obstacles, obstacles, sizeof(obstacles));
+        memcpy(sim->prev_wids, water->obstacle_wids, sizeof(sim->prev_wids));
+        sim->prev_generation = water->generation;
+    }
+    // An index that held nothing, or another window, last step is an obstacle
+    // that has just appeared. Whatever fluid is inside it then may leave it,
+    // exactly as at birth -- otherwise all of it is thrown to its edge in one
+    // step. A window that was there and moved keeps its index, and pushes.
+    uint32_t fresh = 0;
+    for (uint32_t i = 0; i < kVNMaxObstacles; i++) {
+        const uint32_t wid = i < nobs ? water->obstacle_wids[i] : 0;
+        if (wid != 0 && sim->prev_wids[i] != wid) {
+            if (!seeding) fresh |= 1u << i;
+            sim->prev_obstacles[i] = obstacles[i];
+        }
+        sim->prev_wids[i] = wid;
+    }
+    sp.fresh = fresh;
 
     // Algorithm 1, substepped.
     for (uint32_t sub = 0; sub < kVNSubSteps; sub++) {
         sp.spawn = (seeding && sub == 0) ? 1u : 0u;
+        if (sub > 0) sp.fresh = 0;          // granted once, on the first substep
         vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), &sp, sizeof(sp), kVNSimParamsIndex);
+
+        VNObstacle swept[kVNMaxObstacles];
+        const float f = (float)(sub + 1) / (float)kVNSubSteps;
+        for (uint32_t i = 0; i < kVNMaxObstacles; i++) {
+            const VNObstacle a = sim->prev_obstacles[i], o = obstacles[i];
+            swept[i] = o;
+            if (i < nobs && o.min_x > -1e5f) {
+                swept[i].min_x = a.min_x + (o.min_x - a.min_x) * f;
+                swept[i].min_y = a.min_y + (o.min_y - a.min_y) * f;
+                swept[i].max_x = a.max_x + (o.max_x - a.max_x) * f;
+                swept[i].max_y = a.max_y + (o.max_y - a.max_y) * f;
+            }
+        }
+        vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), swept, sizeof(swept), kVNObstacleIndex);
 
         vn_dispatch_1d(enc, kVNKPredict, sp.count);
         if (sp.spawn) continue;                     // the seeding step does no solve
@@ -4482,6 +4675,9 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
         vn_dispatch_1d(enc, kVNKVelPost, sp.count);
         vn_dispatch_1d(enc, kVNKVelCommit, sp.count);
     }
+
+    memcpy(sim->prev_obstacles, obstacles, sizeof(obstacles));
+    sp.fresh = 0;
 
     // The field is built from final positions, so the bins have to describe
     // those -- the last solve binned predicted ones.
