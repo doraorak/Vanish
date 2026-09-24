@@ -4124,8 +4124,8 @@ typedef struct {
     _Atomic uint32_t census_live;     // particles still on screen, as last read back
     _Atomic uint32_t census_generation;   // the close that count belongs to
     _Atomic uint32_t stepped_generation;  // the close whose water the buffers hold
-    _Atomic(void *)  stepped_dest;
-    _Atomic uint64_t domain_bits;
+    _Atomic uint64_t domain_bits;     // the stepped destination's size in pixels, two floats
+    _Atomic uint64_t origin_bits;     // and its origin in points, two int32s
     _Atomic uint64_t seeded_at_bits;  // double: when the fluid was seeded
 } VNSimSlot;
 
@@ -4503,7 +4503,7 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     memcpy(&dx, &sp.domain_x, sizeof(dx));
     memcpy(&dy, &sp.domain_y, sizeof(dy));
     atomic_store_explicit(&sim->domain_bits, ((uint64_t)dy << 32) | dx, memory_order_relaxed);
-    atomic_store_explicit(&sim->stepped_dest, destination, memory_order_release);
+    atomic_store_explicit(&sim->origin_bits, ((uint64_t)(uint32_t)b[1] << 32) | (uint32_t)b[0], memory_order_release);
 
     if (seeding) {
         VN_INFO("water: slot %d destination %p kind=%u bounds=(%d,%d %d,%d) scale=%.2f -> domain %.0fx%.0f px; "
@@ -4698,10 +4698,31 @@ static void vn_particles_bind_fragment(void *encoder, void *destination,
     } else if (found >= 0 && gVNSimScratch) {
         VNSimSlot *sim = &gVNSims[found];
         field = sim->field;
-        void *stepped = atomic_load_explicit(&sim->stepped_dest, memory_order_acquire);
         const bool fresh = atomic_load_explicit(&sim->stepped_generation, memory_order_acquire) == water.generation;
-        if (fresh && stepped == destination) {
-            const uint64_t d = atomic_load_explicit(&sim->domain_bits, memory_order_relaxed);
+
+        // The field is only meaningful in the pixel grid it was stepped in.
+        // That is decided by the grid, not by the destination object: the
+        // compositor draws the same display through more than one destination,
+        // and a pointer comparison sent those draws to the untouched window --
+        // a frame or two of the window back at its start position.
+        bool same_grid = false;
+        uint64_t d = 0;
+        if (fresh && destination) {
+            const int32_t *db = (const int32_t *)((const char *)destination + kVNDestinationBoundsOffset);
+            float dscale = *(const float *)((const char *)destination + kVNDestinationScaleOffset);
+            if (!(dscale > 0.0f)) dscale = 1.0f;
+            const float gx = (float)((double)(db[2] - db[0]) * dscale);
+            const float gy = (float)((double)(db[3] - db[1]) * dscale);
+            uint32_t gxb, gyb;
+            memcpy(&gxb, &gx, sizeof(gxb));
+            memcpy(&gyb, &gy, sizeof(gyb));
+            const uint64_t o = atomic_load_explicit(&sim->origin_bits, memory_order_acquire);
+            d = atomic_load_explicit(&sim->domain_bits, memory_order_relaxed);
+            same_grid = d == (((uint64_t)gyb << 32) | gxb) &&
+                        o == (((uint64_t)(uint32_t)db[1] << 32) | (uint32_t)db[0]);
+        }
+
+        if (fresh && same_grid) {
             const uint32_t dx = (uint32_t)d, dy = (uint32_t)(d >> 32);
             memcpy(&sp.domain_x, &dx, sizeof(dx));
             memcpy(&sp.domain_y, &dy, sizeof(dy));
@@ -4713,17 +4734,15 @@ static void vn_particles_bind_fragment(void *encoder, void *destination,
             sp.fade  = (float)(fade < 0.0 ? 0.0 : (fade > 1.0 ? 1.0 : fade));
             sp.tint  = water.tint;
             sp.valid = 1u;
-        } else if (fresh && stepped && stepped != destination) {
-            // A layer drawn into a destination the step did not run against. The
-            // two pointers are the same object on the path a clone takes, so this
-            // firing at all says the composite is reaching our layer some other
-            // way -- worth one line, because the symptom is a water close that
-            // simulates and draws nothing.
+        } else if (fresh) {
+            // A grid the fluid was not stepped in: nothing of it can be drawn
+            // there, and the untouched window would be the window coming back.
+            sp.valid = 2u;
             static void *s_reported;
             if (s_reported != destination) {
                 s_reported = destination;
-                VN_INFO("water: layer destination %p is not the stepped one %p -- not drawing the fluid",
-                        destination, stepped);
+                VN_INFO("water: layer destination %p is a different pixel grid from the stepped one -- "
+                        "drawing nothing there", destination);
             }
         }
     }
