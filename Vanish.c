@@ -756,6 +756,35 @@ static intptr_t gVNHeadroomOffset = -1;
 /// costs nothing where there is less.
 #define kVNBurnHeadroom 16.0f
 
+/// How long the display takes to reach that headroom while a Burn clone exists,
+/// in seconds. The system's own ramp is 2.0 s, which leaves the first close after
+/// a quiet spell burning in SDR for most of its run.
+#define kVNBurnHeadroomRamp 0.1f
+
+/// SkyLight's ramp-duration override (see kVNSymForceEDRRampDuration). Held on
+/// while any Burn clone exists, and the values found there put back when the
+/// last one goes, so every other EDR request ramps as the system intends.
+static uint8_t *gVNForceRamp;
+static float   *gVNForcedRamp;
+static _Atomic int gVNHDRClones;
+static uint8_t gVNSavedForceRamp;
+static float   gVNSavedForcedRamp;
+
+static void vn_edr_ramp_override(bool on) {
+    if (!gVNForceRamp || !gVNForcedRamp) return;
+    if (on) {
+        gVNSavedForceRamp  = *gVNForceRamp;
+        gVNSavedForcedRamp = *gVNForcedRamp;
+        *gVNForcedRamp = kVNBurnHeadroomRamp;
+        *gVNForceRamp  = 1;
+    } else {
+        *gVNForceRamp  = gVNSavedForceRamp;
+        *gVNForcedRamp = gVNSavedForcedRamp;
+    }
+    VN_INFO("edr: ramp override %s (force=%u duration=%.2fs)", on ? "on" : "restored",
+            (unsigned)*gVNForceRamp, (double)*gVNForcedRamp);
+}
+
 static void vn_headroom_resolve(void) {
     if (!vn_resolved_reevaluate_hdr_request) return;
     const uint32_t *ins = ptrauth_strip((const void *)vn_resolved_reevaluate_hdr_request,
@@ -795,7 +824,11 @@ static void vn_window_request_headroom(CGXWindow *win, float headroom) {
 /// one leaks the object or leaves the display bright.
 static void vn_release_clone(CGXWindow *clone) {
     if (!clone) return;
-    if (vn_window_headroom(clone) > 1.0f) vn_window_request_headroom(clone, 1.0f);
+    if (vn_window_headroom(clone) > 1.0f) {
+        // The override goes first, so the display eases back down at its own pace.
+        if (atomic_fetch_sub_explicit(&gVNHDRClones, 1, memory_order_acq_rel) == 1) vn_edr_ramp_override(false);
+        vn_window_request_headroom(clone, 1.0f);
+    }
     vn_filter_detach(clone);
     if (vn_resolved_system_window_release) vn_resolved_system_window_release(clone);
 }
@@ -1348,7 +1381,10 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             0.0f, 0.0f, 0.0f,
         };
         vn_filter_attach(clone, anim->shader.type, true, params);
-        if (anim->shader.hdr) vn_window_request_headroom(clone, kVNBurnHeadroom);
+        if (anim->shader.hdr) {
+            if (atomic_fetch_add_explicit(&gVNHDRClones, 1, memory_order_acq_rel) == 0) vn_edr_ramp_override(true);
+            vn_window_request_headroom(clone, kVNBurnHeadroom);
+        }
         vn_shader_widen_bounds(clone, frame);
         vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
@@ -3527,6 +3563,15 @@ static void vanish_init_payload(void) {
 
     vn_resolved_reevaluate_hdr_request = (VNReevaluateHDRRequestFn)vn_skylight_symbol(kVNSymReevaluateHDRRequest);
     vn_headroom_resolve();
+    // vn_skylight_symbol signs what it returns as a function pointer; these are
+    // data, so they are used stripped.
+    gVNForceRamp  = (uint8_t *)ptrauth_strip(vn_skylight_symbol(kVNSymForceEDRRampDuration),
+                                             ptrauth_key_function_pointer);
+    gVNForcedRamp = (float *)ptrauth_strip(vn_skylight_symbol(kVNSymForcedEDRRampDuration),
+                                           ptrauth_key_function_pointer);
+    VN_INFO("edr: ramp override force=%p duration=%p (currently %u, %.2fs)",
+            (void *)gVNForceRamp, (void *)gVNForcedRamp,
+            gVNForceRamp ? (unsigned)*gVNForceRamp : 0u, gVNForcedRamp ? (double)*gVNForcedRamp : 0.0);
 
     if (targetEligible) {
         void *rawEligible = ptrauth_strip(targetEligible, ptrauth_key_function_pointer);

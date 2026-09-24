@@ -206,6 +206,23 @@ _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.param
 /// offset is decoded from that first load at runtime rather than hardcoded.
 #define kVNSymReevaluateHDRRequest "__ZN9CGXWindow22reevaluate_hdr_requestEv"
 
+/// How fast the display climbs to a new headroom. SLCADisplay::
+/// create_edr_request_state puts a `HeadroomRampDuration` of 2.0 s in every EDR
+/// request it hands the brightness system -- long enough that a two-second
+/// animation spends most of its life still ramping -- unless SkyLight's own
+/// debug override is on:
+///
+///     ldrb w8, [cgdebug::force_edr_ramp_duration]
+///     cbz  ...                                   ; off -> 2.0 s
+///     ldr  s0, [cgdebug::forced_edr_ramp_duration]
+///     duration = clamp(s0, 0, 100)
+///
+/// Both are plain globals in SkyLight's data, found by name.
+#define kVNSymForceEDRRampDuration \
+    "__ZN2WS8Displays12_GLOBAL__N_112_GLOBAL__N_17cgdebug23force_edr_ramp_durationE"
+#define kVNSymForcedEDRRampDuration \
+    "__ZN2WS8Displays12_GLOBAL__N_112_GLOBAL__N_17cgdebug24forced_edr_ramp_durationE"
+
 typedef struct CGXWindow {
     uint32_t       window_id;                           // 0x000
     uint32_t       window_type;                         // 0x004
