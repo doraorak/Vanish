@@ -52,6 +52,7 @@ static const VNAnimationMeta kAnimations[] = {
     { "crt",       "CRT Off",   0.30 },
     { "shatter",   "Shatter",   0.40 },
     { "burn", "Burn", 0.35 },
+    { "water",     "Water",     1.60 },
 };
 #define kAnimationCount (sizeof(kAnimations) / sizeof(kAnimations[0]))
 
@@ -90,6 +91,16 @@ static const VNAnimationMeta kAnimations[] = {
     NSTextField *_durationLabel;
     NSButton *_resetDurationBtn;
     NSTextField *_durationSubtitle;
+
+    // Water only. Shown when the active animation is the one it belongs to,
+    // and taken out of the layout entirely otherwise -- the card shrinks around
+    // it rather than leaving a gap.
+    NSBox *_sepWater;
+    VNPFlippedView *_rowWater;
+    NSTextField *_waterTitle;
+    NSTextField *_waterLabel;
+    NSTextField *_waterSubtitle;
+    NSSlider *_waterSlider;
     NSSlider *_durationSlider;
     NSBox *_sep4;
     
@@ -280,7 +291,7 @@ static const VNAnimationMeta kAnimations[] = {
     _durationSubtitle = [self createSubtitle:@"Duration for active animation"];
     [_rowDuration addSubview:_durationSubtitle];
     
-    _durationSlider = [self createSliderWithMin:0.05 max:2.00 defaultVal:0.25];
+    _durationSlider = [self createSliderWithMin:0.05 max:5.00 defaultVal:0.25];
     _durationSlider.target = self;
     _durationSlider.action = @selector(durationSliderChanged:);
     [_rowDuration addSubview:_durationSlider];
@@ -300,6 +311,22 @@ static const VNAnimationMeta kAnimations[] = {
     _refreshSubtitle = [self createSubtitle:@"Animation FPS (0 follows ProMotion)"];
     [_rowRefresh addSubview:_refreshSubtitle];
     
+    _sepWater = [self createSeparator];
+    [_animCard addSubview:_sepWater];
+
+    _rowWater = [[VNPFlippedView alloc] init];
+    _waterTitle = [self createLabel:@"Water Tint"];
+    [_rowWater addSubview:_waterTitle];
+    _waterLabel = [self createBadgeLabel:@"0.70"];
+    [_rowWater addSubview:_waterLabel];
+    _waterSubtitle = [self createSubtitle:@"How far the liquid settles from the window's pixels toward water"];
+    [_rowWater addSubview:_waterSubtitle];
+    _waterSlider = [self createSliderWithMin:0.0 max:1.0 defaultVal:0.70];
+    _waterSlider.target = self;
+    _waterSlider.action = @selector(waterTintChanged:);
+    [_rowWater addSubview:_waterSlider];
+    [_animCard addSubview:_rowWater];
+
     _refreshRateSlider = [self createSliderWithMin:0.0 max:144.0 defaultVal:120.0];
     _refreshRateSlider.target = self;
     _refreshRateSlider.action = @selector(refreshRateChanged:);
@@ -350,7 +377,12 @@ static const VNAnimationMeta kAnimations[] = {
     _animHeader.frame = NSMakeRect(8, y, w - 16, 14);
     y += 18.0;
     
-    _animCard.frame = NSMakeRect(0, y, w, 142.0);
+    const BOOL waterShown = [self isWaterSelected];
+    _sepWater.hidden = !waterShown;
+    _rowWater.hidden = !waterShown;
+    const CGFloat animCardH = waterShown ? 142.0 + 1.0 + 52.0 : 142.0;
+
+    _animCard.frame = NSMakeRect(0, y, w, animCardH);
     // Row 1: Active Animation
     _rowAnim.frame = NSMakeRect(0, 0, w, 36.0);
     CGFloat popW = 104.0;
@@ -377,8 +409,19 @@ static const VNAnimationMeta kAnimations[] = {
     _refreshTitle.frame = NSMakeRect(12, 5, w - 24 - rrLabelW - 6, 15);
     _refreshSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
     _refreshRateSlider.frame = NSMakeRect(12, 33, w - 24, 15);
-    
-    y += 142.0 + 8.0;
+
+    // Row 4: Water tint, only when water is the active animation
+    if (waterShown) {
+        _sepWater.frame = NSMakeRect(12, 142, w - 24, 1);
+        _rowWater.frame = NSMakeRect(0, 143, w, 52.0);
+        CGFloat wtLabelW = 42.0;
+        _waterLabel.frame = NSMakeRect(w - 12 - wtLabelW, 5, wtLabelW, 15);
+        _waterTitle.frame = NSMakeRect(12, 5, w - 24 - wtLabelW - 6, 15);
+        _waterSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
+        _waterSlider.frame = NSMakeRect(12, 33, w - 24, 15);
+    }
+
+    y += animCardH + 8.0;
     _totalHeight = y;
     self.preferredContentSize = NSMakeSize(w, _totalHeight);
 }
@@ -501,6 +544,7 @@ static const VNAnimationMeta kAnimations[] = {
     }
     
     [self updateDurationSliderForActiveAnimation];
+    [self updateWaterRowForActiveAnimation];
     
     double rr = [self readDouble:@"refreshRate" defaultValue:120.0];
     _refreshRateSlider.doubleValue = rr;
@@ -519,11 +563,35 @@ static const VNAnimationMeta kAnimations[] = {
     [self writePrefValue:@(val) forKey:@"shadows"];
 }
 
+- (BOOL)isWaterSelected {
+    NSString *key = _animPopUp.selectedItem.representedObject ?: @"shrink";
+    return [key isEqualToString:@"water"];
+}
+
+- (void)updateWaterRowForActiveAnimation {
+    if (!_waterSlider) return;
+    double tint = [self readDouble:@"water_tint" defaultValue:0.70];
+    if (tint < 0.0 || tint > 1.0) tint = 0.70;
+    _waterSlider.doubleValue = tint;
+    _waterLabel.stringValue = [NSString stringWithFormat:@"%.2f", tint];
+}
+
+- (void)waterTintChanged:(NSSlider *)sender {
+    double tint = sender.doubleValue;
+    _waterLabel.stringValue = [NSString stringWithFormat:@"%.2f", tint];
+    [self writePrefValue:@(tint) forKey:@"water_tint"];
+}
+
 - (void)animationSelected:(NSPopUpButton *)sender {
     NSString *key = sender.selectedItem.representedObject;
     if (key) {
         [self writePrefValue:key forKey:@"animation"];
         [self updateDurationSliderForActiveAnimation];
+        [self updateWaterRowForActiveAnimation];
+        // The card changes height when the water row comes and goes, so the
+        // layout has to run again rather than just toggling a hidden flag.
+        [self.view setNeedsLayout:YES];
+        [self.view layoutSubtreeIfNeeded];
     }
 }
 

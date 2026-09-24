@@ -68,10 +68,12 @@
 #include <mach-o/nlist.h>
 #include <mach-o/dyld.h>
 #include <sys/time.h>
+#include <mach/mach_time.h>
 #include <sys/stat.h>
 #include <stdatomic.h>
 
 #include "SkyLightServer.h"
+#include "WaterSim.h"
 #include "TILicense.h"
 
 #pragma mark - Logging
@@ -237,6 +239,9 @@ static VNShapeWindowWithRectFn      vn_resolved_shape_window_with_rect;
 static VNMetalCompositeLayerFn      vn_orig_metal_composite_layer;
 static VNSetPipelineStateFn         vn_orig_set_pipeline_state;
 static VNRenderEncoderFn            vn_resolved_render_encoder;
+static VNStartCompositeFn           vn_orig_start_composite;
+static VNEndEncodersFn              vn_resolved_end_encoders;
+static VNRenderCommandBufferFn      vn_resolved_render_command_buffer;
 static VNCopyPipelineStateFn        vn_orig_copy_pipeline_state;
 static VNReevaluateHDRRequestFn     vn_resolved_reevaluate_hdr_request;
 
@@ -248,6 +253,7 @@ static _Atomic int gShaderFilterCount;
 static VNCreateCloneFn              vn_resolved_create_clone;
 static VNSystemWindowReleaseFn      vn_resolved_system_window_release;
 static VNWindowGetDisplayFn         vn_resolved_window_get_display;
+static VNDisplayGetBoundsFn         vn_resolved_display_get_bounds;
 static VNScreenRectFromRectFn       vn_resolved_screen_rect_from_rect;
 static VNScreenRectFn               vn_resolved_screen_rect;
 static VNWindowGetIDFn              vn_resolved_window_get_id;
@@ -258,6 +264,8 @@ static VNWindowGetOwningPIDFn       vn_resolved_window_get_owning_pid;
 static VNGetConnectionAppNameFn     vn_resolved_get_connection_app_name;
 static VNPostEventByConnectionFn    vn_orig_post_event;
 static VNUpdateCAVisibilityFn       vn_resolved_update_ca_visibility;
+static VNUnobscuredContentShapeFn        vn_resolved_unobscured_content_shape;
+static VNGetRegionBoundsFn               vn_resolved_get_region_bounds;
 static VNClearShadowDensityFn            vn_resolved_clear_shadow_density;
 static VNWSWindowSetShadowEnableFn        vn_resolved_window_set_shadow_enable;
 static VNWSWindowReleaseShadowResourcesFn vn_resolved_window_release_shadow_resources;
@@ -272,7 +280,7 @@ static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
 static const char * const kVNAnimationKeys[] = {
     "shrink", "squish", "fall", "swirl", "flip", "tilt", "slide", "genie",
     "flag", "spin", "roll", "barrel", "clock", "dissolve", "crt", "shatter",
-    "burn"
+    "burn", "water"
 };
 #define kVNAnimationKeyCount (sizeof(kVNAnimationKeys) / sizeof(kVNAnimationKeys[0]))
 
@@ -293,7 +301,8 @@ static const float kVNAnimationDefaultDurations[] = {
     0.30f, /* dissolve */
     0.30f, /* crt */
     0.35f, /* shatter */
-    0.35f  /* burn */
+    0.35f, /* burn */
+    1.60f  /* water */
 };
 _Static_assert(sizeof(kVNAnimationDefaultDurations) / sizeof(kVNAnimationDefaultDurations[0]) == kVNAnimationKeyCount,
                "kVNAnimationDefaultDurations count mismatch");
@@ -301,6 +310,7 @@ _Static_assert(sizeof(kVNAnimationDefaultDurations) / sizeof(kVNAnimationDefault
 typedef struct {
     bool  enabled;
     bool  shadows;
+    float waterTint;      // 0..1, water only; see VNSimParams::tint
     float refreshRate;
     float duration;
     float animDurations[kVNAnimationKeyCount];
@@ -316,6 +326,7 @@ static bool           gPrefsValid = false;
 static void vn_reload_prefs_locked(void) {
     gPrefs.enabled = true;
     gPrefs.shadows = true;
+    gPrefs.waterTint = kVNWaterTintDefault;
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     for (size_t i = 0; i < kVNAnimationKeyCount; i++) {
@@ -347,6 +358,15 @@ static void vn_reload_prefs_locked(void) {
                         CFBooleanRef enabledVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("enabled"));
                         if (enabledVal && CFGetTypeID(enabledVal) == CFBooleanGetTypeID()) {
                             gPrefs.enabled = CFBooleanGetValue(enabledVal);
+                        }
+
+                        CFTypeRef tintVal = CFDictionaryGetValue(dict, CFSTR("water_tint"));
+                        if (tintVal && CFGetTypeID(tintVal) == CFNumberGetTypeID()) {
+                            float tint = 0.0f;
+                            if (CFNumberGetValue((CFNumberRef)tintVal, kCFNumberFloatType, &tint) &&
+                                tint >= 0.0f && tint <= 1.0f) {
+                                gPrefs.waterTint = tint;
+                            }
                         }
 
                         CFBooleanRef shadowsVal = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("shadows"));
@@ -662,7 +682,7 @@ typedef struct {
     // choice cannot change halfway through a close.
     const VNAnimationStyle *anim;
     // The per-close random value in a shader clone's params[0]. The draw hook
-    // finds a layer's animation by it (see vn_phase_publish).
+    // finds a layer's animation by it (see vn_clone_publish).
     float          seed;
     // When the clone was built, which is the mouse-up. A pending clone whose
     // close has not arrived a second later is discarded.
@@ -682,52 +702,226 @@ typedef struct {
 static VNCloneAnimation    gCloneAnimations[MAX_CLONE_ANIMATIONS];
 static os_unfair_lock gCloneAnimationsLock = OS_UNFAIR_LOCK_INIT;
 
-/// Where each running shader animation is in time, readable from the render
-/// thread without gCloneAnimationsLock: the draw hook runs inside the
+/// What the draw hook needs to know about each shader clone, readable from the
+/// render thread without gCloneAnimationsLock: the hook runs inside the
 /// compositor, and nothing that holds that lock may wait on the compositor.
 ///
-/// Each composited frame takes its phase from the clock at the moment it is
-/// drawn, rather than whatever the last tick left on the window. The tick is a
-/// timer that is not locked to the display's refresh, so a phase it sets can
-/// be drawn twice while the next is skipped; a phase read at draw time is
-/// always that frame's own.
+/// Where the window sits inside the clone's quad, from the moment the clone is
+/// built -- its very first frame is drawn with it -- and, once the animation
+/// starts, when that was and how long it runs. Each composited frame takes its
+/// phase from the clock at the moment it is drawn, rather than whatever the last
+/// tick left on the window: the tick is a timer not locked to the display's
+/// refresh, so a phase it sets can be drawn twice while the next is skipped.
 ///
 /// A ring keyed by the clone's per-close seed. Entries are never cleared: a
 /// seed is only looked up while its clone is being drawn, and a new close
 /// brings a new seed.
 typedef struct {
     _Atomic uint64_t key;       // (1 << 32) | seed bits; 0 while being written
-    double           start;
+    _Atomic double   start;     // INFINITY until the animation starts
     double           duration;
-} VNPhaseEntry;
+    float            offset_x;
+    float            offset_y;
+} VNCloneEntry;
 
-static VNPhaseEntry     gVNPhases[MAX_CLONE_ANIMATIONS];
-static _Atomic uint32_t gVNPhaseNext;
+static VNCloneEntry     gVNCloneEntries[MAX_CLONE_ANIMATIONS];
+static _Atomic uint32_t gVNCloneEntryNext;
 
-static void vn_phase_publish(float seed, double start, double duration) {
-    VNPhaseEntry *e = &gVNPhases[atomic_fetch_add_explicit(&gVNPhaseNext, 1, memory_order_relaxed)
-                                 % MAX_CLONE_ANIMATIONS];
+static uint64_t vn_clone_key(float seed) {
     uint32_t bits;
     memcpy(&bits, &seed, sizeof(bits));
-    atomic_store_explicit(&e->key, 0, memory_order_relaxed);
-    e->start    = start;
-    e->duration = duration > 0.0 ? duration : 0.25;
-    atomic_store_explicit(&e->key, (1ull << 32) | bits, memory_order_release);
+    return (1ull << 32) | bits;
 }
 
-/// The phase, 0..1, of the animation whose clone carries `seed`, at `now`; -1
-/// when it has not started, which leaves the shader on the tick's phase.
-static float vn_phase_for_seed(float seed, double now) {
-    uint32_t bits;
-    memcpy(&bits, &seed, sizeof(bits));
-    const uint64_t want = (1ull << 32) | bits;
+static VNCloneEntry *vn_clone_entry(float seed) {
+    const uint64_t want = vn_clone_key(seed);
     for (int i = 0; i < MAX_CLONE_ANIMATIONS; i++) {
-        if (atomic_load_explicit(&gVNPhases[i].key, memory_order_acquire) != want) continue;
-        const double p = (now - gVNPhases[i].start) / gVNPhases[i].duration;
-        return (float)(p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
+        if (atomic_load_explicit(&gVNCloneEntries[i].key, memory_order_acquire) == want) return &gVNCloneEntries[i];
     }
-    return -1.0f;
+    return NULL;
 }
+
+/// Called when a shader clone is built.
+static void vn_clone_publish(float seed, CGPoint offset) {
+    VNCloneEntry *e = &gVNCloneEntries[atomic_fetch_add_explicit(&gVNCloneEntryNext, 1, memory_order_relaxed)
+                                       % MAX_CLONE_ANIMATIONS];
+    atomic_store_explicit(&e->key, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->start, INFINITY, memory_order_relaxed);
+    e->duration = 0.25;
+    e->offset_x = (float)offset.x;
+    e->offset_y = (float)offset.y;
+    atomic_store_explicit(&e->key, vn_clone_key(seed), memory_order_release);
+}
+
+/// Called when its animation starts, with the start time the tick also uses.
+static void vn_clone_start(float seed, double start, double duration) {
+    VNCloneEntry *e = vn_clone_entry(seed);
+    if (!e) return;
+    e->duration = duration > 0.0 ? duration : 0.25;
+    atomic_store_explicit(&e->start, start, memory_order_release);
+}
+
+/// The draw-time state of the clone carrying `seed`: its phase at `now`, 0..1,
+/// or -1 before it starts (the shader then uses the tick's), and the window's
+/// offset in the quad, or -1s when the clone is unknown.
+static void vn_clone_lookup(float seed, double now, float *phase, float *offset_x, float *offset_y) {
+    *phase = -1.0f;
+    *offset_x = *offset_y = -1.0f;
+    VNCloneEntry *e = vn_clone_entry(seed);
+    if (!e) return;
+    *offset_x = e->offset_x;
+    *offset_y = e->offset_y;
+    const double start = atomic_load_explicit(&e->start, memory_order_acquire);
+    if (!(start < INFINITY)) return;
+    const double p = (now - start) / e->duration;
+    *phase = (float)(p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
+}
+
+#pragma mark - Water simulation state
+
+/// What the particle simulation needs to know about the close it belongs to:
+/// which window the particles come from, on which display, and when the
+/// animation starts. Written from the close path, read on the compositor's
+/// thread.
+///
+/// One system at a time. The particles are a single fixed buffer on the GPU, so
+/// a second water close re-seeds that buffer rather than running two
+/// simulations side by side. The clone the particles came from is recorded so
+/// that its release, and only its release, retires the system -- a later close
+/// having overwritten this state does not make the earlier clone's teardown
+/// stop the simulation out from under it.
+///
+/// Published with a sequence counter rather than a lock, for the same reason
+/// the draw hook uses a ring: the compositor's thread must never wait on the
+/// close path. A torn read costs one frame of particles, so the reader gives up
+/// and leaves the frame alone rather than retrying.
+typedef struct {
+    _Atomic uint32_t seq;         // odd while being written
+    uint32_t         generation;  // bumped per close; the step respawns when it changes
+    CGXWindow       *clone_win;
+    CGRect           window_pt;   // the closing window, in the display's points
+    CGRect           display_pt;  // that display's bounds, in points
+    // The other windows on screen, for the fluid to land on. Sampled once, when
+    // the clone is built: a window that moves during the close keeps the shape
+    // the fluid was told about, which is cheaper than re-reading the window
+    // list on the compositor's thread every frame and wrong by less than a
+    // window moves in a second.
+    CGRect           obstacles[kVNMaxObstacles];
+    uint32_t         obstacle_count;
+    float            tint;        // read from prefs here, never on the render thread
+    /// The owning clone's per-close seed -- its filter params[0], the same value
+    /// the draw path reads off each layer. The fluid is one global system, so
+    /// this is how a layer asks whether the water in the buffers is its own.
+    float            seed;
+    double           start;       // when the animation starts; INFINITY until then
+    double           duration;
+} VNWaterState;
+
+static VNWaterState gVNWater = { .start = INFINITY, .duration = 1.0 };
+
+/// Non-zero while a water clone is on screen. The compute hook tests this first
+/// and does nothing else when it is zero, so every frame of every other close --
+/// and every frame of ordinary compositing -- pays one acquire load.
+static _Atomic int gVNWaterClones;
+
+typedef struct {
+    bool     valid;
+    uint32_t generation;
+    CGRect   window_pt;
+    CGRect   display_pt;
+    CGRect   obstacles[kVNMaxObstacles];
+    uint32_t obstacle_count;
+    float    tint;
+    float    seed;
+    double   start;
+    double   duration;
+} VNWaterSnapshot;
+
+/// The windows the fluid should flow around. Defined with the window tracking
+/// table it reads, further down.
+static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_pt,
+                                           CGRect display_pt, CGRect out[kVNMaxObstacles]);
+
+/// `obstacles` is collected by the caller, BEFORE the clone exists. It has to
+/// be: the clone is ordered above everything and, for water, shaped to the
+/// whole display, so asking which windows are unobscured once it is on screen
+/// answers "none of them" -- our own clone covers the lot.
+static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_pt,
+                             const CGRect *obstacles, uint32_t obstacle_count, float tint, float seed) {
+    const uint32_t seq = atomic_load_explicit(&gVNWater.seq, memory_order_relaxed);
+    atomic_store_explicit(&gVNWater.seq, seq + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+
+    gVNWater.generation++;
+    gVNWater.clone_win  = clone;
+    gVNWater.window_pt  = window_pt;
+    gVNWater.display_pt = display_pt;
+    gVNWater.start      = INFINITY;
+    gVNWater.duration   = 1.0;
+    gVNWater.tint       = tint;
+    gVNWater.seed       = seed;
+    gVNWater.obstacle_count = obstacle_count <= kVNMaxObstacles ? obstacle_count : kVNMaxObstacles;
+    if (gVNWater.obstacle_count > 0 && obstacles) {
+        memcpy(gVNWater.obstacles, obstacles, gVNWater.obstacle_count * sizeof(CGRect));
+    }
+
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&gVNWater.seq, seq + 2, memory_order_relaxed);
+    atomic_store_explicit(&gVNWaterClones, 1, memory_order_release);
+
+    VN_INFO("water: clone %p generation %u, %u obstacle(s), window=(%.0f,%.0f %.0fx%.0f) display=(%.0f,%.0f %.0fx%.0f)",
+            clone, gVNWater.generation, gVNWater.obstacle_count,
+            window_pt.origin.x, window_pt.origin.y, window_pt.size.width, window_pt.size.height,
+            display_pt.origin.x, display_pt.origin.y, display_pt.size.width, display_pt.size.height);
+}
+
+static void vn_water_start(CGXWindow *clone, double start, double duration) {
+    if (gVNWater.clone_win != clone) return;
+    const uint32_t seq = atomic_load_explicit(&gVNWater.seq, memory_order_relaxed);
+    atomic_store_explicit(&gVNWater.seq, seq + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+
+    gVNWater.start    = start;
+    gVNWater.duration = duration > 0.0 ? duration : 1.0;
+
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&gVNWater.seq, seq + 2, memory_order_relaxed);
+}
+
+static void vn_particles_report(void);
+
+/// Called from vn_release_clone, on whichever path releases the clone.
+static void vn_water_retire(CGXWindow *clone) {
+    if (!clone || gVNWater.clone_win != clone) return;
+    gVNWater.clone_win = NULL;
+    atomic_store_explicit(&gVNWaterClones, 0, memory_order_release);
+    vn_particles_report();
+}
+
+/// The state as the compositor's thread sees it. `valid` is false if the close
+/// path was midway through publishing, which is a frame this destination simply
+/// does not simulate.
+static VNWaterSnapshot vn_water_snapshot(void) {
+    VNWaterSnapshot out = {0};
+    const uint32_t s1 = atomic_load_explicit(&gVNWater.seq, memory_order_relaxed);
+    if (s1 & 1u) return out;
+    atomic_thread_fence(memory_order_acquire);
+
+    out.generation = gVNWater.generation;
+    out.window_pt  = gVNWater.window_pt;
+    out.display_pt = gVNWater.display_pt;
+    out.start      = gVNWater.start;
+    out.duration   = gVNWater.duration;
+    out.tint = gVNWater.tint;
+    out.seed = gVNWater.seed;
+    out.obstacle_count = gVNWater.obstacle_count <= kVNMaxObstacles ? gVNWater.obstacle_count : 0;
+    memcpy(out.obstacles, gVNWater.obstacles, sizeof(out.obstacles));
+
+    atomic_thread_fence(memory_order_acquire);
+    out.valid = (atomic_load_explicit(&gVNWater.seq, memory_order_relaxed) == s1);
+    return out;
+}
+
 static uint64_t       gNextAnimId = 1;
 static _Atomic bool   gAnimTimerRunning = false;
 
@@ -880,6 +1074,7 @@ static void vn_release_clone(CGXWindow *clone) {
         if (atomic_fetch_sub_explicit(&gVNHDRClones, 1, memory_order_acq_rel) == 1) vn_edr_ramp_override(false);
         vn_window_request_headroom(clone, 1.0f);
     }
+    vn_water_retire(clone);
     vn_filter_detach(clone);
     if (vn_resolved_system_window_release) vn_resolved_system_window_release(clone);
 }
@@ -1080,14 +1275,18 @@ static void vn_pending_clone_cleanup_timer(void *ctx, double when) {
 // and left; disagree here and every shader animation samples off by the
 // difference.
 //
-// One margin for every shader animation, deliberately. An effect that never
-// leaves the window could ask for far less, and the quad's area is what it
-// costs -- but a small margin exposes a one-or-two-frame artifact at the start
-// of the close that has resisted five attempts to fix (a displaced copy of the
-// window peeking out from behind the original). At this width the displaced
-// frame lands entirely behind the original and is never seen. That is a
-// workaround, not a fix: the mismatch is still there, it is merely covered.
-#define kVNShaderMargin 0.50
+// Each shader animation declares its own margin (VNAnimationStyle::shader.
+// margin), and Shatter additionally spans the display's full height so its
+// pieces can fall all the way off the screen. Where the window sits inside the
+// quad reaches the shader per close (VNShaderExtra::offset).
+//
+// Mind the floor: a small margin exposes a one-or-two-frame artifact at the
+// start of the close that has resisted five attempts to fix (a displaced copy
+// of the window peeking out from behind the original). At half the window's
+// size on each side the displaced frame lands entirely behind the original and
+// is never seen. That is a workaround, not a fix: the mismatch is still there,
+// it is merely covered -- so shrink an animation's margin only after watching
+// its first frames.
 
 #define kVNMeshMaxDim   16
 #define kVNMeshMaxCount (kVNMeshMaxDim * kVNMeshMaxDim)
@@ -1130,6 +1329,10 @@ struct VNAnimationStyle {
             uint32_t    type;   // kVNFilterType*, the tag that routes the clone
             const char *frag;   // fragment function in Vanish.metallib
             bool        hdr;    // asks the display for EDR headroom while it runs
+            float       margin; // quad widened by this fraction of the frame on each side
+            bool        full_height; // quad spans the display's full height as well
+            bool        full_screen; // quad IS the display: the animation may draw anywhere
+            bool        particles;   // stepped by the compute pass before each frame is drawn
         } shader;
     };
 };
@@ -1163,10 +1366,11 @@ static const VNAnimationStyle gAnimationStyles[] = {
     { "roll",     "Roll",     VN_ANIM_MESH, .mesh = { 6, 12, vn_anim_roll } },
     { "barrel",   "Barrel",   VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_barrel } },
     { "clock",    "Clock",    VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_clock } },
-    { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve", false } },
-    { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt", false } },
-    { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter", false } },
-    { "burn",      "Burn",      VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_burn", true } },
+    { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve", false, 0.50f, false, false, false } },
+    { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt", false, 0.50f, false, false, false } },
+    { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter", false, 0.50f, true, false, false } },
+    { "burn",      "Burn",      VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_burn", true, 0.50f, false, false, false } },
+    { "water",     "Water",     VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_water", false, 0.50f, false, true, true } },
 };
 #define kVNAnimationStyleCount (sizeof(gAnimationStyles) / sizeof(gAnimationStyles[0]))
 
@@ -1249,18 +1453,46 @@ static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader, co
 /// across a quad larger than the window. The shader puts the content back at
 /// 1:1 in the middle -- see vn_window_uv there, which has to agree with
 /// kVNShaderMargin.
-static void vn_shader_widen_bounds(CGXWindow *clone, CGRect frame) {
-    if (!clone || !vn_resolved_shape_window_with_rect) return;
+static CGPoint vn_shader_widen_bounds(CGXWindow *clone, CGRect frame, const VNAnimationStyle *anim,
+                                      const void *display) {
+    const float margin = anim ? anim->shader.margin : 0.5f;
+    CGPoint offset = CGPointMake(margin, margin);
+    if (!clone || !vn_resolved_shape_window_with_rect) return offset;
 
-    const double mx = frame.size.width  * kVNShaderMargin;
-    const double my = frame.size.height * kVNShaderMargin;
+    const double mx = frame.size.width  * margin;
+    const double my = frame.size.height * margin;
 
     // Screen coordinates, not window-local: the rect positions the window as
     // well as sizing it, so a (-mx, -my) origin does not widen the shape in
     // place, it teleports the clone to the top-left of the display.
-    const CGRect shape = CGRectMake(frame.origin.x - mx, frame.origin.y - my,
-                                    frame.size.width  + mx * 2.0,
-                                    frame.size.height + my * 2.0);
+    CGRect shape = CGRectMake(frame.origin.x - mx, frame.origin.y - my,
+                              frame.size.width  + mx * 2.0,
+                              frame.size.height + my * 2.0);
+
+    // Water's particles fall to the bottom of the screen and bounce off its
+    // sides, so its quad is the display: a shader may only write inside the
+    // layer's draw shape, and anything narrower would clip the simulation at
+    // the window's own margin.
+    if (anim && anim->shader.full_screen && display && vn_resolved_display_get_bounds) {
+        const CGRect screen = vn_resolved_display_get_bounds(display);
+        // Union, not replacement: a window hanging off the edge of the display
+        // still has to be inside the shape, or its own pixels are clipped
+        // before the animation even starts.
+        if (screen.size.width >= 1.0 && screen.size.height >= 1.0) shape = CGRectUnion(screen, frame);
+    } else if (anim && anim->shader.full_height && display && vn_resolved_display_get_bounds) {
+        const CGRect screen = vn_resolved_display_get_bounds(display);
+        if (screen.size.height >= 1.0) {
+            const double top    = fmin(CGRectGetMinY(screen), CGRectGetMinY(frame));
+            const double bottom = fmax(CGRectGetMaxY(screen), CGRectGetMaxY(frame));
+            shape.origin.y    = top;
+            shape.size.height = bottom - top;
+        }
+    }
+
+    // What the shader subtracts from its texture coordinates to put the window
+    // at [0,1]: the window's offset inside the quad, in units of its own size.
+    offset.x = (CGFloat)((frame.origin.x - shape.origin.x) / frame.size.width);
+    offset.y = (CGFloat)((frame.origin.y - shape.origin.y) / frame.size.height);
 
     // Measure, rather than assume. Two attempts at this rect have moved the
     // clone instead of widening it in place, so log what the window actually
@@ -1274,15 +1506,17 @@ static void vn_shader_widen_bounds(CGXWindow *clone, CGRect frame) {
     CGRect after_screen = vn_resolved_screen_rect ? vn_resolved_screen_rect(clone) : CGRectZero;
     CGRect after_bounds = vn_resolved_clipped_frame_bounds ? vn_resolved_clipped_frame_bounds(clone) : CGRectZero;
 
-    VN_INFO("shader bounds: frame=(%.0f,%.0f %.0fx%.0f) asked=(%.0f,%.0f %.0fx%.0f)",
+    VN_INFO("shader bounds: frame=(%.0f,%.0f %.0fx%.0f) asked=(%.0f,%.0f %.0fx%.0f) offset=(%.3f, %.3f)",
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-            shape.origin.x, shape.origin.y, shape.size.width, shape.size.height);
+            shape.origin.x, shape.origin.y, shape.size.width, shape.size.height,
+            offset.x, offset.y);
     VN_INFO("shader bounds: screen %.0f,%.0f %.0fx%.0f -> %.0f,%.0f %.0fx%.0f",
             before_screen.origin.x, before_screen.origin.y, before_screen.size.width, before_screen.size.height,
             after_screen.origin.x,  after_screen.origin.y,  after_screen.size.width,  after_screen.size.height);
     VN_INFO("shader bounds: bounds %.0f,%.0f %.0fx%.0f -> %.0f,%.0f %.0fx%.0f",
             before_bounds.origin.x, before_bounds.origin.y, before_bounds.size.width, before_bounds.size.height,
             after_bounds.origin.x,  after_bounds.origin.y,  after_bounds.size.width,  after_bounds.size.height);
+    return offset;
 }
 
 /// The animation's progress, handed to the shader through the one per-window
@@ -1378,6 +1612,18 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             anim ? anim->key : "?",
             anim ? (anim->kind == VN_ANIM_SHADER ? "SHADER" : "MESH") : "?");
 
+    // Before the clone exists, while the screen still looks the way the user
+    // is looking at it.
+    CGRect   water_obstacles[kVNMaxObstacles];
+    uint32_t water_obstacle_count = 0;
+    CGRect   water_screen = CGRectZero;
+    if (anim->kind == VN_ANIM_SHADER && anim->shader.particles) {
+        water_screen = vn_resolved_display_get_bounds ? vn_resolved_display_get_bounds(display) : CGRectZero;
+        water_obstacle_count = vn_water_collect_obstacles(orig_wid,
+                                                          content.size.width >= 1.0 ? content : frame,
+                                                          water_screen, water_obstacles);
+    }
+
     double t_clone0 = SLSCurrentRealTime();
     CGXWindow *clone = vn_resolved_create_clone(win, frame, display, true);
     double clone_ms = (SLSCurrentRealTime() - t_clone0) * 1000.0;
@@ -1461,7 +1707,16 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             if (atomic_fetch_add_explicit(&gVNHDRClones, 1, memory_order_acq_rel) == 0) vn_edr_ramp_override(true);
             vn_window_request_headroom(clone, kVNBurnHeadroom);
         }
-        vn_shader_widen_bounds(clone, frame);
+        vn_clone_publish(params[0], vn_shader_widen_bounds(clone, frame, anim, display));
+        if (anim->shader.particles) {
+            // The particles need the window and the display in points; the
+            // compute pass converts both into the render target's pixels once
+            // it knows the destination it is stepping against. The obstacles
+            // were collected above, before this clone went on screen.
+            vn_water_publish(clone, content.size.width >= 1.0 ? content : frame,
+                             water_screen, water_obstacles, water_obstacle_count,
+                             prefs.waterTint, params[0]);
+        }
         vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
         VNPointWarp warm[kVNMeshMaxCount];
@@ -2119,7 +2374,10 @@ static void vn_start_clone_animation(VNClone clone) {
         .start_time = start_time,
         .duration = (double)dur,
     };
-    if (clone.anim->kind == VN_ANIM_SHADER) vn_phase_publish(clone.seed, start_time, (double)dur);
+    if (clone.anim->kind == VN_ANIM_SHADER) {
+        vn_clone_start(clone.seed, start_time, (double)dur);
+        vn_water_start(clone_win, start_time, (double)dur);
+    }
     os_unfair_lock_unlock(&gCloneAnimationsLock);
 
     if (clone_wid != 0) {
@@ -2419,6 +2677,130 @@ static void vn_track_window_release(uint32_t wid) {
         }
     }
     os_unfair_lock_unlock(&gTrackedLock);
+}
+
+/// The windows the fluid should flow around: everything ordered in on this
+/// display except the window that is closing and our own clones. Read from the
+/// tracking table the order hook already maintains, on the close path, so the
+/// compositor's thread never has to take that lock.
+/// `closing_pt` is the closing window's OWN rect -- screen_rect, not the
+/// clipped frame bounds that carry its drop shadow, and not the display-sized
+/// shape the shader is allowed to draw into. It has to be the tight one: an
+/// inflated rect would overlap windows that merely sit near the closing one,
+/// drop them from the list, and the water would fall straight through the first
+/// thing under it.
+static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_pt,
+                                           CGRect display_pt, CGRect out[kVNMaxObstacles]) {
+    const double t0 = SLSCurrentRealTime();
+    uint32_t wids[MAX_TRACKED_WINDOWS];
+    int n = 0;
+
+    os_unfair_lock_lock(&gTrackedLock);
+    for (int i = 0; i < MAX_TRACKED_WINDOWS && n < MAX_TRACKED_WINDOWS; i++) {
+        if (gTrackedWindows[i].wid != 0 && gTrackedWindows[i].is_ordered_in &&
+            gTrackedWindows[i].wid != closing_wid) {
+            wids[n++] = gTrackedWindows[i].wid;
+        }
+    }
+    os_unfair_lock_unlock(&gTrackedLock);
+
+    uint32_t count = 0;
+    for (int i = 0; i < n && count < kVNMaxObstacles; i++) {
+        if (!vn_resolved_window_by_id) break;
+        CGXWindow *w = vn_resolved_window_by_id(wids[i]);
+        if (!w || vn_is_clone_wid(wids[i], w)) continue;
+
+        CGRect r = vn_resolved_screen_rect ? vn_resolved_screen_rect(w) : CGRectZero;
+        if (r.size.width < 32.0 || r.size.height < 32.0) continue;
+        // Only what is actually on this display, and only what is big enough to
+        // be a surface rather than a tooltip.
+        if (display_pt.size.width >= 1.0 && !CGRectIntersectsRect(r, display_pt)) continue;
+
+        // Not the desktop. The wallpaper is a window like any other and it is
+        // ordered in and covers the screen, so it would take a slot and be
+        // solid to every drop -- the fluid is meant to run over the desktop,
+        // not be contained by it. Anything covering nearly the whole display
+        // is one of those surfaces rather than a ledge to land on.
+        if (display_pt.size.width >= 1.0 && display_pt.size.height >= 1.0) {
+            const double screen_area = display_pt.size.width * display_pt.size.height;
+            if (r.size.width * r.size.height >= screen_area * 0.85) {
+                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) covers the display -- skipped",
+                         wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
+                continue;
+            }
+        }
+
+        // Not something the fluid is born on top of.
+        //
+        // A window overlapping the closing one is underneath where the liquid
+        // starts, so some of the liquid begins inside it. Left in the list it
+        // is solid to the particles born above its top edge and permeable to
+        // the ones born below -- one window behaving two ways at once, which
+        // pins half the fluid along a dead straight line at its top edge and
+        // pours the other half through it. That is the rectangle that became
+        // visible. The question is about the window, so it is answered once
+        // here rather than per particle.
+        if (closing_pt.size.width >= 1.0 && CGRectIntersectsRect(r, closing_pt)) {
+            VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) overlaps the closing window "
+                     "(%.0f,%.0f %.0fx%.0f) -- skipped",
+                     wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height,
+                     closing_pt.origin.x, closing_pt.origin.y, closing_pt.size.width, closing_pt.size.height);
+            continue;
+        }
+
+        // Only the part of it you can actually see.
+        //
+        // A window buried behind another is still a window as far as the
+        // tracking table is concerned, and making it solid stops the water in
+        // mid-air on a rectangle that is not on screen. SkyLight already knows
+        // the answer: the unobscured content shape is the window's content
+        // minus everything stacked above it, and it is NULL outright when the
+        // window is not visible.
+        //
+        // The bounding box of that shape becomes the obstacle, so a window
+        // half-covered from one side only blocks along the half you can see.
+        if (vn_resolved_unobscured_content_shape && vn_resolved_get_region_bounds) {
+            void *shape = vn_resolved_unobscured_content_shape(w);
+            if (!shape) {
+                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is not visible -- skipped",
+                         wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
+                continue;
+            }
+            CGRect visible = CGRectZero;
+            vn_resolved_get_region_bounds(shape, &visible);
+            CFRelease(shape);
+
+            // Mostly buried counts as buried: landing on a sliver reads as
+            // landing on nothing.
+            const double full = r.size.width * r.size.height;
+            const double seen = visible.size.width * visible.size.height;
+            if (visible.size.width < 32.0 || visible.size.height < 32.0 ||
+                (full > 0.0 && seen < full * 0.2)) {
+                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) is %.0f%% covered -- skipped",
+                         wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height,
+                         full > 0.0 ? (1.0 - seen / full) * 100.0 : 100.0);
+                continue;
+            }
+            if (!CGRectEqualToRect(visible, r)) {
+                VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f) -> visible part "
+                         "(%.0f,%.0f %.0fx%.0f)",
+                         wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height,
+                         visible.origin.x, visible.origin.y, visible.size.width, visible.size.height);
+            }
+            r = visible;
+        }
+
+        VN_DEBUG("water: obstacle wid=%u (%.0f,%.0f %.0fx%.0f)",
+                 wids[i], r.origin.x, r.origin.y, r.size.width, r.size.height);
+        out[count++] = r;
+    }
+
+    // This runs on the mouse-up, between the click and the app hearing about
+    // it, and the shape query is the one expensive thing in it -- so it is
+    // measured rather than assumed.
+    VN_INFO("water: %u obstacle(s) from %d window(s) in %.2fms",
+            count, n, (SLSCurrentRealTime() - t0) * 1000.0);
+    return count;
 }
 
 static int vn_count_visible_windows_for_pid(pid_t pid, uint32_t exclude_wid) {
@@ -3380,6 +3762,740 @@ static void *vn_shader_for_fragment(const char *frag_name) {
     return shader;
 }
 
+#pragma mark - Particle simulation
+
+// A pass of our own inside the compositor's frame.
+//
+// Every other animation here is a closed form: give a pixel its phase and the
+// fragment works out its colour without knowing anything about the frame
+// before. A fluid cannot be written that way -- a particle's position this
+// frame is its position last frame plus what the forces did in between -- so
+// the state has to live on the GPU and be advanced exactly once per frame,
+// before anything reads it.
+//
+// The frame that advances it is the compositor's own. MetalContext::
+// StartComposite closes whatever is encoding and asks RenderCommandBuffer for
+// the command buffer the whole frame is being built on (see
+// kVNSymMetalContextStartComposite for the disassembly that says so), so
+// hooking it gives us a point where that command buffer exists, nothing is
+// encoding, and the render pass that will draw our clone has not started. A
+// compute encoder opened there, used and ended before the original runs, puts
+// the simulation inside the frame the compositor was already assembling:
+//
+//   * one queue and one command buffer, so there is no second timeline to keep
+//     in step with and nothing to synchronise between them;
+//   * Metal's own hazard tracking orders the render pass after the compute
+//     pass, because the buffers are ordinary tracked resources in the same
+//     command buffer -- the fragment reads what this frame's step wrote, with
+//     no fences of ours;
+//   * nothing runs at all when no water close is in flight.
+//
+// The simulation works in RENDER-TARGET PIXELS, the space a fragment's
+// [[position]] arrives in, so the kernels and the fragment need no mapping
+// between them. The destination gives the domain: its bounds are in points and
+// scaling them by its own scale is what StartComposite hands to
+// FillOrtho2DFromBounds, which is the pixel grid.
+
+/// Kernel buffer indices; must match Water.metal.
+#define kVNParticleBufferIndex 0
+#define kVNBinBufferIndex      1
+#define kVNSimParamsIndex      2
+#define kVNObstacleIndex       3
+#define kVNNeighbourIndex      4
+
+/// Fragment buffer and texture indices, ours. The compositor binds only
+/// buffer(0) and texture(0) on this path, and VNShaderExtra sits at 8.
+#define kVNFragSimParamsIndex 11
+#define kVNFragFieldTexture    1
+
+typedef struct { unsigned long width, height, depth; } VNMTLSize;
+typedef struct { unsigned long location, length; } VNNSRange;
+
+/// objc_msgSend, cast per call shape rather than called variadically: a
+/// variadic cast gets struct and float arguments wrong on arm64, and MTLSize is
+/// a 24-byte struct passed by value.
+static void  *(*vn_msg_id)(void *, void *);
+static void  *(*vn_msg_id_p)(void *, void *, void *);
+static void  *(*vn_msg_id_pp)(void *, void *, void *, void **);
+static void  *(*vn_msg_id_u)(void *, void *, unsigned long);
+static void  *(*vn_msg_id_uu)(void *, void *, unsigned long, unsigned long);
+static void  *(*vn_msg_id_range)(void *, void *, VNNSRange);
+static void   (*vn_msg_v_p)(void *, void *, void *);
+static void   (*vn_msg_v_u)(void *, void *, unsigned long);
+static void   (*vn_msg_v_puu)(void *, void *, void *, unsigned long, unsigned long);
+static void   (*vn_msg_v_cuu)(void *, void *, const void *, unsigned long, unsigned long);
+static bool   (*vn_msg_b_p)(void *, void *, void *);
+static bool   (*vn_msg_b_u)(void *, void *, unsigned long);
+static void  *(*vn_msg_id_uuub)(void *, void *, unsigned long, unsigned long, unsigned long, bool);
+static void   (*vn_msg_v_pu)(void *, void *, void *, unsigned long);
+static void   (*vn_msg_v_size2)(void *, void *, VNMTLSize, VNMTLSize);
+static void   (*vn_msg_v)(void *, void *);
+static double (*vn_msg_d)(void *, void *);
+static unsigned long (*vn_msg_u)(void *, void *);
+static void  *(*vn_sel_reg)(const char *);
+static void  *(*vn_get_class)(const char *);
+static void  *(*vn_pool_push)(void);
+static void   (*vn_pool_pop)(void *);
+
+static bool vn_objc_ready(void) {
+    static bool s_tried, s_ok;
+    if (s_tried) return s_ok;
+    s_tried = true;
+
+    void *send = dlsym(RTLD_DEFAULT, "objc_msgSend");
+    vn_sel_reg   = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
+    vn_get_class = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "objc_getClass");
+    vn_pool_push = (void *(*)(void))dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPush");
+    vn_pool_pop  = (void (*)(void *))dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPop");
+    if (!send || !vn_sel_reg || !vn_get_class || !vn_pool_push || !vn_pool_pop) return false;
+
+    vn_msg_id       = (void *(*)(void *, void *))send;
+    vn_msg_id_p     = (void *(*)(void *, void *, void *))send;
+    vn_msg_id_pp    = (void *(*)(void *, void *, void *, void **))send;
+    vn_msg_id_u     = (void *(*)(void *, void *, unsigned long))send;
+    vn_msg_id_uu    = (void *(*)(void *, void *, unsigned long, unsigned long))send;
+    vn_msg_id_range = (void *(*)(void *, void *, VNNSRange))send;
+    vn_msg_v_p      = (void (*)(void *, void *, void *))send;
+    vn_msg_v_u      = (void (*)(void *, void *, unsigned long))send;
+    vn_msg_v_puu    = (void (*)(void *, void *, void *, unsigned long, unsigned long))send;
+    vn_msg_v_cuu    = (void (*)(void *, void *, const void *, unsigned long, unsigned long))send;
+    vn_msg_b_p      = (bool (*)(void *, void *, void *))send;
+    vn_msg_b_u      = (bool (*)(void *, void *, unsigned long))send;
+    vn_msg_id_uuub  = (void *(*)(void *, void *, unsigned long, unsigned long, unsigned long, bool))send;
+    vn_msg_v_pu     = (void (*)(void *, void *, void *, unsigned long))send;
+    vn_msg_v_size2  = (void (*)(void *, void *, VNMTLSize, VNMTLSize))send;
+    vn_msg_v        = (void (*)(void *, void *))send;
+    vn_msg_d        = (double (*)(void *, void *))send;
+    vn_msg_u        = (unsigned long (*)(void *, void *))send;
+    s_ok = true;
+    return true;
+}
+
+#define VN_SEL(name) ({ static void *s_sel; if (!s_sel) s_sel = vn_sel_reg(name); s_sel; })
+
+/// Everything the simulation owns, created once on the compositor's device and
+/// kept for the life of the process. Nothing here is ever released: a buffer or
+/// pipeline can still be referenced by a command buffer we handed it to and no
+/// longer track, and the whole allocation is under two megabytes.
+/// The kernels, in the order Algorithm 1 runs them. One table rather than one
+/// global apiece, so a kernel that fails to build is reported by name and the
+/// dispatch sequence reads as the algorithm does.
+enum {
+    kVNKPredict, kVNKBinClear, kVNKBinFill, kVNKNeighbours,
+    kVNKLambda, kVNKDelta, kVNKApply,
+    kVNKVelocity, kVNKVorticity, kVNKVelPost, kVNKVelCommit,
+    kVNKField, kVNKBlurX, kVNKBlurY,
+    kVNKernelCount
+};
+
+static const char * const kVNKernelNames[kVNKernelCount] = {
+    "vn_pbf_predict", "vn_pbf_bin_clear", "vn_pbf_bin_fill", "vn_pbf_neighbours",
+    "vn_pbf_lambda", "vn_pbf_delta", "vn_pbf_apply",
+    "vn_pbf_velocity", "vn_pbf_vorticity", "vn_pbf_vel_post", "vn_pbf_vel_commit",
+    "vn_field_build", "vn_field_blur_x", "vn_field_blur_y",
+};
+
+/// Everything the simulation owns, created once on the compositor's device and
+/// kept for the life of the process. Nothing here is ever released: a buffer,
+/// texture or pipeline can still be referenced by a command buffer we handed it
+/// to and no longer track, and the whole allocation is a few megabytes.
+static void *gVNSimDevice;
+static void *gVNSimPipes[kVNKernelCount];
+static void *gVNSimParticles;   // MTLBuffer, kVNParticleCountMax x VNParticle
+static void *gVNSimBins;        // MTLBuffer, the bin table
+static void *gVNSimNeighbours;  // MTLBuffer, the flat neighbour list and its counts
+static void *gVNSimField[2];    // MTLTexture, RGBA16Float, ping-ponged by the blurs
+static void *gVNSimTimestamps;  // MTLCounterSampleBuffer, or NULL when unavailable
+static uint32_t gVNSimSampleSlot;
+static bool  gVNSimBroken;      // a failure that retrying would only repeat
+
+/// What the draw path has to know about the last dispatch.
+///
+/// Only the domain actually varies -- everything else the fragment reads is a
+/// constant from WaterSim.h -- and the fragment is handed the constants plus
+/// that one value rather than a copy of the whole struct. That is not
+/// tidiness: the step writes on the compositor's thread and the draw reads on
+/// it, and a torn read of `field_w` or `iso` would let the fragment sample
+/// outside the field, which on this GPU means faulting inside WindowServer.
+/// Constants cannot tear, and the domain is published as one 64-bit value so
+/// its two halves cannot disagree either.
+static _Atomic uint64_t gVNSimDomainBits;
+static _Atomic uint32_t gVNSimTintBits;
+static _Atomic uint32_t gVNSimSeedPhaseBits;
+static _Atomic uint32_t gVNSimOwnerSeedBits;   // whose fluid is in the buffers
+static float            gVNSimSeedPhase;   // written under gVNSimLock when the fluid is seeded
+static _Atomic(void *) gVNSimSteppedDest;
+static void         *gVNSimSteppedCmdBuf;
+static _Atomic uint32_t gVNSimGeneration;   // the close the buffers currently hold
+static double        gVNSimLastStepTime;
+static os_unfair_lock gVNSimLock = OS_UNFAIR_LOCK_INIT;
+
+/// GPU time for the compute pass, resolved on the command buffer's completion
+/// and summarised when the close ends.
+static struct {
+    uint64_t steps, sum_ns, min_ns, max_ns, unavailable;
+    double   frame_sum_ms;
+} gVNSimStats;
+static os_unfair_lock gVNSimStatsLock = OS_UNFAIR_LOCK_INIT;
+
+static void vn_particles_report(void) {
+    os_unfair_lock_lock(&gVNSimStatsLock);
+    const uint64_t n = gVNSimStats.steps;
+    const uint64_t sum = gVNSimStats.sum_ns, lo = gVNSimStats.min_ns, hi = gVNSimStats.max_ns;
+    const uint64_t missing = gVNSimStats.unavailable;
+    const double frame_sum = gVNSimStats.frame_sum_ms;
+    memset(&gVNSimStats, 0, sizeof(gVNSimStats));
+    os_unfair_lock_unlock(&gVNSimStatsLock);
+
+    if (n == 0) {
+        if (missing) VN_INFO("water: %llu step(s) completed, none with GPU timing", missing);
+        return;
+    }
+    VN_INFO("water: %llu step(s) on the GPU -- min %.3fms avg %.3fms max %.3fms; "
+            "whole frame avg %.3fms (%llu untimed)",
+            n, lo / 1e6, (double)sum / (double)n / 1e6, hi / 1e6, frame_sum / (double)n, missing);
+}
+
+/// Resolves the two timestamps the compute pass sampled, and the whole frame's
+/// GPU time alongside them.
+///
+/// The timestamps come back in NANOSECONDS, not in mach_absolute_time ticks.
+///
+/// This was the other way round to begin with, converted through the mach
+/// timebase -- which on this machine is 125/3, so every step was reported 41.67
+/// times too long: 78ms of compute inside a 2.8ms frame. That impossibility is
+/// what the frame's own GPUStartTime/GPUEndTime are logged beside it for, and
+/// they are kept for exactly that reason: they arrive in seconds and rest on no
+/// assumption, so they are the check on the number that does.
+/// Up to this many steps may be in flight with their timestamps unresolved.
+/// The sample buffer holds a pair of slots for each: resolving a frame's pair
+/// after the next frame had written over it is the one way to get numbers that
+/// look plausible and mean nothing.
+#define kVNTimestampSlots 4u
+
+static void vn_particles_resolve_timing(void *cmdbuf, uint32_t slot) {
+    void *pool = vn_pool_push();
+    double frame_ms = 0.0;
+    if (cmdbuf) {
+        const double t0 = vn_msg_d(cmdbuf, VN_SEL("GPUStartTime"));
+        const double t1 = vn_msg_d(cmdbuf, VN_SEL("GPUEndTime"));
+        if (t1 > t0) frame_ms = (t1 - t0) * 1000.0;
+    }
+
+    uint64_t ns = 0;
+    void *sample = gVNSimTimestamps;
+    if (sample) {
+        void *data = vn_msg_id_range(sample, VN_SEL("resolveCounterRange:"),
+                                     (VNNSRange){ slot * 2u, 2 });
+        const uint64_t *ts = data ? (const uint64_t *)vn_msg_id(data, VN_SEL("bytes")) : NULL;
+        if (ts && ts[0] != UINT64_MAX && ts[1] != UINT64_MAX && ts[1] > ts[0]) {
+            ns = ts[1] - ts[0];
+        }
+    }
+
+    os_unfair_lock_lock(&gVNSimStatsLock);
+    if (ns > 0) {
+        if (gVNSimStats.steps == 0 || ns < gVNSimStats.min_ns) gVNSimStats.min_ns = ns;
+        if (ns > gVNSimStats.max_ns) gVNSimStats.max_ns = ns;
+        gVNSimStats.steps++;
+        gVNSimStats.sum_ns += ns;
+        gVNSimStats.frame_sum_ms += frame_ms;
+    } else {
+        gVNSimStats.unavailable++;
+    }
+    os_unfair_lock_unlock(&gVNSimStatsLock);
+
+    VN_DEBUG("water: step %.3fms on the GPU, frame %.3fms", ns / 1e6, frame_ms);
+    vn_pool_pop(pool);
+}
+
+/// The timestamp counter set, if this device samples one at encoder
+/// boundaries. Timing is a diagnostic: everything here may return NULL and the
+/// simulation runs untimed.
+static void *vn_particles_make_timestamps(void *device) {
+    void **name_ref = (void **)dlsym(RTLD_DEFAULT, "MTLCommonCounterSetTimestamp");
+    void *wanted = name_ref ? *name_ref : NULL;
+    if (!wanted) return NULL;
+
+    // MTLCounterSamplingPointAtStageBoundary. A device that cannot sample there
+    // may do more than return nil from the encoder call, so ask first.
+    if (!vn_msg_b_u(device, VN_SEL("supportsCounterSampling:"), 0)) return NULL;
+
+    void *sets = vn_msg_id(device, VN_SEL("counterSets"));
+    if (!sets) return NULL;
+
+    void *found = NULL;
+    const unsigned long n = vn_msg_u(sets, VN_SEL("count"));
+    for (unsigned long i = 0; i < n && !found; i++) {
+        void *set = vn_msg_id_u(sets, VN_SEL("objectAtIndexedSubscript:"), i);
+        void *name = set ? vn_msg_id(set, VN_SEL("name")) : NULL;
+        if (name && vn_msg_b_p(name, VN_SEL("isEqualToString:"), wanted)) {
+            found = set;
+        }
+    }
+    if (!found) return NULL;
+
+    void *cls = vn_get_class("MTLCounterSampleBufferDescriptor");
+    void *desc = cls ? vn_msg_id(vn_msg_id(cls, VN_SEL("alloc")), VN_SEL("init")) : NULL;
+    if (!desc) return NULL;
+
+    vn_msg_v_p(desc, VN_SEL("setCounterSet:"), found);
+    vn_msg_v_u(desc, VN_SEL("setSampleCount:"), kVNTimestampSlots * 2u);
+    vn_msg_v_u(desc, VN_SEL("setStorageMode:"), 0 /* MTLStorageModeShared */);
+
+    void *err = NULL;
+    void *buf = vn_msg_id_pp(device, VN_SEL("newCounterSampleBufferWithDescriptor:error:"), desc, &err);
+    vn_msg_v(desc, VN_SEL("release"));
+    return buf;
+}
+
+static void *vn_particles_pipeline(void *device, void *library, const char *fn_name) {
+    CFStringRef name = CFStringCreateWithCString(NULL, fn_name, kCFStringEncodingUTF8);
+    if (!name) return NULL;
+    void *fn = vn_msg_id_p(library, VN_SEL("newFunctionWithName:"), (void *)name);
+    CFRelease(name);
+    if (!fn) { VN_ERROR("water: Vanish.metallib has no kernel '%s'", fn_name); return NULL; }
+
+    void *err = NULL;
+    void *pipe = vn_msg_id_pp(device, VN_SEL("newComputePipelineStateWithFunction:error:"), fn, &err);
+    vn_msg_v(fn, VN_SEL("release"));
+    if (!pipe) VN_ERROR("water: no compute pipeline for '%s'", fn_name);
+    return pipe;
+}
+
+/// A texture for the surface field: fixed size, so it is allocated once and no
+/// display can force a resize -- a resize would mean releasing a texture that
+/// may still be in flight in a command buffer we no longer own.
+static void *vn_particles_field_texture(void *device) {
+    void *cls = vn_get_class("MTLTextureDescriptor");
+    if (!cls) return NULL;
+    // 115 = MTLPixelFormatRGBA16Float. Half is the right width for a density
+    // field normalised to rest: the values sit around 1.0, where half has far
+    // more precision than a surface needs.
+    void *desc = vn_msg_id_uuub(cls, VN_SEL("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+                                115, kVNFieldDim, kVNFieldDim, false);
+    if (!desc) return NULL;
+    vn_msg_v_u(desc, VN_SEL("setUsage:"), 1 | 2);          // ShaderRead | ShaderWrite
+    vn_msg_v_u(desc, VN_SEL("setStorageMode:"), 2);        // Private
+    return vn_msg_id_p(device, VN_SEL("newTextureWithDescriptor:"), desc);
+}
+
+/// Builds the pipelines, buffers and field textures, once, on the device the
+/// frame is being built for. Returns false while the pieces are not there yet --
+/// the shader library is captured from the compositor's own first ubershader
+/// build, which on the very first water close happens a frame or two after this
+/// first runs.
+static bool vn_particles_ensure(void *device) {
+    if (gVNSimBroken || !device) return false;
+    if (gVNSimParticles && gVNSimDevice == device) return true;
+
+    if (gVNSimDevice && gVNSimDevice != device) {
+        VN_ERROR("water: a second Metal device (%p, had %p) -- not simulating on it", device, gVNSimDevice);
+        gVNSimBroken = true;
+        return false;
+    }
+
+    void *library = gUberLibrary ? vn_shader_library(gUberLibrary) : NULL;
+    if (!library) {
+        VN_DEBUG("water: no shader library yet -- skipping this frame's step");
+        return false;
+    }
+    if (vn_msg_id(library, VN_SEL("device")) != device) {
+        VN_ERROR("water: the shader library is not on the frame's device -- not simulating");
+        gVNSimBroken = true;
+        return false;
+    }
+
+    const double t0 = SLSCurrentRealTime();
+    for (int i = 0; i < kVNKernelCount; i++) {
+        gVNSimPipes[i] = vn_particles_pipeline(device, library, kVNKernelNames[i]);
+        if (!gVNSimPipes[i]) { gVNSimBroken = true; return false; }
+    }
+
+    // Private storage throughout: nothing on the CPU reads or writes any of it.
+    // The particles are seeded by the predict kernel's own spawn branch, which
+    // is why there is no upload here and no synchronisation to go with it.
+    const unsigned long particle_bytes  = (unsigned long)kVNParticleCountMax * sizeof(VNParticle);
+    const unsigned long bin_bytes       = (unsigned long)kVNBinDimMax * kVNBinDimMax * kVNBinStride * sizeof(uint32_t);
+    const unsigned long neighbour_bytes = ((unsigned long)kVNParticleCountMax * kVNMaxNeighbours
+                                           + kVNParticleCountMax) * sizeof(uint32_t);
+    gVNSimParticles  = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"), particle_bytes, 0x20);
+    gVNSimBins       = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"), bin_bytes, 0x20);
+    gVNSimNeighbours = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"), neighbour_bytes, 0x20);
+    gVNSimField[0]   = vn_particles_field_texture(device);
+    gVNSimField[1]   = vn_particles_field_texture(device);
+    if (!gVNSimParticles || !gVNSimBins || !gVNSimNeighbours || !gVNSimField[0] || !gVNSimField[1]) {
+        VN_ERROR("water: could not allocate the simulation on device %p", device);
+        gVNSimBroken = true;
+        return false;
+    }
+
+    gVNSimTimestamps = vn_particles_make_timestamps(device);
+    gVNSimDevice = device;
+    VN_INFO("water: up to %u particles, %lu + %lu + %lu bytes of buffers and two %ux%u fields on device %p "
+            "in %.1fms; GPU timing %s",
+            kVNParticleCountMax, particle_bytes, bin_bytes, neighbour_bytes,
+            kVNFieldDim, kVNFieldDim, device, (SLSCurrentRealTime() - t0) * 1000.0,
+            gVNSimTimestamps ? "on" : "unavailable");
+    return true;
+}
+
+/// Opens a compute encoder on the frame's command buffer, sampling the GPU's
+/// timestamp counter around it when the device has one.
+static void *vn_particles_encoder(void *cmdbuf, uint32_t slot) {
+    if (gVNSimTimestamps) {
+        void *cls = vn_get_class("MTLComputePassDescriptor");
+        void *desc = cls ? vn_msg_id(cls, VN_SEL("computePassDescriptor")) : NULL;
+        void *attachments = desc ? vn_msg_id(desc, VN_SEL("sampleBufferAttachments")) : NULL;
+        void *attachment = attachments ? vn_msg_id_u(attachments, VN_SEL("objectAtIndexedSubscript:"), 0) : NULL;
+        if (attachment) {
+            vn_msg_v_p(attachment, VN_SEL("setSampleBuffer:"), gVNSimTimestamps);
+            vn_msg_v_u(attachment, VN_SEL("setStartOfEncoderSampleIndex:"), slot * 2u);
+            vn_msg_v_u(attachment, VN_SEL("setEndOfEncoderSampleIndex:"), slot * 2u + 1u);
+            void *enc = vn_msg_id_p(cmdbuf, VN_SEL("computeCommandEncoderWithDescriptor:"), desc);
+            if (enc) return enc;
+        }
+    }
+    return vn_msg_id(cmdbuf, VN_SEL("computeCommandEncoder"));
+}
+
+static void vn_dispatch_1d(void *enc, int kernel, uint32_t threads) {
+    if (threads == 0) return;
+    const unsigned long group = 64;
+    vn_msg_v_p(enc, VN_SEL("setComputePipelineState:"), gVNSimPipes[kernel]);
+    vn_msg_v_size2(enc, VN_SEL("dispatchThreadgroups:threadsPerThreadgroup:"),
+                   (VNMTLSize){ (threads + group - 1) / group, 1, 1 },
+                   (VNMTLSize){ group, 1, 1 });
+}
+
+static void vn_dispatch_field(void *enc, int kernel, void *src, void *dst) {
+    vn_msg_v_p(enc, VN_SEL("setComputePipelineState:"), gVNSimPipes[kernel]);
+    if (src) vn_msg_v_pu(enc, VN_SEL("setTexture:atIndex:"), src, 0);
+    if (dst) vn_msg_v_pu(enc, VN_SEL("setTexture:atIndex:"), dst, 1);
+    const unsigned long g = 8, n = kVNFieldDim / 8;
+    vn_msg_v_size2(enc, VN_SEL("dispatchThreadgroups:threadsPerThreadgroup:"),
+                   (VNMTLSize){ n, n, 1 }, (VNMTLSize){ g, g, 1 });
+}
+
+/// One frame of fluid, encoded into the command buffer StartComposite is about
+/// to open its render pass on.
+static void vn_particles_step(void *context, void *destination) {
+    if (!vn_objc_ready() || gVNSimBroken) return;
+    if (!vn_resolved_end_encoders || !vn_resolved_render_command_buffer) return;
+
+    const VNWaterSnapshot water = vn_water_snapshot();
+    if (!water.valid) return;
+
+    // A clone is built on mouse-up and may sit there a while before the app
+    // gets round to closing the window -- or be discarded without ever
+    // animating. Simulating through that would land the fluid on the floor
+    // before the first frame anyone sees, so the step waits for the animation
+    // to start. The first step after it does is the one that seeds the fluid,
+    // because the generation has not been simulated yet.
+    if (!(water.start < INFINITY)) return;
+
+    // The destination has to be a display-sized one. The compositor opens
+    // render passes into small offscreen surfaces as well, and their pixel grid
+    // is not the one the clone is finally drawn in.
+    const int32_t *b = (const int32_t *)((const char *)destination + kVNDestinationBoundsOffset);
+    float scale = *(const float *)((const char *)destination + kVNDestinationScaleOffset);
+    if (!(scale > 0.0f)) scale = 1.0f;
+    const double w_pt = (double)(b[2] - b[0]), h_pt = (double)(b[3] - b[1]);
+    if (w_pt < 512.0 || h_pt < 512.0) return;
+
+    os_unfair_lock_lock(&gVNSimLock);
+
+    // One step per DISPLAYED FRAME.
+    //
+    // A new command buffer is not a new frame. The compositor flushes and
+    // starts another one several times per refresh, and the first build of
+    // this gated on the command buffer alone: it stepped 613 times in a close
+    // that should have had about 144, so the fluid lived four seconds for
+    // every one on screen. It was on the floor and sloshed into the corners a
+    // quarter of a second in, which is why the water had no relation left to
+    // the window it came from.
+    //
+    // The clock is the gate instead, against the same refresh interval the
+    // animation tick runs on.
+    double min_interval = gAnimFrameInterval > 0.0 ? gAnimFrameInterval * 0.9 : (0.9 / 120.0);
+    const double when = SLSCurrentRealTime();
+    if (gVNSimLastStepTime > 0.0 && (when - gVNSimLastStepTime) < min_interval) {
+        os_unfair_lock_unlock(&gVNSimLock);
+        return;
+    }
+
+    void *cmdbuf = vn_resolved_render_command_buffer(context, (const void *[3]){ NULL, NULL, NULL });
+    if (!cmdbuf || cmdbuf == gVNSimSteppedCmdBuf) {
+        os_unfair_lock_unlock(&gVNSimLock);
+        return;
+    }
+
+    void *pool = vn_pool_push();
+    void *device = vn_msg_id(cmdbuf, VN_SEL("device"));
+    if (!vn_particles_ensure(device)) {
+        vn_pool_pop(pool);
+        os_unfair_lock_unlock(&gVNSimLock);
+        return;
+    }
+
+    const double now = when;
+    double frame_dt = gVNSimLastStepTime > 0.0 ? now - gVNSimLastStepTime : 1.0 / 60.0;
+    if (frame_dt < 1.0 / 1000.0) frame_dt = 1.0 / 1000.0;
+    if (frame_dt > 1.0 / 30.0)   frame_dt = 1.0 / 30.0;   // a stall must not teleport the fluid
+
+    // The window, the display and the obstacles all arrive in points; the fluid
+    // lives in the render target's pixels, which is the same rectangle scaled
+    // about the destination's own origin.
+    const double ox = (double)b[0], oy = (double)b[1];
+    VNSimParams sp = {0};
+    sp.domain_x = (float)(w_pt * scale);
+    sp.domain_y = (float)(h_pt * scale);
+    sp.spawn_min_x = (float)((CGRectGetMinX(water.window_pt) - ox) * scale);
+    sp.spawn_min_y = (float)((CGRectGetMinY(water.window_pt) - oy) * scale);
+    sp.spawn_max_x = (float)((CGRectGetMaxX(water.window_pt) - ox) * scale);
+    sp.spawn_max_y = (float)((CGRectGetMaxY(water.window_pt) - oy) * scale);
+
+    // A window larger than the destination, or off it entirely, would seed the
+    // fluid outside the domain and leave it pinned to an edge.
+    if (sp.spawn_min_x < 0.0f) sp.spawn_min_x = 0.0f;
+    if (sp.spawn_min_y < 0.0f) sp.spawn_min_y = 0.0f;
+    if (sp.spawn_max_x > sp.domain_x) sp.spawn_max_x = sp.domain_x;
+    if (sp.spawn_max_y > sp.domain_y) sp.spawn_max_y = sp.domain_y;
+    if (sp.spawn_max_x < sp.spawn_min_x + 16.0f) sp.spawn_max_x = sp.spawn_min_x + 16.0f;
+    if (sp.spawn_max_y < sp.spawn_min_y + 16.0f) sp.spawn_max_y = sp.spawn_min_y + 16.0f;
+
+    sp.dt      = (float)(frame_dt / (double)kVNSubSteps);
+    sp.gravity = kVNGravityPx * scale;
+    sp.seed    = (float)(water.generation % 977u) + 0.5f;
+    sp.valid   = 1u;
+    vn_water_derive(&sp, sp.spawn_max_x - sp.spawn_min_x, sp.spawn_max_y - sp.spawn_min_y);
+    sp.tint = water.tint;   // derive fills in the default; the preference wins
+
+    // The windows the fluid has to flow around, converted the same way.
+    VNObstacle obstacles[kVNMaxObstacles] = {0};
+    uint32_t nobs = water.obstacle_count <= kVNMaxObstacles ? water.obstacle_count : kVNMaxObstacles;
+    for (uint32_t i = 0; i < nobs; i++) {
+        const CGRect r = water.obstacles[i];
+        obstacles[i].min_x  = (float)((CGRectGetMinX(r) - ox) * scale);
+        obstacles[i].min_y  = (float)((CGRectGetMinY(r) - oy) * scale);
+        obstacles[i].max_x  = (float)((CGRectGetMaxX(r) - ox) * scale);
+        obstacles[i].max_y  = (float)((CGRectGetMaxY(r) - oy) * scale);
+        obstacles[i].corner = (float)(12.0 * scale);
+    }
+    sp.obstacles = nobs;
+
+    // Nothing may be encoding when a compute encoder is opened on the command
+    // buffer. StartComposite closes both encoders itself a moment from now, so
+    // this costs the frame nothing it was not about to pay, and it is the very
+    // call StartComposite makes.
+    vn_resolved_end_encoders(context);
+
+    const uint32_t slot = gVNSimSampleSlot++ % kVNTimestampSlots;
+    void *enc = vn_particles_encoder(cmdbuf, slot);
+    if (enc) {
+        vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), gVNSimParticles, 0, kVNParticleBufferIndex);
+        vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), gVNSimBins, 0, kVNBinBufferIndex);
+        vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), obstacles, sizeof(obstacles), kVNObstacleIndex);
+        vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), gVNSimNeighbours, 0, kVNNeighbourIndex);
+
+        // Algorithm 1, substepped. Dispatches within a compute encoder are
+        // ordered by Metal -- the default dispatch type is serial -- so each
+        // pass sees what the one before it wrote without a barrier of ours.
+        const bool seeding = (water.generation != atomic_load_explicit(&gVNSimGeneration, memory_order_relaxed));
+        if (seeding) {
+            // Where in the close the fluid is being born. Everything the shader
+            // ramps over the animation is measured from here.
+            const double p = water.duration > 0.0 ? (now - water.start) / water.duration : 0.0;
+            gVNSimSeedPhase = (float)(p < 0.0 ? 0.0 : (p > 0.95 ? 0.95 : p));
+            if (gVNSimSeedPhase > 0.02f) {
+                VN_INFO("water: fluid seeded %.0fms into the close (phase %.3f) -- the shader's ramps "
+                        "start from there, not from zero",
+                        (now - water.start) * 1000.0, (double)gVNSimSeedPhase);
+            }
+        }
+        sp.seed_phase = gVNSimSeedPhase;
+        for (uint32_t sub = 0; sub < kVNSubSteps; sub++) {
+            sp.spawn = (seeding && sub == 0) ? 1u : 0u;
+            vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), &sp, sizeof(sp), kVNSimParamsIndex);
+
+            vn_dispatch_1d(enc, kVNKPredict, sp.count);
+            if (sp.spawn) continue;                     // the seeding step does no solve
+
+            vn_dispatch_1d(enc, kVNKBinClear, sp.bin_w * sp.bin_h);
+            vn_dispatch_1d(enc, kVNKBinFill, sp.count);
+            vn_dispatch_1d(enc, kVNKNeighbours, sp.count);
+            for (uint32_t it = 0; it < kVNSolverIterations; it++) {
+                vn_dispatch_1d(enc, kVNKLambda, sp.count);
+                vn_dispatch_1d(enc, kVNKDelta, sp.count);
+                vn_dispatch_1d(enc, kVNKApply, sp.count);
+            }
+            vn_dispatch_1d(enc, kVNKVelocity, sp.count);
+            vn_dispatch_1d(enc, kVNKVorticity, sp.count);
+            vn_dispatch_1d(enc, kVNKVelPost, sp.count);
+            vn_dispatch_1d(enc, kVNKVelCommit, sp.count);
+        }
+
+        // The field is built from final positions, so the bins have to describe
+        // those -- the last solve binned predicted ones.
+        sp.spawn = 0u;
+        vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), &sp, sizeof(sp), kVNSimParamsIndex);
+        vn_dispatch_1d(enc, kVNKBinClear, sp.bin_w * sp.bin_h);
+        vn_dispatch_1d(enc, kVNKBinFill, sp.count);
+        vn_dispatch_field(enc, kVNKField, gVNSimField[0], NULL);
+        vn_dispatch_field(enc, kVNKBlurX, gVNSimField[0], gVNSimField[1]);
+        vn_dispatch_field(enc, kVNKBlurY, gVNSimField[1], gVNSimField[0]);
+
+        vn_msg_v(enc, VN_SEL("endEncoding"));
+
+        if (gVNSimTimestamps) {
+            vn_msg_v_p(cmdbuf, VN_SEL("addCompletedHandler:"), (void *)^(void *done) {
+                vn_particles_resolve_timing(done, slot);
+            });
+        }
+
+        gVNSimSteppedCmdBuf = cmdbuf;
+        gVNSimLastStepTime  = now;
+        atomic_store_explicit(&gVNSimGeneration, water.generation, memory_order_release);
+
+        uint32_t dx, dy, tn, sd;
+        memcpy(&dx, &sp.domain_x, sizeof(dx));
+        memcpy(&dy, &sp.domain_y, sizeof(dy));
+        memcpy(&tn, &sp.tint, sizeof(tn));
+        memcpy(&sd, &sp.seed_phase, sizeof(sd));
+        atomic_store_explicit(&gVNSimDomainBits, ((uint64_t)dy << 32) | dx, memory_order_relaxed);
+        atomic_store_explicit(&gVNSimTintBits, tn, memory_order_relaxed);
+        atomic_store_explicit(&gVNSimSeedPhaseBits, sd, memory_order_relaxed);
+
+        uint32_t ow;
+        memcpy(&ow, &water.seed, sizeof(ow));
+        atomic_store_explicit(&gVNSimOwnerSeedBits, ow, memory_order_relaxed);
+        atomic_store_explicit(&gVNSimSteppedDest, destination, memory_order_release);
+
+        static uint32_t s_logged_generation;
+        if (s_logged_generation != water.generation) {
+            s_logged_generation = water.generation;
+            VN_INFO("water: destination %p kind=%u bounds=(%d,%d %d,%d) scale=%.2f -> domain %.0fx%.0f px; "
+                    "%u particles spaced %.1fpx, h=%.1fpx, rho0=%.4g, %u bins of %.0fpx, %u obstacle(s)",
+                    destination, *(const uint32_t *)((const char *)destination + kVNDestinationKindOffset),
+                    b[0], b[1], b[2], b[3], (double)scale, (double)sp.domain_x, (double)sp.domain_y,
+                    sp.count, (double)(sp.h / kVNSmoothingRatio), (double)sp.h, (double)sp.rho0,
+                    sp.bin_w * sp.bin_h, (double)sp.cell, nobs);
+        }
+    } else {
+        VN_ERROR("water: no compute encoder on command buffer %p", cmdbuf);
+        gVNSimBroken = true;
+    }
+    vn_pool_pop(pool);
+
+    os_unfair_lock_unlock(&gVNSimLock);
+}
+
+/// Hands the fragment the simulation it is about to draw. Bound on every draw
+/// of one of our pipelines, whether or not it is the water one: the parameters
+/// are a hundred and twelve bytes and the other fragments do not declare them,
+/// while a water fragment drawn with them missing would read unbound memory.
+///
+/// `valid` is what keeps the fragment away from the field before it exists, and
+/// away from a frame whose step ran against a different destination -- where a
+/// particle's coordinates and a pixel's would not be in the same space.
+/// `layer_seed` is the drawn layer's filter params[0]; `bound` says whether it
+/// came from a layer at all.
+static void vn_particles_bind_fragment(void *encoder, void *destination,
+                                       float layer_seed, bool bound) {
+    // vn_objc_ready() first, and on this path specifically: the draw arrives
+    // here without going through the step, so nothing else has resolved the
+    // message-send pointers. Resolving them at load makes this a load of a
+    // static bool, but the guard stays -- getting it wrong once meant every
+    // shader animation branched to address zero inside WindowServer.
+    if (!encoder || !vn_objc_ready()) return;
+
+    // Constants, plus the one value that varies. See gVNSimDomainBits.
+    VNSimParams sp = {0};
+    sp.count     = kVNParticleCountMax;
+    sp.bin_slots = kVNBinSlots;
+    sp.field_w   = kVNFieldDim;
+    sp.field_h   = kVNFieldDim;
+    sp.iso       = kVNIsoLevel;
+
+    // The field has to hold THIS close's fluid, not the last one's.
+    //
+    // The destination is usually the same object from close to close, so
+    // matching on it alone answers "yes, there is a simulation here" on the
+    // frame after an animation starts but before its first step has run -- and
+    // the field still holds the previous close's water. One frame of the last
+    // close's puddle on the new window. That is the flash.
+    const VNWaterSnapshot current = vn_water_snapshot();
+    bool fresh = current.valid &&
+                 current.generation == atomic_load_explicit(&gVNSimGeneration, memory_order_acquire);
+
+    // And it has to be THIS layer's fluid.
+    //
+    // There is one simulation, shared by every water close. Close a second
+    // window while the first is still animating and the first clone is still on
+    // screen, still tagged, still running this fragment -- but the buffers now
+    // hold the second close's water. It drew the new fluid's shape filled with
+    // the old window's pixels, at the old clone's phase, which is late enough
+    // to be fully tinted: a window turning up already blue, wearing another
+    // app's contents.
+    //
+    // A layer that does not own the fluid falls back to the untouched window,
+    // which is what it draws before its animation starts anyway.
+    if (fresh && bound) {
+        const uint32_t ow = atomic_load_explicit(&gVNSimOwnerSeedBits, memory_order_relaxed);
+        float owner_seed;
+        memcpy(&owner_seed, &ow, sizeof(owner_seed));
+        if (owner_seed != layer_seed) {
+            static float s_reported;
+            if (s_reported != layer_seed) {
+                s_reported = layer_seed;
+                VN_INFO("water: layer seed %.3f is not the simulation's %.3f -- an earlier close is "
+                        "still on screen; drawing its own window instead of this close's water",
+                        (double)layer_seed, (double)owner_seed);
+            }
+            fresh = false;
+        }
+    }
+
+    void *stepped = atomic_load_explicit(&gVNSimSteppedDest, memory_order_acquire);
+    if (fresh && gVNSimField[0] && stepped && stepped == destination) {
+        const uint64_t d = atomic_load_explicit(&gVNSimDomainBits, memory_order_relaxed);
+        const uint32_t dx = (uint32_t)d, dy = (uint32_t)(d >> 32);
+        const uint32_t tn = atomic_load_explicit(&gVNSimTintBits, memory_order_relaxed);
+        const uint32_t sd = atomic_load_explicit(&gVNSimSeedPhaseBits, memory_order_relaxed);
+        memcpy(&sp.domain_x, &dx, sizeof(dx));
+        memcpy(&sp.domain_y, &dy, sizeof(dy));
+        memcpy(&sp.tint, &tn, sizeof(tn));
+        memcpy(&sp.seed_phase, &sd, sizeof(sd));
+        sp.valid = 1u;
+    } else if (fresh && stepped && stepped != destination) {
+        // A layer drawn into a destination the step did not run against. The
+        // two pointers are the same object on the path a clone takes, so this
+        // firing at all says the composite is reaching our layer some other
+        // way -- worth one line, because the symptom is a water close that
+        // simulates and draws nothing.
+        static void *s_reported;
+        if (s_reported != destination) {
+            s_reported = destination;
+            VN_INFO("water: layer destination %p is not the stepped one %p -- not drawing the fluid",
+                    destination, stepped);
+        }
+    }
+
+    vn_msg_v_cuu(encoder, VN_SEL("setFragmentBytes:length:atIndex:"), &sp, sizeof(sp), kVNFragSimParamsIndex);
+    if (gVNSimField[0]) {
+        vn_msg_v_pu(encoder, VN_SEL("setFragmentTexture:atIndex:"), gVNSimField[0], kVNFragFieldTexture);
+    }
+}
+
+/// The hook. Everything above it runs only for the frames of a water close;
+/// every other frame pays this one load.
+static void vn_hook_start_composite(void *context, void *destination, uint64_t load, uint64_t store) {
+    if (destination && atomic_load_explicit(&gVNWaterClones, memory_order_acquire) > 0) {
+        vn_particles_step(context, destination);
+    }
+    vn_orig_start_composite(context, destination, load, store);
+}
+
 #pragma mark - Per-window shader arguments
 
 /// The fragment buffer index VNShaderExtra is bound at. Must match
@@ -3392,6 +4508,7 @@ typedef struct {
     float params[5];   // the layer's filter params, set per close in vn_make_clone
     float bound;       // 1 when params came from a layer; 0 leaves the shader on its defaults
     float phase;       // the animation's phase when this frame is drawn; -1 = use the tick's
+    float offset[2];   // the window's offset inside the quad, in window sizes; -1 = default
 } VNShaderExtra;
 
 /// True once every hook the argument buffer needs is in place. Our fragment
@@ -3402,6 +4519,11 @@ static bool gVNShaderArgsReady;
 /// The layer MetalCompositeLayer is drawing on this thread, so SetPipelineState
 /// can find its params. The compositor draws on more than one thread.
 static __thread void *tl_vn_layer;
+
+/// The destination that layer is being drawn into, so the water fragment can be
+/// told whether the simulation it would read was stepped in this same pixel
+/// grid.
+static __thread void *tl_vn_destination;
 
 /// Pipeline states made from our MetalShaders, recorded as CopyPipelineState
 /// hands them out.
@@ -3425,9 +4547,12 @@ static bool vn_is_our_pipeline(void *pipeline) {
 
 static uint64_t vn_hook_metal_composite_layer(void *context, void *layer, void *destination, uint64_t flags) {
     void *outer = tl_vn_layer;
+    void *outer_dest = tl_vn_destination;
     tl_vn_layer = layer;
+    tl_vn_destination = destination;
     uint64_t result = vn_orig_metal_composite_layer(context, layer, destination, flags);
     tl_vn_layer = outer;
+    tl_vn_destination = outer_dest;
     return result;
 }
 
@@ -3463,19 +4588,21 @@ static void vn_hook_set_pipeline_state(void *context, void *pipeline) {
         msg = (void (*)(void *, void *, const void *, unsigned long, unsigned long))dlsym(RTLD_DEFAULT, "objc_msgSend");
     }
 
-    VNShaderExtra extra = { .phase = -1.0f };
+    VNShaderExtra extra = { .phase = -1.0f, .offset = { -1.0f, -1.0f } };
     void *layer = tl_vn_layer;
     if (layer && *(uint32_t *)((char *)layer + kVNLayerFilterTypeOffset) == kVNFilterTypeShaderTag) {
         memcpy(extra.params, (char *)layer + kVNLayerFilterParamsOffset, sizeof(extra.params));
         extra.bound = 1.0f;
         const double now = SLSCurrentRealTime();
-        extra.phase = vn_phase_for_seed(extra.params[0], now);
-        VN_TRACE("draw: layer %p phase %.4f at %.4f", layer, (double)extra.phase, now);
+        vn_clone_lookup(extra.params[0], now, &extra.phase, &extra.offset[0], &extra.offset[1]);
+        VN_TRACE("draw: layer %p phase %.4f offset (%.3f, %.3f) at %.4f", layer, (double)extra.phase,
+                 (double)extra.offset[0], (double)extra.offset[1], now);
     }
 
     void *encoder = vn_resolved_render_encoder(context);
     if (encoder && msg && sel_set_bytes) {
         msg(encoder, sel_set_bytes, &extra, sizeof(extra), kVNShaderExtraIndex);
+        vn_particles_bind_fragment(encoder, tl_vn_destination, extra.params[0], extra.bound > 0.5f);
     }
 
     static _Atomic int s_logged;
@@ -3557,6 +4684,13 @@ static void *vn_hook_create_specialized_shader(void *library, void *vtx, void *f
 extern void MSHookFunction(void *symbol, void *replace, void **result);
 
 static void vanish_init_payload(void) {
+    // Resolved here rather than on first use: the draw path and the compute
+    // path both send messages, and whichever runs first must not be the one
+    // that decides whether the pointers exist.
+    if (!vn_objc_ready()) {
+        VN_ERROR("WARNING: objc_msgSend could not be resolved -- the water animation is unavailable");
+    }
+
     void *targetOrder               = vn_skylight_symbol(kVNSymOrderWindowList);
     void *targetRelease             = vn_skylight_symbol(kVNSymReleaseWindow);
     void *targetPostEvent           = vn_skylight_symbol(kVNSymPostEventByConnection);
@@ -3573,6 +4707,7 @@ static void vanish_init_payload(void) {
     vn_resolved_create_clone                 = (VNCreateCloneFn)vn_skylight_symbol(kVNSymCreateCloneOfWindow);
     vn_resolved_system_window_release        = (VNSystemWindowReleaseFn)vn_skylight_symbol(kVNSymSystemWindowRelease);
     vn_resolved_window_get_display           = (VNWindowGetDisplayFn)vn_skylight_symbol(kVNSymWindowGetDisplay);
+    vn_resolved_display_get_bounds = (VNDisplayGetBoundsFn)vn_skylight_symbol(kVNSymDisplayGetBounds);
     vn_resolved_screen_rect_from_rect        = (VNScreenRectFromRectFn)vn_skylight_symbol(kVNSymScreenRectFromRect);
     vn_resolved_screen_rect                  = (VNScreenRectFn)vn_skylight_symbol(kVNSymScreenRect);
     vn_resolved_window_get_id                = (VNWindowGetIDFn)vn_skylight_symbol(kVNSymWindowGetID);
@@ -3651,6 +4786,35 @@ static void vanish_init_payload(void) {
             (void *)vn_resolved_render_encoder, gVNShaderArgsReady);
     if (!gVNShaderArgsReady) {
         VN_ERROR("WARNING: shader argument hooks missing -- shader animations fall back to the stock invert");
+    }
+
+    // The compute pass. StartComposite is the point in the frame where the
+    // command buffer exists and nothing is encoding; EndEncoders and
+    // RenderCommandBuffer are the two calls it makes there itself, and the two
+    // the pass needs to get in. Without all three the water animation simply
+    // never steps -- its fragment then draws the untouched window, which is the
+    // same thing it draws before an animation starts.
+    // What makes the fluid land only on windows that are actually on screen.
+    // Both optional: without them every tracked window is solid, which is the
+    // behaviour this replaces rather than a failure.
+    vn_resolved_unobscured_content_shape =
+        (VNUnobscuredContentShapeFn)vn_skylight_symbol(kVNSymUnobscuredContentShape);
+    vn_resolved_get_region_bounds = (VNGetRegionBoundsFn)dlsym(RTLD_DEFAULT, "CGSGetRegionBounds");
+    VN_INFO("water: unobscured_content_shape=%p get_region_bounds=%p",
+            (void *)vn_resolved_unobscured_content_shape, (void *)vn_resolved_get_region_bounds);
+
+    void *targetStartComposite        = vn_skylight_symbol(kVNSymMetalContextStartComposite);
+    vn_resolved_end_encoders          = (VNEndEncodersFn)vn_skylight_symbol(kVNSymMetalContextEndEncoders);
+    vn_resolved_render_command_buffer = (VNRenderCommandBufferFn)vn_skylight_symbol(kVNSymMetalContextRenderCommandBuffer);
+    if (targetStartComposite && vn_resolved_end_encoders && vn_resolved_render_command_buffer) {
+        TIL_HOOK("com.doraorak.vanish", ptrauth_strip(targetStartComposite, ptrauth_key_function_pointer),
+                 vn_hook_start_composite, &vn_orig_start_composite);
+    }
+    VN_INFO("water: start_composite=%p end_encoders=%p render_command_buffer=%p hooked=%d",
+            targetStartComposite, (void *)vn_resolved_end_encoders,
+            (void *)vn_resolved_render_command_buffer, vn_orig_start_composite != NULL);
+    if (!vn_orig_start_composite) {
+        VN_ERROR("WARNING: the compute pass could not be installed -- the water animation will not simulate");
     }
 
     vn_resolved_reevaluate_hdr_request = (VNReevaluateHDRRequestFn)vn_skylight_symbol(kVNSymReevaluateHDRRequest);

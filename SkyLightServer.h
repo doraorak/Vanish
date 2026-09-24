@@ -189,6 +189,58 @@ _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.param
 #define kVNSymMetalContextRenderEncoder "__ZN12MetalContext13RenderEncoderEv"
 #define kVNSymMetalShaderCopyPipelineState "__ZN11MetalShader17CopyPipelineStateEP12MetalContextbb"
 
+/// The compositor's own Metal frame, and where a pass of our own fits into it.
+///
+/// `MetalContext::StartComposite(destination, load, store)` opens the render
+/// pass that draws into `destination`. Its first act is to close whatever is
+/// already encoding -- it ends the blit encoder at [ctx+0x70] itself, then
+/// calls StopEncoding() for the render encoder at [ctx+0x78] -- and only then
+/// does it ask for the frame's command buffer. MetalContext::BlitEncoder takes
+/// the same three steps in the same order, and reads as the worked example:
+///
+///     +40:  ldr x0, [this, #0x70]      ; one already open?
+///     +52:  bl  MetalContext::StopEncoding()
+///     +56:  stp xzr, xzr, [sp]         ; an empty std::vector on the stack
+///     +72:  bl  MetalContext::RenderCommandBuffer(vector<...>)
+///     +84:  str x0, [this, #0x70]      ; the encoder it opened on it
+///
+/// So `EndEncoders()` -- the blit encoder, then a tail call to StopEncoding --
+/// followed by `RenderCommandBuffer()` is the supported way in: it hands back
+/// the command buffer the whole frame is being built on, creating it on the
+/// first call of the frame. A compute encoder opened on that buffer, used and
+/// ended before StartComposite is allowed to continue puts our work inside the
+/// frame the compositor is already assembling: one queue, one command buffer,
+/// and Metal's own hazard tracking orders the render pass that follows against
+/// whatever the compute pass wrote.
+///
+/// The vector argument is passed indirectly and destroyed by the caller
+/// (Itanium ABI), so a pointer to three zeroed words is a valid empty one and
+/// needs no cleanup afterwards.
+#define kVNSymMetalContextStartComposite \
+    "__ZN12MetalContext14StartCompositeEP22WSCompositeDestination13MTLLoadAction14MTLStoreAction"
+#define kVNSymMetalContextEndEncoders "__ZN12MetalContext11EndEncodersEv"
+#define kVNSymMetalContextRenderCommandBuffer \
+    "__ZN12MetalContext19RenderCommandBufferENSt3__16vectorIU13block_pointerFvPU27objcproto16MTLCommandBuffer11objc_objectENS0_9allocatorIS5_EEEE"
+
+/// What StartComposite reads out of a WSCompositeDestination before it builds
+/// the pass, which is also all we need of it:
+///
+///     +0x10  uint32 kind          ; 2 and 3 take their own branches
+///     +0x2c  int32  bounds minX   ; in points
+///     +0x30  int32  bounds minY
+///     +0x34  int32  bounds maxX
+///     +0x38  int32  bounds maxY
+///     +0x68  float  scale         ; 0 is read as 1.0
+///
+/// StartComposite scales the bounds by that float and hands the product to
+/// FillOrtho2DFromBounds, so `bounds x scale` is the render target's pixel
+/// grid -- which is the space a fragment's [[position]] arrives in. The
+/// particle simulation lives in that same space, so it needs nothing from the
+/// destination beyond these six numbers.
+#define kVNDestinationKindOffset   0x10
+#define kVNDestinationBoundsOffset 0x2c
+#define kVNDestinationScaleOffset  0x68
+
 #define kVNLayerFilterTypeOffset  0x228
 #define kVNLayerFilterParamsOffset 0x230
 
@@ -579,6 +631,9 @@ typedef void   (*VNFreezeContentFn)(CGXWindow *);
 /// `window_lookup_best_pkg_display_for_geometry`, so it copes with a window
 /// that is not on a managed space.
 #define kVNSymWindowGetDisplay "_PKGWindowGetDisplay"
+/// A display's rect in global screen coordinates, the same space as window
+/// frames. Just a read of the display's stored bounds.
+#define kVNSymDisplayGetBounds "_PKGDisplayGetBounds"
 
 /// Maps a window-local rect to screen coordinates. The clone caller passes
 /// CGRectZero to get the window's own frame.
@@ -597,6 +652,28 @@ typedef void   (*VNFreezeContentFn)(CGXWindow *);
 /// window, which makes it safe to call on anything.
 #define kVNSymSystemWindowRelease "_WSSystemWindowRelease"
 
+/// `CGXCreateScreenUnobscuredContentShapeForWindow(CGXWindow *)`
+///
+/// The part of a window's content that is actually on screen -- its content
+/// shape minus everything stacked above it -- as a CGSRegion the caller owns.
+/// One argument, and NULL when the window is not visible at all:
+///
+///     +24:  bl  CGXWindowIsVisible
+///     +28:  tbz w0, #0, return_null
+///     +40:  bl  create_frame_shape_above_for_window(win, 0)
+///     +56:  bl  CGXCopyScreenContentShapeForWindow(win, 0)
+///     +68:  bl  <subtract>(content, above)
+///     ...   release both, return the difference
+///
+/// This is what makes the fluid land only on windows you can see. Without it a
+/// window buried behind another is still solid, and the water stops in mid-air
+/// on a rectangle that is not on screen.
+///
+/// The region is a CoreFoundation object -- measured: CFGetTypeID returns 75
+/// with a retain count of 1 -- so CFRelease is how it is freed, and
+/// CGSGetRegionBounds(region, &rect) writes its bounding box as four doubles.
+#define kVNSymUnobscuredContentShape "_CGXCreateScreenUnobscuredContentShapeForWindow"
+
 /// Window shadow management
 #define kVNSymClearShadowDensity "__ZL20clear_shadow_densityP9CGXWindow"
 #define kVNSymWSWindowSetShadowEnable "_WSWindowSetShadowEnable"
@@ -606,6 +683,7 @@ typedef void   (*VNFreezeContentFn)(CGXWindow *);
 typedef void (*VNSystemWindowReleaseFn)(CGXWindow *);
 typedef CGXWindow *(*VNCreateCloneFn)(CGXWindow *, CGRect, const void *, bool);
 typedef const void *(*VNWindowGetDisplayFn)(CGXWindow *);
+typedef CGRect      (*VNDisplayGetBoundsFn)(const void *display);
 typedef CGRect      (*VNScreenRectFromRectFn)(CGXWindow *, CGRect);
 typedef CGRect      (*VNScreenRectFn)(CGXWindow *);
 typedef uint32_t    (*VNWindowGetIDFn)(CGXWindow *);
@@ -631,6 +709,9 @@ typedef void   (*VNShapeWindowWithRectFn)(CGXWindow *, CGRect, uint32_t);
 /// argument the MetalContext.
 typedef uint64_t (*VNMetalCompositeLayerFn)(void *context, void *layer, void *destination, uint64_t flags);
 typedef void     (*VNSetPipelineStateFn)(void *context, void *pipeline);
+typedef void     (*VNStartCompositeFn)(void *context, void *destination, uint64_t load, uint64_t store);
+typedef void     (*VNEndEncodersFn)(void *context);
+typedef void    *(*VNRenderCommandBufferFn)(void *context, const void *empty_vector);
 typedef void    *(*VNRenderEncoderFn)(void *context);
 typedef void    *(*VNCopyPipelineStateFn)(void *shader, void *context, bool a, bool b);
 typedef void     (*VNReevaluateHDRRequestFn)(CGXWindow *window);
@@ -638,6 +719,9 @@ typedef void  *(*VNCreateSpecializedShaderFn)(void *library, void *vtx, void *fr
                                               void *constants_fn, uint64_t options, void *vdesc);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);
 typedef double (*VNCornerRadiusFn)(CGXWindow *);
+
+typedef void *(*VNUnobscuredContentShapeFn)(CGXWindow *);
+typedef int   (*VNGetRegionBoundsFn)(void *region, CGRect *out);
 
 typedef void (*VNClearShadowDensityFn)(CGXWindow *);
 typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);

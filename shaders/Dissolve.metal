@@ -27,7 +27,7 @@ fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
                                  constant VNUberArgs &args [[buffer(0)]],
                                  constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                                  sampler samp [[sampler(0)]]) {
-    const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
+    const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6), extra);
     const float  t  = vn_phase(args, extra);
 
     // New on every close: each fleck's timing and wander, and the drift of the

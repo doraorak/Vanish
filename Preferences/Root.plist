@@ -64,6 +64,7 @@
 				<string>CRT Off</string>
 				<string>Shatter</string>
 				<string>Burn</string>
+				<string>Water</string>
 			</array>
 			<key>validValues</key>
 			<array>
@@ -84,6 +85,7 @@
 				<string>crt</string>
 				<string>shatter</string>
 				<string>burn</string>
+				<string>water</string>
 			</array>
 		</dict>
 		<dict>
@@ -174,7 +176,7 @@
 			<key>label</key>
 			<string>Default</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -200,7 +202,7 @@
 			<key>label</key>
 			<string>Shrink</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -218,7 +220,7 @@
 			<key>label</key>
 			<string>Squish</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -236,7 +238,7 @@
 			<key>label</key>
 			<string>Fall</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -254,7 +256,7 @@
 			<key>label</key>
 			<string>Swirl</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -272,7 +274,7 @@
 			<key>label</key>
 			<string>Flip</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -290,7 +292,7 @@
 			<key>label</key>
 			<string>Tilt</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -308,7 +310,7 @@
 			<key>label</key>
 			<string>Slide</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -326,7 +328,7 @@
 			<key>label</key>
 			<string>Genie</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -344,7 +346,7 @@
 			<key>label</key>
 			<string>Flag</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -362,7 +364,7 @@
 			<key>label</key>
 			<string>Spin</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -380,7 +382,7 @@
 			<key>label</key>
 			<string>Roll</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -398,7 +400,7 @@
 			<key>label</key>
 			<string>Barrel</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -416,7 +418,7 @@
 			<key>label</key>
 			<string>Clock</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -434,7 +436,7 @@
 			<key>label</key>
 			<string>Dissolve</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -452,7 +454,7 @@
 			<key>label</key>
 			<string>CRT Off</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -470,7 +472,7 @@
 			<key>label</key>
 			<string>Shatter</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>
@@ -488,7 +490,43 @@
 			<key>label</key>
 			<string>Burn</string>
 			<key>max</key>
-			<real>2.0</real>
+			<real>5.0</real>
+			<key>min</key>
+			<real>0.05</real>
+			<key>showValue</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>default</key>
+			<real>0.7</real>
+			<key>key</key>
+			<string>water_tint</string>
+			<key>label</key>
+			<string>Water Tint</string>
+			<key>max</key>
+			<real>1.0</real>
+			<key>min</key>
+			<real>0.0</real>
+			<key>showValue</key>
+			<true/>
+		</dict>
+	<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>default</key>
+			<real>1.6</real>
+			<key>key</key>
+			<string>duration_water</string>
+			<key>label</key>
+			<string>Water</string>
+			<key>max</key>
+			<real>5.0</real>
 			<key>min</key>
 			<real>0.05</real>
 			<key>showValue</key>

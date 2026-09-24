@@ -45,7 +45,7 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     // inside it comes from VNShaderExtra params[2..4]; `uv` spans just that
     // rect, and the flame lives in it. Unbound, the window is the whole frame.
     const bool   bound = extra.bound > 0.5;
-    const float2 fuv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
+    const float2 fuv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6), extra);
     const float  t   = vn_phase(args, extra);
     float2 w0, wsz;
     vn_window_rect(extra, w0, wsz);

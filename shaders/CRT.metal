@@ -15,7 +15,7 @@ fragment float4 vn_uber_crt(VNUberStage in [[stage_in]],
                             constant VNUberArgs &args [[buffer(0)]],
                             constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                             sampler samp [[sampler(0)]]) {
-    const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
+    const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6), extra);
     const float  t  = vn_phase(args, extra);
 
     const float vert  = clamp(t / 0.62, 0.0, 1.0);          // squeeze to a line

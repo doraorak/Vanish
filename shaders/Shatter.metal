@@ -91,7 +91,7 @@ fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
     // are on. The glass is the window alone: `uv` spans just the window's rect,
     // the shards are cut from it, and each shard is masked to the window's
     // rounded shape, so no piece carries shadow away with it.
-    const float2 fuv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
+    const float2 fuv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6), extra);
     const float  t   = vn_phase(args, extra);
     float2 w0, wsz;
     vn_window_rect(extra, w0, wsz);

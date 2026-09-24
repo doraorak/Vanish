@@ -64,6 +64,7 @@ struct VNShaderExtra {
     float params[5];
     float bound;
     float phase;    // the animation's phase when this frame is drawn; -1 = none
+    float offset[2];// the window's offset inside the quad, in window sizes; -1 = default
 };
 
 // The animation's progress, 0..1, for the frame being drawn. Vanish computes it
@@ -123,32 +124,26 @@ vertex VNUberStage vn_uber_vertex(VNUberIn in [[stage_in]],
     return out;
 }
 
-// Must match kVNShaderMargin in Vanish.c.
-//
-// Vanish gives the clone a shape that much larger than the window on each side
-// so flecks are not cut off at its edge. The texture coordinates that arrive
+// Vanish gives the clone a shape larger than the window so what the shader
+// draws is not cut off at the window's edge -- by a margin each animation picks,
+// and for some the display's full height. The texture coordinates that arrive
 // here are normalised to the TEXTURE, not to the quad -- so across a quad
 // (1 + 2m) times wider they run 0 .. (1 + 2m), and the window's own pixels are
 // exactly the [0,1] part. Nothing needs rescaling; texel-to-pixel is already
 // 1:1.
 //
 // What does need correcting is the origin: coordinate 0 sits at the quad's
-// top-left corner, which the widened shape moved up and left by m. Subtracting
-// m puts the window back where it was, centred in the quad with margin all
-// round, and makes anything outside [0,1] the margin.
-// One margin for every shader animation, deliberately.
-//
-// Effects that never leave the window could ask for far less, and the quad's
-// area is what they cost -- but a small margin exposes a one-or-two-frame
-// artifact at the start of the close that has resisted five attempts to fix
-// (a displaced copy of the window peeking out from behind the original). At
-// this width the displaced frame lands entirely behind the original window and
-// is never seen. That is a workaround, not a fix: the underlying mismatch is
-// still there, it is simply covered.
+// top-left corner, which the widened shape moved up and left. Subtracting the
+// window's offset inside the quad -- VNShaderExtra::offset, set per close --
+// puts it back at [0,1] and makes anything outside that the margin. Unbound,
+// the offset is the half-size margin every animation had before choosing its
+// own.
 constant float kVNShaderMargin = 0.50;
 
-static inline float2 vn_window_uv(float2 tex) {
-    return tex - kVNShaderMargin;
+static inline float2 vn_window_uv(float2 tex, constant VNShaderExtra &extra) {
+    const float2 offset = float2(extra.offset[0] >= 0.0 ? extra.offset[0] : kVNShaderMargin,
+                                 extra.offset[1] >= 0.0 ? extra.offset[1] : kVNShaderMargin);
+    return tex - offset;
 }
 
 // Dave Hoskins' hash. Multiply-add based.

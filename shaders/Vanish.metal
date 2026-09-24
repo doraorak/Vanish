@@ -15,9 +15,12 @@
 //   - CRT.metal       : Retro CRT collapse (vn_uber_crt).
 //   - Shatter.metal   : Invertible Voronoi glass shatter (vn_uber_shatter).
 //   - Burn.metal      : EDR / HDR burning wavefront (vn_uber_burn).
+//   - Water.metal     : Particle simulation, stepped by vn_particle_* in a
+//                       compute pass and drawn by vn_uber_water.
 
 #include "Common.metal"
 #include "Dissolve.metal"
 #include "CRT.metal"
 #include "Shatter.metal"
 #include "Burn.metal"
+#include "Water.metal"
