@@ -252,6 +252,7 @@ static VNScreenRectFromRectFn       vn_resolved_screen_rect_from_rect;
 static VNScreenRectFn               vn_resolved_screen_rect;
 static VNWindowGetIDFn              vn_resolved_window_get_id;
 static VNClippedFrameBoundsFn       vn_resolved_clipped_frame_bounds;
+static VNCornerRadiusFn             vn_resolved_corner_radius;
 static VNReleaseWindowFn            vn_orig_release_window;
 static VNWindowGetOwningPIDFn       vn_resolved_window_get_owning_pid;
 static VNGetConnectionAppNameFn     vn_resolved_get_connection_app_name;
@@ -1373,12 +1374,34 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
     }
 
     if (anim->kind == VN_ANIM_SHADER) {
-        // Per-close values for the shader. Burn ignites at params[0..1], a
-        // point in the window's unit square.
+        // Per-close values for the shader, in the window's unit square:
+        //   params[0]  ignition point, packed as whole thousandths of x plus y
+        //              (y < 1), which a float holds to about 6e-5
+        //   params[1]  corner radius as a fraction of the window's height
+        //   params[2]  inset of the window's left and right edges within the
+        //              clone's frame, which also holds the shadow when shadows
+        //              are on (the shadow is centred horizontally)
+        //   params[3]  the window's top edge within the frame
+        //   params[4]  the window's bottom edge within the frame
+        float inset_x = 0.0f, top = 0.0f, bottom = 1.0f, radius = 0.0f;
+        if (frame.size.width >= 1.0 && frame.size.height >= 1.0 &&
+            content.size.width >= 1.0 && content.size.height >= 1.0) {
+            const double left  = (CGRectGetMinX(content) - frame.origin.x) / frame.size.width;
+            const double right = (CGRectGetMaxX(frame) - CGRectGetMaxX(content)) / frame.size.width;
+            inset_x = (float)fmax(0.0, fmin(0.5, 0.5 * (left + right)));
+            top     = (float)fmax(0.0, fmin(1.0, (CGRectGetMinY(content) - frame.origin.y) / frame.size.height));
+            bottom  = (float)fmax(0.0, fmin(1.0, (CGRectGetMaxY(content) - frame.origin.y) / frame.size.height));
+            const double radius_pt = vn_resolved_corner_radius ? vn_resolved_corner_radius(win) : 0.0;
+            radius = (float)fmax(0.0, fmin(0.5, radius_pt / content.size.height));
+            VN_INFO("clone: window within frame: left %.4f right %.4f top %.4f bottom %.4f corner radius %.1fpt "
+                    "(window %.1f,%.1f %.1fx%.1f in frame %.1f,%.1f %.1fx%.1f)",
+                    left, right, (double)top, (double)bottom, radius_pt,
+                    content.origin.x, content.origin.y, content.size.width, content.size.height,
+                    frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+        }
         const float params[5] = {
-            (float)arc4random_uniform(1001) / 1000.0f,
-            (float)arc4random_uniform(1001) / 1000.0f,
-            0.0f, 0.0f, 0.0f,
+            (float)arc4random_uniform(1001) + (float)arc4random_uniform(1000) / 1000.0f,
+            radius, inset_x, top, bottom,
         };
         vn_filter_attach(clone, anim->shader.type, true, params);
         if (anim->shader.hdr) {
@@ -3486,6 +3509,7 @@ static void vanish_init_payload(void) {
     vn_resolved_screen_rect                  = (VNScreenRectFn)vn_skylight_symbol(kVNSymScreenRect);
     vn_resolved_window_get_id                = (VNWindowGetIDFn)vn_skylight_symbol(kVNSymWindowGetID);
     vn_resolved_clipped_frame_bounds         = (VNClippedFrameBoundsFn)vn_skylight_symbol(kVNSymClippedFrameBounds);
+    vn_resolved_corner_radius                = (VNCornerRadiusFn)vn_skylight_symbol(kVNSymCornerRadius);
     vn_resolved_update_ca_visibility         = (VNUpdateCAVisibilityFn)vn_skylight_symbol(kVNSymUpdateCAVisibility);
     vn_resolved_clear_shadow_density         = (VNClearShadowDensityFn)vn_skylight_symbol(kVNSymClearShadowDensity);
     vn_resolved_window_set_shadow_enable     = (VNWSWindowSetShadowEnableFn)vn_skylight_symbol(kVNSymWSWindowSetShadowEnable);

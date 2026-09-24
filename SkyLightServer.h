@@ -511,6 +511,10 @@ typedef void (*VNScheduleCallbackFn)(void (*)(void *, double), void *, double);
 /// `CGXWindow::clipped_frame_bounds(CGXWindow *self)` -- x0 only, and a CGRect
 /// is an HFA of four doubles, so it comes back in d0-d3.
 #define kVNSymClippedFrameBounds "__ZN9CGXWindow20clipped_frame_boundsEv"
+/// The radius of the window's rounded corners, in points: an explicit radius
+/// when one is set on the window (+0x868), otherwise its shadow shape's radius
+/// divided by the window's backing scale. A read with no side effects.
+#define kVNSymCornerRadius "__ZNK9CGXWindow13corner_radiusEv"
 
 /// A 4x4 transform, for the cheap cases. Unlike the alpha path this schedules
 /// its own redraw (`accumulate_window_display_updates`).
@@ -633,6 +637,7 @@ typedef void     (*VNReevaluateHDRRequestFn)(CGXWindow *window);
 typedef void  *(*VNCreateSpecializedShaderFn)(void *library, void *vtx, void *frag,
                                               void *constants_fn, uint64_t options, void *vdesc);
 typedef CGRect (*VNClippedFrameBoundsFn)(CGXWindow *);
+typedef double (*VNCornerRadiusFn)(CGXWindow *);
 
 typedef void (*VNClearShadowDensityFn)(CGXWindow *);
 typedef void (*VNWSWindowSetShadowEnableFn)(CGXWindow *);
