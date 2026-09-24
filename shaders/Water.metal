@@ -70,6 +70,7 @@ struct VNSimParams {
     uint  valid;                     // 0 = no simulation behind this frame
     float tint;                      // 0..1, how far it settles toward water blue
     float seed_phase;                // the close's phase when the fluid was seeded
+    uint  drains;                    // bit 0 left corner, 1 middle, 2 right corner
 };
 
 /// Must match VNParticle in Vanish.c. `uv0` is where in the window this parcel
@@ -91,7 +92,7 @@ struct VNObstacle {
     float _pad;
 };
 
-static_assert(sizeof(VNSimParams) == 120, "VNSimParams must match WaterSim.h");
+static_assert(sizeof(VNSimParams) == 124, "VNSimParams must match WaterSim.h");
 static_assert(sizeof(VNParticle) == 48, "VNParticle must match WaterSim.h");
 static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match WaterSim.h");
 
@@ -190,14 +191,22 @@ static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
     const float corner_w = kVNCornerDrainFraction * sp.domain_x;
     const float corner_h = kVNCornerDrainFraction * sp.domain_y;
 
-    // The side walls stop short of the floor, so what spreads into a corner
-    // leaves through it rather than banking up against the edge.
-    if (p.y <= sp.domain_y - corner_h) p.x = clamp(p.x, lo.x, hi.x);
+    const bool  left_open   = (sp.drains & 1u) != 0u;
+    const bool  middle_open = (sp.drains & 2u) != 0u;
+    const bool  right_open  = (sp.drains & 4u) != 0u;
 
-    // The bottom edge is open in the middle and at both corners.
+    // A side wall stops short of the floor only where that corner drains, so
+    // what spreads into an open corner leaves through it rather than banking
+    // up against the edge.
+    const bool low = p.y > sp.domain_y - corner_h;
+    if (!(low && left_open))  p.x = max(p.x, lo.x);
+    if (!(low && right_open)) p.x = min(p.x, hi.x);
+
+    // The bottom edge is open wherever its drain is switched on.
     const float drain = 0.5 * kVNDrainFraction * sp.domain_x;
-    const bool over_middle = abs(p.x - 0.5 * sp.domain_x) < drain;
-    const bool over_corner = p.x < corner_w || p.x > sp.domain_x - corner_w;
+    const bool over_middle = middle_open && abs(p.x - 0.5 * sp.domain_x) < drain;
+    const bool over_corner = (left_open  && p.x < corner_w) ||
+                             (right_open && p.x > sp.domain_x - corner_w);
     if (!over_middle && !over_corner) p.y = min(p.y, hi.y);
 
     for (uint i = 0; i < sp.obstacles; ++i) {
@@ -449,6 +458,7 @@ kernel void vn_pbf_velocity(device VNParticle *P     [[buffer(0)]],
     if (id >= sp.count) return;
     VNParticle p = P[id];
     p.vel = (p.ppos - p.pos) / max(sp.dt, 1e-5);
+
     p.pos = p.ppos;
     P[id] = p;
 }
@@ -567,7 +577,7 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
 // Separable Gaussian, 9 taps. Smoothing the field is what turns a lumpy sum of
 // kernels into a surface; without it the fluid reads as beads.
 #ifndef VN_BLUR_STRIDE
-#define VN_BLUR_STRIDE 2
+#define VN_BLUR_STRIDE 1
 #endif
 
 constant float kVNBlur[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };

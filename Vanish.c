@@ -311,6 +311,7 @@ typedef struct {
     bool  enabled;
     bool  shadows;
     float waterTint;      // 0..1, water only; see VNSimParams::tint
+    uint32_t waterDrains; // water only; see kVNDrain*
     float refreshRate;
     float duration;
     float animDurations[kVNAnimationKeyCount];
@@ -327,6 +328,7 @@ static void vn_reload_prefs_locked(void) {
     gPrefs.enabled = true;
     gPrefs.shadows = true;
     gPrefs.waterTint = kVNWaterTintDefault;
+    gPrefs.waterDrains = kVNDrainAll;
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     for (size_t i = 0; i < kVNAnimationKeyCount; i++) {
@@ -366,6 +368,29 @@ static void vn_reload_prefs_locked(void) {
                             if (CFNumberGetValue((CFNumberRef)tintVal, kCFNumberFloatType, &tint) &&
                                 tint >= 0.0f && tint <= 1.0f) {
                                 gPrefs.waterTint = tint;
+                            }
+                        }
+
+                        static const struct { CFStringRef key; uint32_t bit; } kDrainKeys[] = {
+                            { CFSTR("water_drain_left"),   kVNDrainLeft   },
+                            { CFSTR("water_drain_middle"), kVNDrainMiddle },
+                            { CFSTR("water_drain_right"),  kVNDrainRight  },
+                        };
+                        for (size_t di = 0; di < sizeof(kDrainKeys) / sizeof(kDrainKeys[0]); di++) {
+                            // Boolean OR number: a switch's value has been
+                            // written both ways, and a preference that is
+                            // silently the wrong CFType reads as absent.
+                            CFTypeRef v = CFDictionaryGetValue(dict, kDrainKeys[di].key);
+                            bool on = true, got = false;
+                            if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
+                                on = CFBooleanGetValue((CFBooleanRef)v); got = true;
+                            } else if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+                                int n = 0;
+                                if (CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &n)) { on = (n != 0); got = true; }
+                            }
+                            if (got) {
+                                if (on) gPrefs.waterDrains |= kDrainKeys[di].bit;
+                                else    gPrefs.waterDrains &= ~kDrainKeys[di].bit;
                             }
                         }
 
@@ -809,6 +834,7 @@ typedef struct {
     CGRect           obstacles[kVNMaxObstacles];
     uint32_t         obstacle_count;
     float            tint;        // read from prefs here, never on the render thread
+    uint32_t         drains;      // likewise; see kVNDrain*
     /// The owning clone's per-close seed -- its filter params[0], the same value
     /// the draw path reads off each layer. The fluid is one global system, so
     /// this is how a layer asks whether the water in the buffers is its own.
@@ -832,6 +858,7 @@ typedef struct {
     CGRect   obstacles[kVNMaxObstacles];
     uint32_t obstacle_count;
     float    tint;
+    uint32_t drains;
     float    seed;
     double   start;
     double   duration;
@@ -847,7 +874,8 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
 /// whole display, so asking which windows are unobscured once it is on screen
 /// answers "none of them" -- our own clone covers the lot.
 static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_pt,
-                             const CGRect *obstacles, uint32_t obstacle_count, float tint, float seed) {
+                             const CGRect *obstacles, uint32_t obstacle_count, float tint, float seed,
+                             uint32_t drains) {
     const uint32_t seq = atomic_load_explicit(&gVNWater.seq, memory_order_relaxed);
     atomic_store_explicit(&gVNWater.seq, seq + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
@@ -860,6 +888,7 @@ static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_
     gVNWater.duration   = 1.0;
     gVNWater.tint       = tint;
     gVNWater.seed       = seed;
+    gVNWater.drains     = drains;
     gVNWater.obstacle_count = obstacle_count <= kVNMaxObstacles ? obstacle_count : kVNMaxObstacles;
     if (gVNWater.obstacle_count > 0 && obstacles) {
         memcpy(gVNWater.obstacles, obstacles, gVNWater.obstacle_count * sizeof(CGRect));
@@ -914,6 +943,7 @@ static VNWaterSnapshot vn_water_snapshot(void) {
     out.duration   = gVNWater.duration;
     out.tint = gVNWater.tint;
     out.seed = gVNWater.seed;
+    out.drains = gVNWater.drains;
     out.obstacle_count = gVNWater.obstacle_count <= kVNMaxObstacles ? gVNWater.obstacle_count : 0;
     memcpy(out.obstacles, gVNWater.obstacles, sizeof(out.obstacles));
 
@@ -1715,7 +1745,7 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             // were collected above, before this clone went on screen.
             vn_water_publish(clone, content.size.width >= 1.0 ? content : frame,
                              water_screen, water_obstacles, water_obstacle_count,
-                             prefs.waterTint, params[0]);
+                             prefs.waterTint, params[0], prefs.waterDrains);
         }
         vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
@@ -4270,6 +4300,7 @@ static void vn_particles_step(void *context, void *destination) {
     sp.valid   = 1u;
     vn_water_derive(&sp, sp.spawn_max_x - sp.spawn_min_x, sp.spawn_max_y - sp.spawn_min_y);
     sp.tint = water.tint;   // derive fills in the default; the preference wins
+    sp.drains    = water.drains;
 
     // The windows the fluid has to flow around, converted the same way.
     VNObstacle obstacles[kVNMaxObstacles] = {0};

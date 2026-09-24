@@ -92,15 +92,22 @@ static const VNAnimationMeta kAnimations[] = {
     NSButton *_resetDurationBtn;
     NSTextField *_durationSubtitle;
 
-    // Water only. Shown when the active animation is the one it belongs to,
-    // and taken out of the layout entirely otherwise -- the card shrinks around
-    // it rather than leaving a gap.
-    NSBox *_sepWater;
+    // The animation-specific section. It is a card of its own below the timing
+    // one, and it is taken out of the layout entirely -- header included --
+    // when the active animation has nothing to put in it, rather than leaving
+    // an empty card behind.
+    NSTextField *_specificHeader;
+    VNPFlippedView *_specificCard;
     VNPFlippedView *_rowWater;
     NSTextField *_waterTitle;
     NSTextField *_waterLabel;
     NSTextField *_waterSubtitle;
     NSSlider *_waterSlider;
+    NSBox *_sepDrainL;
+    VNPFlippedView *_rowDrainL, *_rowDrainM, *_rowDrainR;
+    NSTextField *_drainLTitle, *_drainMTitle, *_drainRTitle;
+    NSSwitch *_drainLSwitch, *_drainMSwitch, *_drainRSwitch;
+    NSBox *_sepDrainM, *_sepDrainR;
     NSSlider *_durationSlider;
     NSBox *_sep4;
     
@@ -311,9 +318,6 @@ static const VNAnimationMeta kAnimations[] = {
     _refreshSubtitle = [self createSubtitle:@"Animation FPS (0 follows ProMotion)"];
     [_rowRefresh addSubview:_refreshSubtitle];
     
-    _sepWater = [self createSeparator];
-    [_animCard addSubview:_sepWater];
-
     _rowWater = [[VNPFlippedView alloc] init];
     _waterTitle = [self createLabel:@"Water Tint"];
     [_rowWater addSubview:_waterTitle];
@@ -325,7 +329,39 @@ static const VNAnimationMeta kAnimations[] = {
     _waterSlider.target = self;
     _waterSlider.action = @selector(waterTintChanged:);
     [_rowWater addSubview:_waterSlider];
-    [_animCard addSubview:_rowWater];
+
+    _specificHeader = [self createSectionHeader:@"ANIMATION SPECIFIC"];
+    [_contentView addSubview:_specificHeader];
+    _specificCard = [self createCardView];
+    [_contentView addSubview:_specificCard];
+    [_specificCard addSubview:_rowWater];
+
+    _sepDrainL = [self createSeparator];   [_specificCard addSubview:_sepDrainL];
+    _rowDrainL = [[VNPFlippedView alloc] init];
+    _drainLTitle = [self createLabel:@"Drain: left corner"];
+    [_rowDrainL addSubview:_drainLTitle];
+    _drainLSwitch = [self createSwitch];
+    _drainLSwitch.target = self; _drainLSwitch.action = @selector(drainToggled:);
+    [_rowDrainL addSubview:_drainLSwitch];
+    [_specificCard addSubview:_rowDrainL];
+
+    _sepDrainM = [self createSeparator];   [_specificCard addSubview:_sepDrainM];
+    _rowDrainM = [[VNPFlippedView alloc] init];
+    _drainMTitle = [self createLabel:@"Drain: middle"];
+    [_rowDrainM addSubview:_drainMTitle];
+    _drainMSwitch = [self createSwitch];
+    _drainMSwitch.target = self; _drainMSwitch.action = @selector(drainToggled:);
+    [_rowDrainM addSubview:_drainMSwitch];
+    [_specificCard addSubview:_rowDrainM];
+
+    _sepDrainR = [self createSeparator];   [_specificCard addSubview:_sepDrainR];
+    _rowDrainR = [[VNPFlippedView alloc] init];
+    _drainRTitle = [self createLabel:@"Drain: right corner"];
+    [_rowDrainR addSubview:_drainRTitle];
+    _drainRSwitch = [self createSwitch];
+    _drainRSwitch.target = self; _drainRSwitch.action = @selector(drainToggled:);
+    [_rowDrainR addSubview:_drainRSwitch];
+    [_specificCard addSubview:_rowDrainR];
 
     _refreshRateSlider = [self createSliderWithMin:0.0 max:144.0 defaultVal:120.0];
     _refreshRateSlider.target = self;
@@ -378,9 +414,7 @@ static const VNAnimationMeta kAnimations[] = {
     y += 18.0;
     
     const BOOL waterShown = [self isWaterSelected];
-    _sepWater.hidden = !waterShown;
-    _rowWater.hidden = !waterShown;
-    const CGFloat animCardH = waterShown ? 142.0 + 1.0 + 52.0 : 142.0;
+    const CGFloat animCardH = 142.0;
 
     _animCard.frame = NSMakeRect(0, y, w, animCardH);
     // Row 1: Active Animation
@@ -410,18 +444,47 @@ static const VNAnimationMeta kAnimations[] = {
     _refreshSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
     _refreshRateSlider.frame = NSMakeRect(12, 33, w - 24, 15);
 
-    // Row 4: Water tint, only when water is the active animation
+    y += animCardH + 14.0;
+
+    // Section 3: whatever the active animation brings with it. Water brings a
+    // tint and three drains; everything else brings nothing, and then the
+    // header and the card are not laid out at all.
+    _specificHeader.hidden = !waterShown;
+    _specificCard.hidden   = !waterShown;
+    _rowWater.hidden       = !waterShown;
+    _sepDrainL.hidden = _sepDrainM.hidden = _sepDrainR.hidden = !waterShown;
+    _rowDrainL.hidden = _rowDrainM.hidden = _rowDrainR.hidden = !waterShown;
+
     if (waterShown) {
-        _sepWater.frame = NSMakeRect(12, 142, w - 24, 1);
-        _rowWater.frame = NSMakeRect(0, 143, w, 52.0);
+        _specificHeader.frame = NSMakeRect(8, y, w - 16, 14);
+        y += 18.0;
+
+        const CGFloat rowH = 36.0, tintH = 52.0;
+        const CGFloat specificH = tintH + 3.0 * (1.0 + rowH);
+        _specificCard.frame = NSMakeRect(0, y, w, specificH);
+
         CGFloat wtLabelW = 42.0;
+        _rowWater.frame = NSMakeRect(0, 0, w, tintH);
         _waterLabel.frame = NSMakeRect(w - 12 - wtLabelW, 5, wtLabelW, 15);
         _waterTitle.frame = NSMakeRect(12, 5, w - 24 - wtLabelW - 6, 15);
         _waterSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
         _waterSlider.frame = NSMakeRect(12, 33, w - 24, 15);
+
+        VNPFlippedView *rows[3] = { _rowDrainL, _rowDrainM, _rowDrainR };
+        NSBox *seps[3] = { _sepDrainL, _sepDrainM, _sepDrainR };
+        NSTextField *titles[3] = { _drainLTitle, _drainMTitle, _drainRTitle };
+        NSSwitch *switches[3] = { _drainLSwitch, _drainMSwitch, _drainRSwitch };
+        CGFloat ry = tintH;
+        for (int i = 0; i < 3; i++) {
+            seps[i].frame = NSMakeRect(12, ry, w - 24, 1);
+            rows[i].frame = NSMakeRect(0, ry + 1, w, rowH);
+            switches[i].frame = NSMakeRect(w - 12 - 38, (rowH - 22.0) / 2.0, 38, 22);
+            titles[i].frame = NSMakeRect(12, (rowH - 16.0) / 2.0, w - 24 - 38 - 8, 16);
+            ry += 1.0 + rowH;
+        }
+        y += specificH + 8.0;
     }
 
-    y += animCardH + 8.0;
     _totalHeight = y;
     self.preferredContentSize = NSMakeSize(w, _totalHeight);
 }
@@ -574,6 +637,21 @@ static const VNAnimationMeta kAnimations[] = {
     if (tint < 0.0 || tint > 1.0) tint = 0.70;
     _waterSlider.doubleValue = tint;
     _waterLabel.stringValue = [NSString stringWithFormat:@"%.2f", tint];
+
+    _drainLSwitch.state = [self readBool:@"water_drain_left"   defaultValue:YES] ? NSControlStateValueOn : NSControlStateValueOff;
+    _drainMSwitch.state = [self readBool:@"water_drain_middle" defaultValue:YES] ? NSControlStateValueOn : NSControlStateValueOff;
+    _drainRSwitch.state = [self readBool:@"water_drain_right"  defaultValue:YES] ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)drainToggled:(NSSwitch *)sender {
+    NSString *key = sender == _drainLSwitch ? @"water_drain_left"
+                  : sender == _drainMSwitch ? @"water_drain_middle"
+                  : @"water_drain_right";
+    // Through a BOOL local, not @(a == b) directly: `==` has type int in C, so
+    // boxing the comparison writes <integer>0</integer> rather than <false/>
+    // and a reader looking for a boolean never sees it.
+    BOOL val = (sender.state == NSControlStateValueOn);
+    [self writePrefValue:@(val) forKey:key];
 }
 
 - (void)waterTintChanged:(NSSlider *)sender {

@@ -514,6 +514,42 @@
 			<key>showValue</key>
 			<true/>
 		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>key</key>
+			<string>water_drain_left</string>
+			<key>label</key>
+			<string>Drain: left corner</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>key</key>
+			<string>water_drain_middle</string>
+			<key>label</key>
+			<string>Drain: middle</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>key</key>
+			<string>water_drain_right</string>
+			<key>label</key>
+			<string>Drain: right corner</string>
+		</dict>
 	<dict>
 			<key>PostNotification</key>
 			<string>com.doraorak.vanish/prefsChanged</string>

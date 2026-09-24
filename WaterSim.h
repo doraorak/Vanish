@@ -30,7 +30,7 @@
 /// and has the side benefit that a small window is cheaper rather than merely
 /// slower.
 #ifndef kVNParticleSpacingPx
-#define kVNParticleSpacingPx 14.0
+#define kVNParticleSpacingPx 7.0
 #endif
 
 /// Bounds on the derived count: enough to read as a body of liquid, capped so a
@@ -52,7 +52,7 @@
 /// move less than the smoothing radius in 1/60 s, which free fall across a
 /// display breaks; each substep halves the displacement it has to survive.
 #ifndef kVNSubSteps
-#define kVNSubSteps 3u
+#define kVNSubSteps 6u
 #endif
 
 /// Neighbours kept per particle. Must match kVNMaxNeighbours in Water.metal.
@@ -107,6 +107,12 @@
 
 /// Equation 16. Position based solvers damp; this puts some of it back.
 #define kVNVorticityEps 0.00008f
+
+/// The openings in the floor, one bit each, switched from the preferences.
+#define kVNDrainLeft   1u
+#define kVNDrainMiddle 2u
+#define kVNDrainRight  4u
+#define kVNDrainAll    (kVNDrainLeft | kVNDrainMiddle | kVNDrainRight)
 
 /// How much of the rest density the isosurface sits at, after blurring.
 #define kVNIsoLevel 0.55f
@@ -175,6 +181,8 @@ typedef struct {
     /// measured from here, or the liquid is born partway through its own
     /// transition -- which looked like a window turning up already blue.
     float    seed_phase;
+    /// Which floor openings are open: kVNDrainLeft | kVNDrainMiddle | kVNDrainRight.
+    uint32_t drains;
 } VNSimParams;
 
 /// Must match VNObstacle in Water.metal.
@@ -187,7 +195,7 @@ typedef struct {
 #define kVNMaxObstacles 24
 
 _Static_assert(sizeof(VNParticle) == 48, "VNParticle must match Water.metal");
-_Static_assert(sizeof(VNSimParams) == 120, "VNSimParams must match Water.metal");
+_Static_assert(sizeof(VNSimParams) == 124, "VNSimParams must match Water.metal");
 _Static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match Water.metal");
 
 /// The 2D kernels, in the same form the shader uses them. 2D, not 3D: this
