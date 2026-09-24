@@ -16,8 +16,9 @@
 // directly drive the display's Mini-LED backlights to peak physical brightness
 // (1000 - 1600 nits).
 //
-// The animation ignites at the window's top-left corner and sweeps across the
-// pane as an organic, incandescent burning wavefront:
+// The animation ignites at a point Vanish picks per close (VNShaderExtra
+// params[0..1], in the window's unit square; the top-left corner when unbound)
+// and sweeps across the pane as an organic, incandescent burning wavefront:
 //
 //   AHEAD OF WAVE  : Window is completely intact, unaltered pixels.
 //   AT THE WAVE    : Relativistic burning plasma edge with extreme HDR radiance
@@ -35,6 +36,7 @@
 fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
                              texture2d<float> tex2D [[texture(0)]],
                              constant VNUberArgs &args [[buffer(0)]],
+                             constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                              sampler samp [[sampler(0)]]) {
     const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6));
     const float  t  = clamp(1.0 - args.brightness, 0.0, 1.0);
@@ -62,18 +64,23 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     const float2 size   = 1.0 / px;
     const float  aspect = size.x / size.y;
 
-    // Detonation origin anchored directly at the window's top-left corner (0.0, 0.0)
-    const float2 p      = uv * float2(aspect, 1.0);
+    // Ignition point, and the distance from it to the farthest corner, so the
+    // wavefront reaches every corner at the end wherever it started.
+    const float2 origin = extra.bound > 0.5 ? clamp(float2(extra.params[0], extra.params[1]), 0.0, 1.0)
+                                            : float2(0.0);
+    const float2 p      = (uv - origin) * float2(aspect, 1.0);
+    const float2 far    = float2(max(origin.x, 1.0 - origin.x), max(origin.y, 1.0 - origin.y));
     const float  dist   = length(p);
-    const float  span   = length(float2(aspect, 1.0));
+    const float  span   = length(far * float2(aspect, 1.0));
+    const float2 np     = uv * float2(aspect, 1.0);   // noise stays fixed to the window
     const float  norm_d = dist / max(span, 1e-4);
 
     // Wavefront expands smoothly from the corner to consume the full window
     const float front = pow(t, 0.88) * 1.25;
 
     // Multi-octave procedural turbulence for organic burning flame contours
-    const float n = vn_fast_noise(p * 5.5 - float2(t * 2.2)) * 0.70
-                  + vn_fast_noise(p * 14.0 + float2(t * 3.5)) * 0.30;
+    const float n = vn_fast_noise(np * 5.5 - float2(t * 2.2)) * 0.70
+                  + vn_fast_noise(np * 14.0 + float2(t * 3.5)) * 0.30;
 
     const float delta = norm_d - front + (n - 0.5) * 0.08;
 
@@ -85,7 +92,7 @@ fragment float4 vn_uber_burn(VNUberStage in [[stage_in]],
     const float burn_mask = smoothstep(-0.04, 0.01, delta);
 
     // Sample window content with slight refractive heat shimmer at the flame
-    const float2 shock_dir = dist > 1e-4 ? normalize(uv) : float2(0.7071, 0.7071);
+    const float2 shock_dir = dist > 1e-4 ? normalize(uv - origin) : float2(0.7071, 0.7071);
     const float2 sample_uv = uv - shock_dir * (heat * 0.020);
     float4 base = tex2D.sample(samp, clamp(sample_uv, 0.0, 1.0));
     base *= burn_mask * content_mask;
