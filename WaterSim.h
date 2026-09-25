@@ -128,6 +128,30 @@
 #define kVNCFMRelax 0.02f
 #endif
 
+/// Water at rest weighs less.
+///
+/// A position based solve never holds a column of liquid perfectly still: every
+/// substep gravity presses it down and the density solve pushes it back, and
+/// the push is never exact. What is left over moves the water -- in proportion
+/// to gravity and to the particle size, so a big window's deep pool drifted
+/// and swirled forever, about 60 px/s everywhere in it, however much the solve
+/// iterated or the velocities were damped.
+///
+/// So when practically none of a close's water is moving, gravity for the
+/// whole of it eases down to kVNRestGravity of itself: uniformly, so the pool
+/// stays in balance and still levels itself, only under a lighter load and so
+/// with a fraction of the noise. The moment enough of it moves -- a window
+/// dragged through it, another close landing in it -- gravity is back in full
+/// almost at once. Per-particle versions of this were tried and dropped: water
+/// under different gravity in one column pushes against itself -- and for the
+/// same reason water touching another close's water keeps full gravity: two
+/// pools easing on their own schedules pushed at each other along the seam.
+#define kVNRestGravity        0.2f
+#define kVNRestMovingBelow    0.02f   // share of particles moving: under this, at rest
+#define kVNRestMovingAbove    0.05f   // over this, in motion
+#define kVNRestEaseDown       0.5f    // seconds to ease to rest gravity
+#define kVNRestEaseUp         0.1f    // seconds to be back to full
+
 /// Must match VNParticle in Water.metal.
 typedef struct {
     float pos[2];

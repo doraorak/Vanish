@@ -4207,6 +4207,7 @@ static void *vn_shader_for_fragment(const char *frag_name) {
 /// buffer(0) and texture(0) on this path, and VNShaderExtra sits at 8.
 #define kVNFragSimParamsIndex 11
 #define kVNFragFieldTexture    1
+#define kVNFragMotionTexture   2
 
 typedef struct { unsigned long width, height, depth; } VNMTLSize;
 typedef struct { unsigned long location, length; } VNNSRange;
@@ -4325,9 +4326,12 @@ static bool  gVNSimBroken;      // a failure that retrying would only repeat
 typedef struct {
     void *particles;                  // MTLBuffer, kVNParticleCountMax x VNParticle
     void *field;                      // MTLTexture, RGBA16Float
-    void *census;                     // MTLBuffer, shared, kVNCensusRing x uint32
+    void *motion;                     // MTLTexture, RG16Float: density and speed, for the foam
+    void *census;                     // MTLBuffer, shared, kVNCensusRing x { live, moving }
     uint32_t census_next;
     _Atomic uint32_t census_live;     // particles still on screen, as last read back
+    _Atomic uint32_t census_moving;   // and how many of them were moving
+    float    rest_scale;              // gravity's share, easing toward kVNRestGravity at rest
     _Atomic uint32_t census_generation;   // the close that count belongs to
     _Atomic uint32_t stepped_generation;  // the close whose water the buffers hold
     _Atomic uint64_t domain_bits;     // the stepped destination's size in pixels, two floats
@@ -4482,14 +4486,18 @@ static void *vn_particles_pipeline(void *device, void *library, const char *fn_n
 /// A texture for the surface field: fixed size, so it is allocated once and no
 /// display can force a resize -- a resize would mean releasing a texture that
 /// may still be in flight in a command buffer we no longer own.
-static void *vn_particles_field_texture(void *device) {
+/// 115 = MTLPixelFormatRGBA16Float. Half is the right width for a density
+/// field normalised to rest: the values sit around 1.0, where half has far
+/// more precision than a surface needs. The motion field, density and speed,
+/// is 65 = MTLPixelFormatRG16Float.
+#define kVNFieldFormat  115ul
+#define kVNMotionFormat 65ul
+
+static void *vn_particles_field_texture(void *device, unsigned long format) {
     void *cls = vn_get_class("MTLTextureDescriptor");
     if (!cls) return NULL;
-    // 115 = MTLPixelFormatRGBA16Float. Half is the right width for a density
-    // field normalised to rest: the values sit around 1.0, where half has far
-    // more precision than a surface needs.
     void *desc = vn_msg_id_uuub(cls, VN_SEL("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-                                115, kVNFieldDim, kVNFieldDim, false);
+                                format, kVNFieldDim, kVNFieldDim, false);
     if (!desc) return NULL;
     vn_msg_v_u(desc, VN_SEL("setUsage:"), 1 | 2);          // ShaderRead | ShaderWrite
     vn_msg_v_u(desc, VN_SEL("setStorageMode:"), 2);        // Private
@@ -4538,16 +4546,17 @@ static bool vn_particles_ensure(void *device) {
                                            + kVNParticleCountMax) * sizeof(uint32_t);
     gVNSimBins       = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"), bin_bytes, 0x20);
     gVNSimNeighbours = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"), neighbour_bytes, 0x20);
-    void *scratch    = vn_particles_field_texture(device);
+    void *scratch    = vn_particles_field_texture(device, kVNFieldFormat);
     bool ok = gVNSimBins && gVNSimNeighbours && scratch;
     for (int i = 0; i < kVNWaterSlots && ok; i++) {
         gVNSims[i].particles = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"), particle_bytes, 0x20);
-        gVNSims[i].field     = vn_particles_field_texture(device);
+        gVNSims[i].field     = vn_particles_field_texture(device, kVNFieldFormat);
+        gVNSims[i].motion    = vn_particles_field_texture(device, kVNMotionFormat);
         // Shared: the CPU reads it back. A new buffer is zeroed, which is the
         // state the ring expects every entry to be in before it is counted into.
         gVNSims[i].census    = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"),
-                                            kVNCensusRing * sizeof(uint32_t), 0);
-        ok = gVNSims[i].particles && gVNSims[i].field && gVNSims[i].census;
+                                            kVNCensusRing * 2 * sizeof(uint32_t), 0);
+        ok = gVNSims[i].particles && gVNSims[i].field && gVNSims[i].motion && gVNSims[i].census;
     }
     if (!ok) {
         VN_ERROR("water: could not allocate the simulation on device %p", device);
@@ -4643,7 +4652,22 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     if (sp.spawn_max_y < sp.spawn_min_y + 16.0f) sp.spawn_max_y = sp.spawn_min_y + 16.0f;
 
     sp.dt      = (float)(frame_dt / (double)kVNSubSteps);
-    sp.gravity = kVNGravityPx * scale;
+    // At rest, lighter: see kVNRestGravity. Eased from the last census read
+    // back, which is a frame or two old -- fine for something that changes
+    // over half a second.
+    if (water->generation != atomic_load_explicit(&sim->stepped_generation, memory_order_relaxed) || npartners > 0) {
+        sim->rest_scale = 1.0f;
+    } else if (atomic_load_explicit(&sim->census_generation, memory_order_acquire) == water->generation) {
+        const uint32_t live = atomic_load_explicit(&sim->census_live, memory_order_relaxed);
+        const uint32_t moving = atomic_load_explicit(&sim->census_moving, memory_order_relaxed);
+        const float share = live > 0u ? (float)moving / (float)live : 1.0f;
+        if (share < kVNRestMovingBelow) {
+            sim->rest_scale = fmaxf(kVNRestGravity, sim->rest_scale - (float)frame_dt * (1.0f - kVNRestGravity) / kVNRestEaseDown);
+        } else if (share > kVNRestMovingAbove) {
+            sim->rest_scale = fminf(1.0f, sim->rest_scale + (float)frame_dt * (1.0f - kVNRestGravity) / kVNRestEaseUp);
+        }
+    }
+    sp.gravity = kVNGravityPx * scale * sim->rest_scale;
     sp.seed    = (float)(water->generation % 977u) + 0.5f;
     sp.valid   = 1u;
     vn_water_derive(&sp, sp.spawn_max_x - sp.spawn_min_x, sp.spawn_max_y - sp.spawn_min_y);
@@ -4754,12 +4778,12 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), &sp, sizeof(sp), kVNSimParamsIndex);
 
     const uint32_t ring = sim->census_next++ % kVNCensusRing;
-    vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), sim->census, ring * sizeof(uint32_t), kVNCensusIndex);
+    vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), sim->census, ring * 2 * sizeof(uint32_t), kVNCensusIndex);
     vn_dispatch_1d(enc, kVNKCensus, sp.count);
 
     vn_dispatch_1d(enc, kVNKBinClear, sp.bin_w * sp.bin_h);
     vn_dispatch_1d(enc, kVNKBinFill, sp.count);
-    vn_dispatch_field(enc, kVNKField, sim->field, NULL);
+    vn_dispatch_field(enc, kVNKField, sim->field, sim->motion);
     vn_dispatch_field(enc, kVNKBlurX, sim->field, gVNSimScratch);
     vn_dispatch_field(enc, kVNKBlurY, gVNSimScratch, sim->field);
 
@@ -4785,9 +4809,10 @@ static void vn_particles_read_census(int slot_index, uint32_t ring, uint32_t gen
     VNSimSlot *sim = &gVNSims[slot_index];
     uint32_t *counts = (uint32_t *)vn_msg_id(sim->census, VN_SEL("contents"));
     if (!counts) return;
-    const uint32_t live = counts[ring];
-    counts[ring] = 0;   // ready for the frame that next counts into it
+    const uint32_t live = counts[ring * 2], moving = counts[ring * 2 + 1];
+    counts[ring * 2] = counts[ring * 2 + 1] = 0;   // ready for the frame that next counts into it
     atomic_store_explicit(&sim->census_live, live, memory_order_relaxed);
+    atomic_store_explicit(&sim->census_moving, moving, memory_order_relaxed);
     atomic_store_explicit(&sim->census_generation, generation, memory_order_release);
 }
 
@@ -4980,12 +5005,13 @@ static void vn_particles_bind_fragment(void *encoder, void *destination,
     // drawing the untouched window instead would bring the window back. A slot
     // midway through being written is not that, and gets the window for the
     // one frame.
-    void *field = NULL;
+    void *field = NULL, *motion = NULL;
     if (bound && found < 0 && !torn && gVNSimScratch) {
         sp.valid = 2u;
     } else if (found >= 0 && gVNSimScratch) {
         VNSimSlot *sim = &gVNSims[found];
         field = sim->field;
+        motion = sim->motion;
         const bool fresh = atomic_load_explicit(&sim->stepped_generation, memory_order_acquire) == water.generation;
 
         // The field is only meaningful in the pixel grid it was stepped in.
@@ -5036,9 +5062,10 @@ static void vn_particles_bind_fragment(void *encoder, void *destination,
     }
 
     vn_msg_v_cuu(encoder, VN_SEL("setFragmentBytes:length:atIndex:"), &sp, sizeof(sp), kVNFragSimParamsIndex);
-    if (!field && gVNSimScratch) field = gVNSims[0].field;   // something must be bound; valid says not to read it
+    if (!field && gVNSimScratch) { field = gVNSims[0].field; motion = gVNSims[0].motion; }   // bound; valid says not to read them
     if (field) {
         vn_msg_v_pu(encoder, VN_SEL("setFragmentTexture:atIndex:"), field, kVNFragFieldTexture);
+        vn_msg_v_pu(encoder, VN_SEL("setFragmentTexture:atIndex:"), motion, kVNFragMotionTexture);
     }
 }
 

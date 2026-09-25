@@ -669,16 +669,26 @@ kernel void vn_pbf_vel_commit(device VNParticle *P     [[buffer(0)]],
     P[id].dp  = float2(0.0);
 }
 
+/// Faster than this, in smoothing radii a second, a particle is moving. The
+/// solve's own noise in a pool at rest is about 1 h/s.
+constant float kVNMovingSpeed = 4.0;
+
 /// How much of the fluid is still on screen. The CPU reads the count back when
 /// the frame's command buffer completes, and a close whose water has all
 /// drained ends there instead of running out its duration. The slot is zeroed
 /// by the CPU after reading, so nothing here has to clear it.
+///
+/// And how much of it is moving -- faster than kVNMovingSpeed -- which is
+/// how the CPU tells a body of water at rest from one in motion. See
+/// kVNRestGravity in WaterSim.h.
 kernel void vn_pbf_census(const device VNParticle *P [[buffer(0)]],
                           constant VNSimParams &sp   [[buffer(2)]],
-                          device atomic_uint *live   [[buffer(5)]],
+                          device atomic_uint *counts [[buffer(5)]],
                           uint id [[thread_position_in_grid]]) {
     if (id >= sp.count) return;
-    if ((P[id].ignore & VN_DRAINED) == 0u) atomic_fetch_add_explicit(live, 1u, memory_order_relaxed);
+    if ((P[id].ignore & VN_DRAINED) != 0u) return;
+    atomic_fetch_add_explicit(&counts[0], 1u, memory_order_relaxed);
+    if (length(P[id].vel) > kVNMovingSpeed * sp.h) atomic_fetch_add_explicit(&counts[1], 1u, memory_order_relaxed);
 }
 
 #pragma mark - Surface field
@@ -702,6 +712,7 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
                            const device uint *bins      [[buffer(1)]],
                            constant VNSimParams &sp     [[buffer(2)]],
                            texture2d<float, access::write> field [[texture(0)]],
+                           texture2d<float, access::write> motion [[texture(1)]],
                            uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= sp.field_w || gid.y >= sp.field_h) return;
 
@@ -715,6 +726,7 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
     float  w = 0.0;
     float2 uv = float2(0.0);
     float  reach = 0.0;
+    float  spd = 0.0;
     // Within about one particle spacing of any particle. See the fragment's
     // cover: this is what draws the corners the density alone leaves out.
     const float R = kVNCoverReach * sp.h / kVNSmoothingRatio;
@@ -736,12 +748,16 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
                 const float k = vn_poly6(r2, sp.h);
                 w  += k;
                 uv += k * P[j].uv0;
+                spd += k * length(P[j].vel) / max(sp.h, 1e-3);   // smoothing radii a second
                 const float q = saturate(1.0 - r2 / (R * R));
                 reach = max(reach, q * q);
             }
         }
     }
     field.write(float4(w / sp.rho0, uv / sp.rho0, reach), gid);
+    // How fast the water here is moving, for the foam: density and the
+    // density-weighted speed, unblurred, which the fragment divides.
+    motion.write(float4(w, spd, 0.0, 0.0), gid);
 }
 
 // Separable Gaussian, 9 taps. Smoothing the field is what turns a lumpy sum of
@@ -807,6 +823,7 @@ kernel void vn_field_blur_y(texture2d<float, access::read> src  [[texture(0)]],
 fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
                               texture2d<float> tex2D        [[texture(0)]],
                               texture2d<float> fieldTex     [[texture(1)]],
+                              texture2d<float> motionTex    [[texture(2)]],
                               constant VNUberArgs &args     [[buffer(0)]],
                               constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
                               constant VNSimParams &sp      [[buffer(11)]],
@@ -964,11 +981,25 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     // No reflection and no highlights: on water being stirred they are across
     // the whole of it, and read as white. The outline is the one light the
     // surface keeps.
-    const float3 rgb = saturate(body + rim);
+    // Foam where the water is thin and fast: the spray of a splash and the lip
+    // of a wave, not the body of a pool. Thin is what decides it -- a whole
+    // window falling is fast too, and it is a body: letting speed count for
+    // bodies washed every falling window white on its way down and again on
+    // impact. Speckled by the carried coordinate so it travels with the water
+    // rather than sitting on the screen.
+    const float2 mo = motionTex.sample(vn_field_sampler, fuv).xy;
+    const float  speed = mo.y / max(mo.x, 1e-6);               // smoothing radii a second
+    const float  foam_amount = smoothstep(60.0, 160.0, speed) * (1.0 - smoothstep(0.15, 0.45, T));
+    const float  speckle = vn_fast_noise(carried * 70.0);
+    const float  foam = foam_amount * smoothstep(0.35, 0.75, speckle);
+
+    float3 rgb = body + rim;
+    rgb = mix(rgb, float3(0.97, 0.99, 1.0), foam * 0.55);
+    rgb = saturate(rgb);
 
     // Thin water is see-through and a body of it is not, by the same
     // absorption.
-    const float opacity = mix(saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T))), 1.0, young);
+    const float opacity = mix(saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + foam * 0.6), 1.0, young);
     const float alpha = cover * opacity * saturate(held.a) * saturate(sp.fade);
     return float4(rgb * alpha, alpha);
 }
