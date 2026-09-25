@@ -848,6 +848,7 @@ typedef struct {
     uint32_t         generation;  // unique per close; 0 = the slot is free
     CGXWindow       *clone_win;
     CGRect           window_pt;   // the closing window, in the display's points
+    double           corner_pt;   // its corner radius, points
     CGRect           display_pt;  // that display's bounds, in points
     // The other windows on screen, for the fluid to land on. Collected when the
     // clone is built and again whenever the windows on screen change -- so a
@@ -891,6 +892,7 @@ typedef struct {
     bool     valid;
     uint32_t generation;
     CGRect   window_pt;
+    double   corner_pt;
     CGRect   display_pt;
     CGRect   obstacles[kVNMaxObstacles];
     uint32_t obstacle_wids[kVNMaxObstacles];
@@ -944,7 +946,7 @@ static VNWaterSlot *vn_water_slot_for_clone(CGXWindow *clone) {
 /// be: the clone is ordered above everything and, for water, shaped to the
 /// whole display, so asking which windows are unobscured once it is on screen
 /// answers "none of them" -- our own clone covers the lot.
-static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_pt,
+static void vn_water_publish(CGXWindow *clone, CGRect window_pt, double corner_pt, CGRect display_pt,
                              const CGRect *obstacles, const uint32_t *obstacle_wids, uint32_t obstacle_count,
                              const uint32_t *overlapped, uint32_t closing_wid, float tint, float seed, uint32_t drains,
                              bool keep_previous) {
@@ -968,6 +970,7 @@ static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_
     s->generation = gVNWaterGeneration;
     s->clone_win  = clone;
     s->window_pt  = window_pt;
+    s->corner_pt  = corner_pt > 0.0 ? corner_pt : 0.0;
     s->display_pt = display_pt;
     s->start      = INFINITY;
     atomic_store_explicit(&s->end, INFINITY, memory_order_relaxed);
@@ -1066,6 +1069,7 @@ static VNWaterSnapshot vn_water_snapshot(const VNWaterSlot *s) {
 
     out.generation = s->generation;
     out.window_pt  = s->window_pt;
+    out.corner_pt  = s->corner_pt;
     out.display_pt = s->display_pt;
     out.start      = s->start;
     out.tint       = s->tint;
@@ -1908,6 +1912,7 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
         //   params[3]  the window's top edge within the frame
         //   params[4]  the window's bottom edge within the frame
         float inset_x = 0.0f, top = 0.0f, bottom = 1.0f, radius = 0.0f;
+        double corner_pt = 0.0;
         if (frame.size.width >= 1.0 && frame.size.height >= 1.0 &&
             content.size.width >= 1.0 && content.size.height >= 1.0) {
             const double left  = (CGRectGetMinX(content) - frame.origin.x) / frame.size.width;
@@ -1917,6 +1922,7 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             bottom  = (float)fmax(0.0, fmin(1.0, (CGRectGetMaxY(content) - frame.origin.y) / frame.size.height));
             const double radius_pt = vn_resolved_corner_radius ? vn_resolved_corner_radius(win) : 0.0;
             radius = (float)fmax(0.0, fmin(0.5, radius_pt / content.size.height));
+            corner_pt = radius_pt;
             VN_INFO("clone: window within frame: left %.4f right %.4f top %.4f bottom %.4f corner radius %.1fpt "
                     "(window %.1f,%.1f %.1fx%.1f in frame %.1f,%.1f %.1fx%.1f)",
                     left, right, (double)top, (double)bottom, radius_pt,
@@ -1939,7 +1945,7 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             // compute pass converts both into the render target's pixels once
             // it knows the destination it is stepping against. The obstacles
             // were collected above, before this clone went on screen.
-            vn_water_publish(clone, content.size.width >= 1.0 ? content : frame,
+            vn_water_publish(clone, content.size.width >= 1.0 ? content : frame, corner_pt,
                              water_screen, water_obstacles, water_obstacle_wids, water_obstacle_count,
                              water_overlapped, orig_wid, prefs.waterTint, params[0], prefs.waterDrains,
                              prefs.waterKeepPrevious);
@@ -4625,6 +4631,7 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     sp.spawn_min_y = (float)((CGRectGetMinY(water->window_pt) - oy) * scale);
     sp.spawn_max_x = (float)((CGRectGetMaxX(water->window_pt) - ox) * scale);
     sp.spawn_max_y = (float)((CGRectGetMaxY(water->window_pt) - oy) * scale);
+    sp.spawn_corner = (float)(water->corner_pt * scale);
 
     // A window larger than the destination, or off it entirely, would seed the
     // fluid outside the domain and leave it pinned to an edge.

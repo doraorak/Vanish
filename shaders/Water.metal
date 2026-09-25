@@ -74,6 +74,7 @@ struct VNSimParams {
     float fade;                      // 1 while the water is shown, down to 0 as it goes
     uint  fresh;                     // obstacles that appeared this step, a bit per index
     uint  others;                    // other closes' fields bound for coupling, 0..2
+    float spawn_corner;              // the window's corner radius, px: nothing is seeded outside it
 };
 
 /// Must match VNParticle in Vanish.c. `uv0` is where in the window this parcel
@@ -95,7 +96,7 @@ struct VNObstacle {
     float _pad;
 };
 
-static_assert(sizeof(VNSimParams) == 136, "VNSimParams must match WaterSim.h");
+static_assert(sizeof(VNSimParams) == 140, "VNSimParams must match WaterSim.h");
 static_assert(sizeof(VNParticle) == 48, "VNParticle must match WaterSim.h");
 static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match WaterSim.h");
 
@@ -170,6 +171,11 @@ constant float kVNTintSeconds = 1.6;
 /// How long a window takes to stop looking like a window and start looking
 /// like water, in seconds from the fluid's birth.
 constant float kVNBecomeWaterSeconds = 0.35;
+
+/// The outline along the water's edge: how far inside the edge it sits, and
+/// how wide it is, in render-target pixels.
+constant float kVNOutlineInsetPx = 2.5;
+constant float kVNOutlineWidthPx = 1.5;
 
 static inline bool vn_inside_obstacle(float2 p, VNObstacle o, float margin) {
     return p.x > o.min_x - margin && p.x < o.max_x + margin &&
@@ -329,6 +335,22 @@ kernel void vn_pbf_predict(device VNParticle *P          [[buffer(0)]],
 
         // Whatever it is born inside of, it may leave.
         p.ignore = 0u;
+
+        // Only inside the window's own shape. Its corners are rounded, and a
+        // lattice across the whole rect put water in the transparent corners:
+        // invisible, but there, so the fluid's outline was the rect's and not
+        // the window's. Outside the rounded rect a particle is born drained --
+        // never in the fluid at all.
+        {
+            const float2 half_span = 0.5 * span;
+            const float  rc = clamp(sp.spawn_corner, 0.0, min(half_span.x, half_span.y));
+            const float2 q = abs(p.pos - (float2(sp.spawn_min_x, sp.spawn_min_y) + half_span)) - (half_span - rc);
+            if (rc > 0.0 && length(max(q, 0.0)) > rc) {
+                p.ignore = VN_DRAINED;
+                P[id] = p;
+                return;
+            }
+        }
         for (uint i = 0; i < sp.obstacles && i < 32u; ++i) {
             if (vn_inside_obstacle(p.pos, obs[i], sp.radius)) p.ignore |= (1u << i);
         }
@@ -928,8 +950,16 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
 
     // The meniscus: a thin bright line just inside the edge, where the surface
     // curves over and catches the light.
-    const float  rim_at = (d - sp.iso * 1.25) / (sp.iso * 0.30);
-    const float  rim = exp(-rim_at * rim_at) * 0.8 * (1.0 - young);
+    //
+    // A line a few pixels wide, measured from the edge in pixels -- how far
+    // inside it this pixel is, by how fast the field changes across a pixel.
+    // Drawn where the density reads a band of values instead, it covered the
+    // whole of any sheet of water spread thin enough to sit in that band: a
+    // pool piled against a wall went silver-white across its face. Drawn from
+    // the first frame, so the window has its outline as it becomes water.
+    const float inside_px = max((d - sp.iso) / edge_w, (f.w - kVNCoverLevel) / reach_w);
+    const float rim_at = (inside_px - kVNOutlineInsetPx) / kVNOutlineWidthPx;
+    const float rim = exp(-rim_at * rim_at) * 0.8;
 
     // No reflection and no highlights: on water being stirred they are across
     // the whole of it, and read as white. The outline is the one light the
