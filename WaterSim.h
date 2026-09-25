@@ -191,7 +191,9 @@ typedef struct {
 typedef struct {
     float min_x, min_y, max_x, max_y;
     float corner;
-    float _pad;
+    /// 1 while the window is being moved -- it moved within the last few
+    /// steps -- and so solid all round rather than a shelf.
+    float solid;
 } VNObstacle;
 
 #define kVNMaxObstacles 24
