@@ -254,20 +254,20 @@ static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
 constexpr sampler vn_field_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
 
 /// Where another close's water is dense enough to count as water, relative to
-/// its own rest density, and how hard its surface pushes back.
+/// its own rest density.
 constant float kVNCoupleLevel    = 0.15;
-constant float kVNCoupleStrength = 2.0;
+constant float kVNCoupleVelocityShare = 0.2;   // of the push that becomes velocity
 
 /// Keeps a particle out of another close's water.
 ///
 /// The closes are separate simulations -- separate particles, separate
 /// neighbour searches -- so they cannot feel each other as fluid. Each does
 /// have a density field, though, built every frame for drawing, and that is
-/// enough for the other to treat it as a soft, moving obstacle: where the
-/// other water is denser than kVNCoupleLevel, the particle is pushed down its
-/// density gradient, further the deeper it is, never more than half a
-/// smoothing radius per substep. Two bodies of water bump and pile against
-/// each other; they do not mix.
+/// enough for the other to treat it as a moving obstacle: where the other
+/// water is denser than kVNCoupleLevel, the particle is moved down its density
+/// gradient onto that level, never more than half a smoothing radius per
+/// substep. Two bodies of water bump and pile against each other; they do not
+/// mix.
 static inline float2 vn_couple(float2 p, constant VNSimParams &sp, texture2d<float> other) {
     const float2 domain = float2(sp.domain_x, sp.domain_y);
     const float2 uv = p / domain;
@@ -279,10 +279,16 @@ static inline float2 vn_couple(float2 p, constant VNSimParams &sp, texture2d<flo
                             other.sample(vn_field_sampler, uv - float2(t.x, 0.0)).x,
                             other.sample(vn_field_sampler, uv + float2(0.0, t.y)).x -
                             other.sample(vn_field_sampler, uv - float2(0.0, t.y)).x);
-    // Flat inside a body of water, where the gradient says nothing: straight up
-    // is the way out of a pool.
-    const float2 out = length(g) > 1e-4 ? -normalize(g) : float2(0.0, -1.0);
-    return p + out * min(kVNCoupleStrength * (d - kVNCoupleLevel) * sp.h, 0.5 * sp.h);
+    // Onto the other water's surface, not pushed by an amount: one Newton step
+    // to where its density falls to kVNCoupleLevel. A push proportional to
+    // depth is a spring, and two springs each seeing the other a frame late
+    // oscillate -- two pools that touched boiled along the seam. A projection
+    // lands on the surface and stops.
+    const float2 texel_px = domain * t;                        // pixels per texel
+    const float2 grad = g / (2.0 * texel_px);                  // density per pixel
+    const float  gl = length(grad);
+    if (gl < 1e-6) return p + float2(0.0, -min(0.5 * sp.h, sp.radius));   // flat inside: up and out
+    return p - (grad / gl) * min((d - kVNCoupleLevel) / gl, 0.5 * sp.h);
 }
 
 #pragma mark - Solver
@@ -347,9 +353,26 @@ kernel void vn_pbf_predict(device VNParticle *P          [[buffer(0)]],
 
     p.ppos = vn_collide(p.pos + p.vel * sp.dt, sp, obs, p.ignore);
     if (sp.others > 0u) {
+        const float2 before = p.ppos;
         p.ppos = vn_couple(p.ppos, sp, otherA);
         if (sp.others > 1u) p.ppos = vn_couple(p.ppos, sp, otherB);
         p.ppos = vn_collide_walls(p.ppos, sp);   // the walls still win
+
+        // Mostly not velocity. The push is a position correction like any
+        // other, and turned straight into speed it made two resting pools
+        // boil wherever they touched: half a smoothing radius a substep is
+        // thousands of pixels a second. Most of it moves the particle's
+        // starting point as well, so it moves without being launched, and
+        // what was carrying it into the other water is taken out -- it lands
+        // rather than bouncing.
+        const float2 push = p.ppos - before;
+        p.pos += push * (1.0 - kVNCoupleVelocityShare);
+        const float pl = length(push);
+        if (pl > 1e-5) {
+            const float2 n = push / pl;
+            const float vn = dot(p.vel, n);
+            if (vn < 0.0) p.vel -= vn * n;
+        }
     }
 
     // Once it is clear of an obstacle it started in, that obstacle is solid to
@@ -550,6 +573,14 @@ kernel void vn_pbf_vorticity(device VNParticle *P     [[buffer(0)]],
     P[id].lambda = w;
 }
 
+/// XSPH for settling water, and the speeds, in smoothing radii a second,
+/// between which it gives way to the paper's value. Measured: a pool that has
+/// landed still circulates at 10-40 h/s as a body, which the paper's value
+/// never damps, while water falling from a window moves at well over 120.
+constant float kVNXSPHRest   = 0.9;
+constant float kVNRestSpeed  = 40.0;
+constant float kVNFlowSpeed  = 120.0;
+
 /// Equations 16 and 17: vorticity confinement to put back the energy a position
 /// based solver damps out, and XSPH viscosity, which is what makes the fluid
 /// move as a body rather than as a cloud of independent dots.
@@ -564,15 +595,38 @@ kernel void vn_pbf_vel_post(device VNParticle *P     [[buffer(0)]],
 
     float2 eta = float2(0.0);
     float2 xsph = float2(0.0);
+    float2 vsum = float2(0.0);
+    float  wsum = 0.0;
     for (uint t = 0; t < nn; ++t) {
         const uint   j = nlist[id * kVNMaxNeighbours + t];
         const float2 r = pi - P[j].pos;
         const float  r2 = dot(r, r);
+        const float  w = vn_poly6(r2, sp.h);
         eta  += abs(P[j].lambda) * vn_spiky_grad(r, sqrt(r2), sp.h);
-        xsph += (P[j].vel - vi) * vn_poly6(r2, sp.h);
+        xsph += (P[j].vel - vi) * w;
+        vsum += P[j].vel * w;
+        wsum += w;
     }
 
-    float2 v = vi + sp.xsph_c * xsph / sp.rho0;
+    // Viscosity by speed. The solve never quite comes to rest: every substep
+    // it pushes the bottom of a pool back up against gravity, the pushes are
+    // turned into velocity, and a still puddle churns at a couple of hundred
+    // pixels a second -- at the paper's c = 0.01 that never dies down. XSPH
+    // pulls a particle toward its neighbours' velocity, so it removes exactly
+    // that relative jitter without slowing water that moves as a body, but at
+    // a strength that stills a pool it would also turn a splash to honey.
+    // So it is strong only where the fluid is slow: water in flight keeps the
+    // paper's value, water settling gets kVNXSPHRest.
+    //
+    // Slow as a neighbourhood, not as a particle. Judged per particle, a
+    // still one beside a jittering one was pulled hard toward its velocity,
+    // lost its damping and passed the jitter on -- a pool that boiled worse
+    // than with no damping at all. The jitter averages out over a
+    // neighbourhood; water that is actually moving does not.
+    const float2 vmean = wsum > 0.0 ? (vsum + vi * vn_poly6(0.0, sp.h)) / (wsum + vn_poly6(0.0, sp.h)) : vi;
+    const float speed = length(vmean) / max(sp.h, 1e-3);       // smoothing radii a second
+    const float c = mix(kVNXSPHRest, sp.xsph_c, smoothstep(kVNRestSpeed, kVNFlowSpeed, speed));
+    float2 v = vi + c * xsph / sp.rho0;
     const float len = length(eta);
     if (len > 1e-8) {
         const float2 N = eta / len;
