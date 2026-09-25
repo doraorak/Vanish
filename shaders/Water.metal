@@ -512,6 +512,18 @@ kernel void vn_pbf_lambda(device VNParticle *P        [[buffer(0)]],
     P[id].lambda = -C / (sum_grad2 + sp.cfm_eps);
 }
 
+/// How much of its correction a particle takes in one iteration.
+///
+/// Every particle is corrected at once, from the same positions (Jacobi), and
+/// each correction assumes its neighbours stay where they are -- so two
+/// neighbours pushing apart both move the whole way and overshoot, and the next
+/// iteration throws them back. In a column of water the overshoot grows with
+/// the pressure, so it is worst at the bottom; the row against the floor can
+/// only take it sideways, and a row sliding under the pool stirs the whole of
+/// it. Half steps do not overshoot, so a deep pool comes to rest with its floor
+/// row still.
+constant float kVNSolveRelax = 0.5;
+
 /// Equations 13 and 14: the position correction, with Monaghan's artificial
 /// pressure. That term is what gives the fluid a surface: it keeps particles
 /// from clumping where the neighbourhood is thin, and the inward pull it leaves
@@ -538,7 +550,7 @@ kernel void vn_pbf_delta(device VNParticle *P          [[buffer(0)]],
         dp += (li + P[j].lambda + scorr) * vn_spiky_grad(r, sqrt(r2), sp.h);
     }
 
-    dp /= sp.rho0;
+    dp *= kVNSolveRelax / sp.rho0;
 
     // No single iteration may move a particle further than it could have
     // travelled anyway. This is a backstop, not tuning: whatever the density
@@ -668,11 +680,6 @@ kernel void vn_pbf_vel_commit(device VNParticle *P     [[buffer(0)]],
 /// solve's own noise in a pool at rest is about 1 h/s.
 constant float kVNMovingSpeed = 4.0;
 
-/// Faster than this a particle is stirring, for the sleep (kVNSleepSeconds in
-/// WaterSim.h): a stricter test than moving, since a sleeping pool no longer
-/// levels itself.
-constant float kVNCalmSpeed = 1.0;
-
 /// How much of the fluid is still on screen. The CPU reads the count back when
 /// the frame's command buffer completes, and a close whose water has all
 /// drained ends there instead of running out its duration. The slot is zeroed
@@ -690,7 +697,6 @@ kernel void vn_pbf_census(const device VNParticle *P [[buffer(0)]],
     atomic_fetch_add_explicit(&counts[0], 1u, memory_order_relaxed);
     const float v = length(P[id].vel);
     if (v > kVNMovingSpeed * sp.h) atomic_fetch_add_explicit(&counts[1], 1u, memory_order_relaxed);
-    if (v > kVNCalmSpeed * sp.h)   atomic_fetch_add_explicit(&counts[2], 1u, memory_order_relaxed);
 }
 
 #pragma mark - Surface field

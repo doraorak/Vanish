@@ -145,26 +145,13 @@
 /// almost at once. Per-particle versions of this were tried and dropped: water
 /// under different gravity in one column pushes against itself -- and for the
 /// same reason water touching another close's water is counted with it, and
-/// the two ease and sleep as one: easing on their own schedules they pushed at
-/// each other along the seam.
+/// the two ease as one: easing on their own schedules they pushed at each
+/// other along the seam.
 #define kVNRestGravity        0.2f
 #define kVNRestMovingBelow    0.02f   // share of particles moving: under this, at rest
 #define kVNRestMovingAbove    0.05f   // over this, in motion
 #define kVNRestEaseDown       0.5f    // seconds to ease to rest gravity
 #define kVNRestEaseUp         0.1f    // seconds to be back to full
-
-/// Water at rest stops.
-///
-/// Even at rest gravity the solve leaves a trace of motion. Once a close's
-/// water has been at rest gravity with under kVNSleepStirringBelow of it
-/// faster than kVNCalmSpeed (Water.metal) for kVNSleepSeconds, it is no longer
-/// stepped at all: its last frame stays on screen and nothing moves. The
-/// whole of it at once, never particles within it -- a sleeping particle next
-/// to a waking one is a solid wall, and piles froze mid-slump that way. It
-/// wakes when a window changes (the obstacle list's serial) or other water
-/// is awake.
-#define kVNSleepSeconds       1.0f
-#define kVNSleepStirringBelow 0.01f
 
 /// Must match VNParticle in Water.metal.
 typedef struct {
