@@ -2925,28 +2925,47 @@ static void vn_track_window_release(uint32_t wid) {
 /// inflated rect would overlap windows that merely sit near the closing one,
 /// drop them from the list, and the water would fall straight through the first
 /// thing under it.
-/// Whether `w` is one of ours: a water clone in a slot, any clone the
-/// animation table knows, or the window being closed -- which is on its way
-/// out, and whose shadow would otherwise hide the edges of its neighbours.
-static bool vn_water_ignores_as_cover(CGXWindow *w, uint32_t closing_wid) {
+/// Whether `w` hides what is under it from the water.
+///
+/// Only an application's own windows do -- the ones in the tracking table,
+/// `tracked`, the same list the obstacles come from. The Dock is not one: it
+/// owns windows the size of the display, ordered above every application
+/// window (level 20), and counted as cover they cut the bottom off every
+/// window's visible part. A window dragged down toward water pooled at the
+/// bottom of the screen stopped at the Dock's top edge, well above the water,
+/// and only reached it once dipped so far that part of it showed beside the
+/// Dock -- by which time it was deep in the water. The menu bar and the other
+/// system surfaces are left out for the same reason.
+///
+/// And not ours: a water clone in a slot, any clone the animation table
+/// knows, or the window being closed -- which is on its way out, and whose
+/// shadow would otherwise hide the edges of its neighbours.
+static bool vn_water_ignores_as_cover(CGXWindow *w, uint32_t closing_wid,
+                                      const uint32_t *tracked, int ntracked) {
     const uint32_t wid = vn_resolved_window_get_id ? vn_resolved_window_get_id(w) : 0;
-    if (wid != 0 && wid == closing_wid) return true;
+    if (wid == 0) return true;
+    bool app_window = false;
+    for (int k = 0; k < ntracked && !app_window; k++) app_window = tracked[k] == wid;
+    if (!app_window) return true;
+    if (wid == closing_wid) return true;
     for (int i = 0; i < kVNWaterSlots; i++) {
         if (gVNWaterSlots[i].generation != 0 && gVNWaterSlots[i].clone_win == w) return true;
     }
     return vn_is_clone_wid(wid, w);
 }
 
-/// The bounds of the part of `w` you can see, leaving our own windows out of
-/// what covers it. The same computation as
+/// The bounds of the part of `w` you can see, counting only application
+/// windows as what covers it. The same computation as
 /// CGXCreateScreenUnobscuredContentShapeForWindow -- content shape minus the
 /// frame shapes of every window above -- over the same window stack, with
-/// vn_water_ignores_as_cover skipped. See kVNSymSessionControlRef.
+/// vn_water_ignores_as_cover skipped. See kVNSymSessionControlRef. `tracked`
+/// is the tracking table's window ids.
 ///
 /// 1 with `out` set when some of it is visible, 0 when none is, and -1 when
 /// the stack could not be read, which sends the caller back to SkyLight's own
 /// answer.
-static int vn_water_visible_bounds(CGXWindow *w, uint32_t closing_wid, CGRect *out) {
+static int vn_water_visible_bounds(CGXWindow *w, uint32_t closing_wid,
+                                   const uint32_t *tracked, int ntracked, CGRect *out) {
     if (!vn_resolved_session_control_ref || !vn_resolved_copy_screen_frame_shape ||
         !vn_resolved_copy_screen_content_shape || !vn_region_union || !vn_region_diff ||
         !vn_resolved_get_region_bounds) return -1;
@@ -2972,7 +2991,7 @@ static int vn_water_visible_bounds(CGXWindow *w, uint32_t closing_wid, CGRect *o
     if (!visible) return 0;
     for (int32_t i = 0; i < index; i++) {
         CGXWindow *above = stack->items[i];
-        if (!above || vn_water_ignores_as_cover(above, closing_wid)) continue;
+        if (!above || vn_water_ignores_as_cover(above, closing_wid, tracked, ntracked)) continue;
         void *frame = vn_resolved_copy_screen_frame_shape(above, 0);
         if (!frame) continue;
         void *rest = NULL;
@@ -3083,7 +3102,7 @@ static uint32_t vn_water_collect_obstacles(uint32_t closing_wid, CGRect closing_
         // last close is the whole display: asked while one is up, every
         // window is buried and the water falls through all of them.
         CGRect visible = CGRectZero;
-        int seen_state = vn_water_visible_bounds(w, closing_wid, &visible);
+        int seen_state = vn_water_visible_bounds(w, closing_wid, wids, n, &visible);
         if (seen_state < 0 && vn_resolved_unobscured_content_shape && vn_resolved_get_region_bounds) {
             void *shape = vn_resolved_unobscured_content_shape(w);
             seen_state = shape ? 1 : 0;
