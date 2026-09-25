@@ -88,12 +88,11 @@ struct VNParticle {
     uint   ignore;  // obstacles this particle began inside; see vn_collide
 };
 
-/// A window the fluid lands on, in the same pixels, and whether it is being
-/// moved.
+/// A window the fluid has to flow around. Rounded rectangle, in the same pixels.
 struct VNObstacle {
     float min_x, min_y, max_x, max_y;
     float corner;
-    float solid;                     // 1 while being moved: solid all round
+    float _pad;
 };
 
 static_assert(sizeof(VNSimParams) == 136, "VNSimParams must match WaterSim.h");
@@ -188,16 +187,6 @@ static inline bool vn_inside_obstacle(float2 p, VNObstacle o, float margin) {
 /// cannot push it, until it leaves of its own accord -- at which point the bit
 /// clears and the window becomes solid to it like any other. Water poured onto
 /// a stack of windows runs off the one it started on and lands on the next.
-/// Whether the floor is solid at x: no switched-on drain is open there.
-static inline bool vn_floor_closed(float x, constant VNSimParams &sp) {
-    const float corner_w = kVNCornerDrainFraction * sp.domain_x;
-    const float drain = 0.5 * kVNDrainFraction * sp.domain_x;
-    const bool over_middle = (sp.drains & 2u) != 0u && abs(x - 0.5 * sp.domain_x) < drain;
-    const bool over_corner = ((sp.drains & 1u) != 0u && x < corner_w) ||
-                             ((sp.drains & 4u) != 0u && x > sp.domain_x - corner_w);
-    return !over_middle && !over_corner;
-}
-
 /// The display's edges, with the floor and the lower side walls open wherever
 /// a drain is switched on.
 static inline float2 vn_collide_walls(float2 p, constant VNSimParams &sp) {
@@ -231,61 +220,30 @@ static inline float2 vn_collide_walls(float2 p, constant VNSimParams &sp) {
 }
 
 static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
-                                const device VNObstacle *obstacles, uint ignore, float2 start) {
+                                const device VNObstacle *obstacles, uint ignore) {
     const float r = sp.radius;
     p = vn_collide_walls(p, sp);
 
-    // Windows standing still are shelves; a window being moved is solid.
-    //
-    // The water is drawn in front of every window, so a window standing still
-    // has one surface the water can meet: its top edge, which it lands on. As
-    // solid boxes, windows stopped water coming from the side as a vertical
-    // wall and water rising from below as a ceiling -- a pool deep enough to
-    // reach a window's bottom edge was cut flat along it, a straight line
-    // across the top of the water. A window being dragged is someone pushing
-    // the water with it, so while it moves it is solid all round: lowered into
-    // a pool it displaces it from the first touch of its bottom edge. The water
-    // already inside it when it starts to move is let out rather than thrown
-    // (sp.fresh), as with a window that newly appears.
     for (uint i = 0; i < sp.obstacles; ++i) {
         if (i < 32u && (ignore & (1u << i)) != 0u) continue;
         const VNObstacle o = obstacles[i];
         const float2 lo = float2(o.min_x, o.min_y);
         const float2 hi = float2(o.max_x, o.max_y);
         if (any(hi <= lo)) continue;
-        if (p.x <= lo.x - r || p.x >= hi.x + r || p.y <= lo.y - r || p.y >= hi.y + r) continue;
 
-        // Moving: solid all round, out through the nearest face that leads
-        // somewhere. A face whose way out is off the display is not a way out
-        // -- a window lowered onto water on the floor would otherwise push it
-        // into the floor, which wins, and leave it inside the window.
-        if (o.solid > 0.5) {
-            const float dl = p.x - (lo.x - r), dr = (hi.x + r) - p.x;
-            const float dt = p.y - (lo.y - r), db = (hi.y + r) - p.y;
-            const float kBlocked = 1e30;
-            const float cl = (lo.x - r < r) ? kBlocked : dl;
-            const float cr = (hi.x + r > sp.domain_x - r) ? kBlocked : dr;
-            const float ct = (lo.y - r < r) ? kBlocked : dt;
-            const float cb = (hi.y + r > sp.domain_y - r && vn_floor_closed(p.x, sp)) ? kBlocked : db;
-            const bool  boxed = min(min(cl, cr), min(ct, cb)) >= kBlocked;
-            const float el = boxed ? dl : cl, er = boxed ? dr : cr, et = boxed ? dt : ct, eb = boxed ? db : cb;
-            const float m = min(min(el, er), min(et, eb));
-            if      (m == el) p.x = lo.x - r;
-            else if (m == er) p.x = hi.x + r;
-            else if (m == et) p.y = lo.y - r;
-            else              p.y = hi.y + r;
-            continue;
-        }
+        // Signed distance to the rounded rectangle, grown by the particle radius.
+        const float2 half_size = 0.5 * (hi - lo);
+        const float  rad = min(o.corner, min(half_size.x, half_size.y));
+        const float2 d = abs(p - 0.5 * (lo + hi)) - (half_size - rad);
+        const float  sdf = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - rad;
+        if (sdf >= r) continue;
 
-        // Still: a shelf, for what arrives from above. The band reaches as
-        // deep as a falling particle can travel in one substep, so a fast drop
-        // lands rather than passing in -- but only a particle that began the
-        // substep above the edge has landed on it. One already below, in a
-        // pool that has risen past the window, is water in front of the window,
-        // and pushing it up left an empty seam along every submerged top edge.
-        const float top_band = max(0.5 * sp.h, r);
-        const bool  from_above = start.y <= lo.y + r;
-        if (from_above && p.y < lo.y + top_band && p.x > lo.x - r && p.x < hi.x + r) p.y = lo.y - r;
+        // Outward normal from the same field, by its gradient.
+        float2 n = normalize(max(d, 0.0) + 1e-4);
+        if (max(d.x, d.y) < 0.0) n = (d.x > d.y) ? float2(sign(p.x - 0.5 * (lo.x + hi.x)), 0.0)
+                                                 : float2(0.0, sign(p.y - 0.5 * (lo.y + hi.y)));
+        else n *= sign(p - 0.5 * (lo + hi));
+        p += n * (r - sdf);
     }
     // The walls again, last, so they win. A window dragged into the edge of
     // the display would otherwise push whatever it traps there straight
@@ -393,7 +351,7 @@ kernel void vn_pbf_predict(device VNParticle *P          [[buffer(0)]],
     const float speed = length(p.vel);
     if (speed > vmax) p.vel *= vmax / speed;
 
-    p.ppos = vn_collide(p.pos + p.vel * sp.dt, sp, obs, p.ignore, p.pos);
+    p.ppos = vn_collide(p.pos + p.vel * sp.dt, sp, obs, p.ignore);
     if (sp.others > 0u) {
         const float2 before = p.ppos;
         p.ppos = vn_couple(p.ppos, sp, otherA);
@@ -572,7 +530,7 @@ kernel void vn_pbf_delta(device VNParticle *P          [[buffer(0)]],
     // Collision response inside the solver loop, as Algorithm 1 line 14 does:
     // a wall met here is resolved by the remaining iterations instead of
     // leaving particles buried in it.
-    P[id].dp = vn_collide(pi + dp, sp, obs, P[id].ignore, P[id].pos) - pi;
+    P[id].dp = vn_collide(pi + dp, sp, obs, P[id].ignore) - pi;
 }
 
 kernel void vn_pbf_apply(device VNParticle *P     [[buffer(0)]],
@@ -723,7 +681,6 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
 
     float  w = 0.0;
     float2 uv = float2(0.0);
-    float  spd = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         const int by = b0.y + dy;
         if (by < 0 || by >= int(sp.bin_h)) continue;
@@ -742,13 +699,10 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
                 const float k = vn_poly6(r2, sp.h);
                 w  += k;
                 uv += k * P[j].uv0;
-                spd += k * length(P[j].vel) / max(sp.h, 1e-3);   // smoothing radii a second
             }
         }
     }
-    // .a is the density-weighted speed, for the foam: the fragment divides it
-    // back out as it does the carried coordinate.
-    field.write(float4(w / sp.rho0, uv / sp.rho0, spd / sp.rho0), gid);
+    field.write(float4(w / sp.rho0, uv / sp.rho0, 0.0), gid);
 }
 
 // Separable Gaussian, 9 taps. Smoothing the field is what turns a lumpy sum of
@@ -943,24 +897,12 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     const float  rim_at = (d - sp.iso * 1.25) / (sp.iso * 0.30);
     const float  rim = exp(-rim_at * rim_at) * 0.8;
 
-    // Foam where the water is thin and fast: the spray of a splash and the lip
-    // of a wave, not the body of a pool. Thin is what decides it -- a whole
-    // window falling is fast too, and it is a body: letting speed count for
-    // bodies washed every falling window white on its way down and again on
-    // impact. Speckled by the carried coordinate so it travels with the water
-    // rather than sitting on the screen.
-    const float  speed = f.w / max(d, 1e-4);                   // smoothing radii a second
-    const float  foam_amount = smoothstep(60.0, 160.0, speed) * (1.0 - smoothstep(0.15, 0.45, T));
-    const float  speckle = vn_fast_noise(carried * 70.0);
-    const float  foam = foam_amount * smoothstep(0.35, 0.75, speckle);
-
     float3 rgb = body + spec + rim;
-    rgb = mix(rgb, float3(0.97, 0.99, 1.0), foam * 0.55);
     rgb = saturate(rgb);
 
     // Thin water is see-through and a body of it is not, by the same
-    // absorption; the reflection and the foam are opaque wherever they are.
-    const float opacity = saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + F * 0.5 + foam * 0.6);
+    // absorption; the reflection is opaque wherever it is.
+    const float opacity = saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + F * 0.5);
     const float alpha = cover * opacity * saturate(src.a) * saturate(sp.fade);
     return float4(rgb * alpha, alpha);
 }

@@ -4299,9 +4299,6 @@ static void *gVNSimTimestamps;  // MTLCounterSampleBuffer, or NULL when unavaila
 static uint32_t gVNSimSampleSlot;
 static bool  gVNSimBroken;      // a failure that retrying would only repeat
 
-/// How many steps a window counts as moving after it last moved.
-#define kVNMovingHoldSteps 8u
-
 /// Frames of census results in flight per simulation. Each frame counts into
 /// its own entry and the CPU reads it back when that frame's command buffer
 /// completes, long before the ring comes round to it again.
@@ -4332,8 +4329,6 @@ typedef struct {
     // jumping -- a jump of more than a particle's width goes straight past it.
     VNObstacle       prev_obstacles[kVNMaxObstacles];
     uint32_t         prev_wids[kVNMaxObstacles];
-    uint32_t         prev_moving;     // obstacles treated as moving last step, a bit each
-    uint8_t          still_steps[kVNMaxObstacles];   // steps since each last moved
     uint32_t         prev_generation;
 } VNSimSlot;
 
@@ -4679,19 +4674,13 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     if (seeding || sim->prev_generation != water->generation) {
         memcpy(sim->prev_obstacles, obstacles, sizeof(obstacles));
         memcpy(sim->prev_wids, water->obstacle_wids, sizeof(sim->prev_wids));
-        memset(sim->still_steps, 255, sizeof(sim->still_steps));
-        sim->prev_moving = 0;
         sim->prev_generation = water->generation;
     }
     // An index that held nothing, or another window, last step is an obstacle
     // that has just appeared. Whatever fluid is inside it then may leave it,
     // exactly as at birth -- otherwise all of it is thrown to its edge in one
     // step. A window that was there and moved keeps its index, and pushes.
-    //
-    // So is one that has just started to move: standing still it was a shelf,
-    // with water in front of it inside its rect, and moving it is solid. See
-    // vn_collide in Water.metal.
-    uint32_t fresh = 0, moving = 0;
+    uint32_t fresh = 0;
     for (uint32_t i = 0; i < kVNMaxObstacles; i++) {
         const uint32_t wid = i < nobs ? water->obstacle_wids[i] : 0;
         if (wid != 0 && sim->prev_wids[i] != wid) {
@@ -4699,22 +4688,7 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
             sim->prev_obstacles[i] = obstacles[i];
         }
         sim->prev_wids[i] = wid;
-        if (wid != 0 && (fabsf(obstacles[i].min_x - sim->prev_obstacles[i].min_x) > 0.3f ||
-                         fabsf(obstacles[i].min_y - sim->prev_obstacles[i].min_y) > 0.3f)) moving |= 1u << i;
     }
-
-    // Moving until it has been still for a few steps. The window's position is
-    // re-read once a frame and the simulation steps once a frame, but not in
-    // lockstep, so a window mid-drag can look still for a step -- and flicking
-    // to a shelf for it lets the water in front of it into it.
-    uint32_t held = 0;
-    for (uint32_t i = 0; i < kVNMaxObstacles; i++) {
-        if ((moving >> i) & 1u) sim->still_steps[i] = 0;
-        else if (sim->still_steps[i] < 255) sim->still_steps[i]++;
-        if (i < nobs && water->obstacle_wids[i] != 0 && sim->still_steps[i] < kVNMovingHoldSteps) held |= 1u << i;
-    }
-    if (!seeding) fresh |= held & ~sim->prev_moving;
-    sim->prev_moving = held;
     sp.fresh = fresh;
 
     // Other closes' fields for the predict kernel to keep out of. Both indices
@@ -4740,7 +4714,6 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
                 swept[i].min_y = a.min_y + (o.min_y - a.min_y) * f;
                 swept[i].max_x = a.max_x + (o.max_x - a.max_x) * f;
                 swept[i].max_y = a.max_y + (o.max_y - a.max_y) * f;
-                swept[i].solid = ((held >> i) & 1u) ? 1.0f : 0.0f;
             }
         }
         vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), swept, sizeof(swept), kVNObstacleIndex);
