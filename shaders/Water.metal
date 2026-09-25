@@ -657,6 +657,13 @@ kernel void vn_pbf_census(const device VNParticle *P [[buffer(0)]],
 
 #pragma mark - Surface field
 
+/// How far from a particle's centre it counts as water, in particle spacings,
+/// whatever its neighbours; and the level of that coverage the edge is drawn
+/// at, after the blur.
+constant float kVNCoverReach = 1.2;
+constant float kVNSmoothingRatio = 3.0;   // h over the particle spacing; must match WaterSim.h
+constant float kVNCoverLevel = 0.45;
+
 /// Gathers the density and the window colour the fluid is carrying into one
 /// field, which the blurs smooth and the fragment takes its surface from.
 ///
@@ -681,6 +688,10 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
 
     float  w = 0.0;
     float2 uv = float2(0.0);
+    float  reach = 0.0;
+    // Within about one particle spacing of any particle. See the fragment's
+    // cover: this is what draws the corners the density alone leaves out.
+    const float R = kVNCoverReach * sp.h / kVNSmoothingRatio;
     for (int dy = -1; dy <= 1; ++dy) {
         const int by = b0.y + dy;
         if (by < 0 || by >= int(sp.bin_h)) continue;
@@ -699,10 +710,12 @@ kernel void vn_field_build(const device VNParticle *P   [[buffer(0)]],
                 const float k = vn_poly6(r2, sp.h);
                 w  += k;
                 uv += k * P[j].uv0;
+                const float q = saturate(1.0 - r2 / (R * R));
+                reach = max(reach, q * q);
             }
         }
     }
-    field.write(float4(w / sp.rho0, uv / sp.rho0, 0.0), gid);
+    field.write(float4(w / sp.rho0, uv / sp.rho0, reach), gid);
 }
 
 // Separable Gaussian, 9 taps. Smoothing the field is what turns a lumpy sum of
@@ -719,11 +732,19 @@ static inline void vn_field_blur(texture2d<float, access::read> src,
     if (gid.x >= sp.field_w || gid.y >= sp.field_h) return;
     const int2 hi = int2(int(sp.field_w) - 1, int(sp.field_h) - 1);
 
-    float4 sum = src.read(gid) * kVNBlur[0];
+    const float4 c = src.read(gid);
+    float4 sum = c * kVNBlur[0];
+    float  near = c.w * 0.5;
     for (int i = 1; i < 5; ++i) {
-        sum += src.read(uint2(clamp(int2(gid) + axis * i * VN_BLUR_STRIDE, int2(0), hi))) * kVNBlur[i];
-        sum += src.read(uint2(clamp(int2(gid) - axis * i * VN_BLUR_STRIDE, int2(0), hi))) * kVNBlur[i];
+        const float4 a = src.read(uint2(clamp(int2(gid) + axis * i * VN_BLUR_STRIDE, int2(0), hi)));
+        const float4 b = src.read(uint2(clamp(int2(gid) - axis * i * VN_BLUR_STRIDE, int2(0), hi)));
+        sum += (a + b) * kVNBlur[i];
+        if (i == 1) near += (a.w + b.w) * 0.25;
     }
+    // Coverage (.w) only across its neighbours: a blur as wide as the
+    // density's -- a couple of dozen pixels -- is exactly what takes a corner
+    // away, since only a quarter of it holds water there.
+    sum.w = near;
     dst.write(sum, gid);
 }
 
@@ -803,8 +824,17 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
 
     // The edge a pixel wide, anti-aliased by how fast the field changes across
     // this pixel, rather than a soft ramp that reads as a halo.
+    //
+    // Or within reach of any particle. The density falls short at a corner --
+    // a corner particle has a quarter of the neighbours one inside has -- and
+    // the top corners in particular, which spread as the window starts to
+    // fall while its bottom packs tighter: drawn by density alone, the window
+    // lost its top corners in the first frames of the close. Coverage does
+    // not care how many neighbours a particle has.
     const float edge_w = max(fwidth(d), 1e-4);
-    const float cover = smoothstep(sp.iso - edge_w, sp.iso + edge_w, d);
+    const float reach_w = max(fwidth(f.w), 1e-4);
+    const float cover = max(smoothstep(sp.iso - edge_w, sp.iso + edge_w, d),
+                            smoothstep(kVNCoverLevel - reach_w, kVNCoverLevel + reach_w, f.w));
     if (cover <= 0.001) return out;
 
     // The surface normal, from the field's gradient. z is a constant rather
@@ -818,7 +848,7 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     // How steeply the surface tilts where the field falls away. Low, so the
     // edges and ripples turn far enough to catch the reflection and the light;
     // a flat-looking surface is what made the liquid read as tinted glass.
-    const float3 n = normalize(float3(-dx, -dy, 0.2 * sp.iso));
+    const float3 n = normalize(float3(-dx, -dy, 0.3 * sp.iso));
 
     // The window coordinate this parcel of liquid is carrying, refracted
     // through that normal.
@@ -882,9 +912,15 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     const float  F = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
     const float3 R = reflect(-V, n);
     const float3 env = mix(float3(0.10, 0.16, 0.28), float3(0.78, 0.90, 1.0), smoothstep(-0.35, 0.55, -R.y));
-    // A sheet thinner than the light's way through it reflects less of the room
-    // than a body does; without this every thin sheet read as milk.
-    body = mix(body, env, F * saturate(T * 1.2));
+    //
+    // Along the surface, not across the body. Near the edge -- the band where
+    // the field falls from a body's density to the surface level -- this is
+    // the bright outline along the top of a pool. Inside a body it is only
+    // ever a splash's bumps tilting the surface sideways, and there it turned
+    // the whole of the water silver on every impact.
+    const float surface_band = 1.0 - 0.9 * smoothstep(2.0 * sp.iso, 3.5 * sp.iso, d);
+    const float reflect_w = F * surface_band;
+    body = mix(body, env, reflect_w);
 
     // Two highlights from one light up and to the left: a sharp glint and a
     // soft sheen around it.
@@ -902,7 +938,7 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
 
     // Thin water is see-through and a body of it is not, by the same
     // absorption; the reflection is opaque wherever it is.
-    const float opacity = saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + F * 0.5);
+    const float opacity = saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + reflect_w * 0.5);
     const float alpha = cover * opacity * saturate(src.a) * saturate(sp.fade);
     return float4(rgb * alpha, alpha);
 }

@@ -4655,7 +4655,7 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
         obstacles[i].min_y  = (float)((CGRectGetMinY(r) - oy) * scale);
         obstacles[i].max_x  = (float)((CGRectGetMaxX(r) - ox) * scale);
         obstacles[i].max_y  = (float)((CGRectGetMaxY(r) - oy) * scale);
-        obstacles[i].corner = (float)(12.0 * scale);
+        obstacles[i].corner = 0.0f;   // square: two windows meeting edge to edge leave no notch between them
     }
     sp.obstacles = nobs;
 
