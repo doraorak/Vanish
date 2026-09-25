@@ -859,6 +859,7 @@ typedef struct {
     CGRect           obstacles[kVNMaxObstacles];
     uint32_t         obstacle_wids[kVNMaxObstacles];
     uint32_t         obstacle_count;   // highest index in use, plus one
+    uint32_t         obstacle_serial;  // bumped whenever the obstacles change: wakes sleeping water
     float            tint;        // read from prefs here, never on the render thread
     uint32_t         drains;      // likewise; see kVNDrain*
     /// The owning clone's per-close seed -- its filter params[0], the same value
@@ -897,6 +898,7 @@ typedef struct {
     CGRect   obstacles[kVNMaxObstacles];
     uint32_t obstacle_wids[kVNMaxObstacles];
     uint32_t obstacle_count;
+    uint32_t obstacle_serial;
     float    tint;
     uint32_t drains;
     float    seed;
@@ -1076,6 +1078,7 @@ static VNWaterSnapshot vn_water_snapshot(const VNWaterSlot *s) {
     out.drains     = s->drains;
     out.seed       = s->seed;
     out.obstacle_count = s->obstacle_count <= kVNMaxObstacles ? s->obstacle_count : 0;
+    out.obstacle_serial = s->obstacle_serial;
     memcpy(out.obstacles, s->obstacles, sizeof(out.obstacles));
     memcpy(out.obstacle_wids, s->obstacle_wids, sizeof(out.obstacle_wids));
 
@@ -1137,10 +1140,14 @@ static void vn_water_refresh_obstacles(double now) {
         uint32_t count = 0;
         for (uint32_t j = 0; j < kVNMaxObstacles; j++) if (next_wids[j] != 0) count = j + 1;
 
+        const bool changed = count != s->obstacle_count ||
+                             memcmp(next, s->obstacles, sizeof(next)) != 0 ||
+                             memcmp(next_wids, s->obstacle_wids, sizeof(next_wids)) != 0;
         vn_water_write_begin(s);
         memcpy(s->obstacles, next, sizeof(next));
         memcpy(s->obstacle_wids, next_wids, sizeof(next_wids));
         s->obstacle_count = count;
+        if (changed) s->obstacle_serial++;
         vn_water_write_end(s);
 
         const double ms = (SLSCurrentRealTime() - t0) * 1000.0;
@@ -4314,6 +4321,10 @@ static bool  gVNSimBroken;      // a failure that retrying would only repeat
 /// completes, long before the ring comes round to it again.
 #define kVNCensusRing 4u
 
+/// Counts per census entry: live, moving (see kVNRestGravity), stirring (see
+/// kVNSleepSeconds).
+#define kVNCensusCounts 3u
+
 /// What one water slot has on the GPU, and what the draw path has to know
 /// about its last dispatch.
 ///
@@ -4332,6 +4343,10 @@ typedef struct {
     _Atomic uint32_t census_live;     // particles still on screen, as last read back
     _Atomic uint32_t census_moving;   // and how many of them were moving
     float    rest_scale;              // gravity's share, easing toward kVNRestGravity at rest
+    _Atomic uint32_t census_stirring; // particles faster than kVNCalmSpeed, for the sleep
+    float    calm_seconds;            // how long it has been calm enough to sleep
+    bool     sleeping;                // not stepped: the last frame of it stays on screen
+    uint32_t sleep_serial;            // the obstacles it went to sleep with
     _Atomic uint32_t census_generation;   // the close that count belongs to
     _Atomic uint32_t stepped_generation;  // the close whose water the buffers hold
     _Atomic uint64_t domain_bits;     // the stepped destination's size in pixels, two floats
@@ -4555,7 +4570,7 @@ static bool vn_particles_ensure(void *device) {
         // Shared: the CPU reads it back. A new buffer is zeroed, which is the
         // state the ring expects every entry to be in before it is counted into.
         gVNSims[i].census    = vn_msg_id_uu(device, VN_SEL("newBufferWithLength:options:"),
-                                            kVNCensusRing * 2 * sizeof(uint32_t), 0);
+                                            kVNCensusRing * kVNCensusCounts * sizeof(uint32_t), 0);
         ok = gVNSims[i].particles && gVNSims[i].field && gVNSims[i].motion && gVNSims[i].census;
     }
     if (!ok) {
@@ -4622,8 +4637,13 @@ static double   vn_d_bits(uint64_t b) { double v; memcpy(&v, &b, sizeof(v)); ret
 /// compute encoder are ordered by Metal, the default dispatch type being
 /// serial, so running simulations one after another is all the isolation
 /// they need.
+/// A close's water and the water touching it, counted together for the rest
+/// and the sleep: they ease and sleep as one, or they push at each other.
+typedef struct { uint32_t live, moving, stirring; bool counted; } VNWaterGroupCensus;
+
 static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSnapshot *water,
                                      void *const partners[2], uint32_t npartners,
+                                     VNWaterGroupCensus group,
                                      const int32_t *b, float scale, double frame_dt, double now,
                                      void *destination) {
     VNSimSlot *sim = &gVNSims[slot_index];
@@ -4655,16 +4675,29 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     // At rest, lighter: see kVNRestGravity. Eased from the last census read
     // back, which is a frame or two old -- fine for something that changes
     // over half a second.
-    if (water->generation != atomic_load_explicit(&sim->stepped_generation, memory_order_relaxed) || npartners > 0) {
+    //
+    // Judged with the water touching it, as one: two pools easing on their own
+    // schedules pushed at each other along the seam and never settled.
+    if (water->generation != atomic_load_explicit(&sim->stepped_generation, memory_order_relaxed)) {
         sim->rest_scale = 1.0f;
-    } else if (atomic_load_explicit(&sim->census_generation, memory_order_acquire) == water->generation) {
-        const uint32_t live = atomic_load_explicit(&sim->census_live, memory_order_relaxed);
-        const uint32_t moving = atomic_load_explicit(&sim->census_moving, memory_order_relaxed);
-        const float share = live > 0u ? (float)moving / (float)live : 1.0f;
+        sim->calm_seconds = 0.0f;
+    } else if (group.counted) {
+        const uint32_t live = group.live;
+        const float share = live > 0u ? (float)group.moving / (float)live : 1.0f;
         if (share < kVNRestMovingBelow) {
             sim->rest_scale = fmaxf(kVNRestGravity, sim->rest_scale - (float)frame_dt * (1.0f - kVNRestGravity) / kVNRestEaseDown);
         } else if (share > kVNRestMovingAbove) {
             sim->rest_scale = fminf(1.0f, sim->rest_scale + (float)frame_dt * (1.0f - kVNRestGravity) / kVNRestEaseUp);
+        }
+
+        // Calm enough to stop altogether: see kVNSleepSeconds.
+        const bool calm = live > 0u && sim->rest_scale <= kVNRestGravity + 1e-3f &&
+                          (float)group.stirring < kVNSleepStirringBelow * (float)live;
+        sim->calm_seconds = calm ? sim->calm_seconds + (float)frame_dt : 0.0f;
+        if (sim->calm_seconds >= kVNSleepSeconds) {
+            sim->sleeping = true;
+            sim->sleep_serial = water->obstacle_serial;
+            VN_INFO("water: slot %d at rest -- no longer stepped until something moves", slot_index);
         }
     }
     sp.gravity = kVNGravityPx * scale * sim->rest_scale;
@@ -4778,7 +4811,7 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     vn_msg_v_cuu(enc, VN_SEL("setBytes:length:atIndex:"), &sp, sizeof(sp), kVNSimParamsIndex);
 
     const uint32_t ring = sim->census_next++ % kVNCensusRing;
-    vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), sim->census, ring * 2 * sizeof(uint32_t), kVNCensusIndex);
+    vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), sim->census, ring * kVNCensusCounts * sizeof(uint32_t), kVNCensusIndex);
     vn_dispatch_1d(enc, kVNKCensus, sp.count);
 
     vn_dispatch_1d(enc, kVNKBinClear, sp.bin_w * sp.bin_h);
@@ -4786,6 +4819,10 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
     vn_dispatch_field(enc, kVNKField, sim->field, sim->motion);
     vn_dispatch_field(enc, kVNKBlurX, sim->field, gVNSimScratch);
     vn_dispatch_field(enc, kVNKBlurY, gVNSimScratch, sim->field);
+    // The motion field is smoothed the same way, as the foam's speed was when
+    // it rode in the density field itself.
+    vn_dispatch_field(enc, kVNKBlurX, sim->motion, gVNSimScratch);
+    vn_dispatch_field(enc, kVNKBlurY, gVNSimScratch, sim->motion);
 
     atomic_store_explicit(&sim->stepped_generation, water->generation, memory_order_release);
     uint32_t dx, dy;
@@ -4809,10 +4846,12 @@ static void vn_particles_read_census(int slot_index, uint32_t ring, uint32_t gen
     VNSimSlot *sim = &gVNSims[slot_index];
     uint32_t *counts = (uint32_t *)vn_msg_id(sim->census, VN_SEL("contents"));
     if (!counts) return;
-    const uint32_t live = counts[ring * 2], moving = counts[ring * 2 + 1];
-    counts[ring * 2] = counts[ring * 2 + 1] = 0;   // ready for the frame that next counts into it
+    uint32_t *c = counts + ring * kVNCensusCounts;
+    const uint32_t live = c[0], moving = c[1], stirring = c[2];
+    c[0] = c[1] = c[2] = 0;   // ready for the frame that next counts into it
     atomic_store_explicit(&sim->census_live, live, memory_order_relaxed);
     atomic_store_explicit(&sim->census_moving, moving, memory_order_relaxed);
+    atomic_store_explicit(&sim->census_stirring, stirring, memory_order_relaxed);
     atomic_store_explicit(&sim->census_generation, generation, memory_order_release);
 }
 
@@ -4854,6 +4893,25 @@ static void vn_particles_step(void *context, void *destination) {
             continue;
         }
         if (now >= atomic_load_explicit(&gVNWaterSlots[i].end, memory_order_acquire)) continue;
+
+        // Asleep: left alone, its last frame on screen, until a window
+        // changes or another close's water arrives.
+        if (sim->sleeping) {
+            bool wake = sim->sleep_serial != water[i].obstacle_serial ||
+                        atomic_load_explicit(&sim->stepped_generation, memory_order_relaxed) != water[i].generation;
+            for (int o = 0; o < kVNWaterSlots && !wake; o++) {
+                if (o == i || gVNSims[o].sleeping) continue;
+                const VNWaterSnapshot w = vn_water_snapshot(&gVNWaterSlots[o]);
+                wake = w.valid && w.start < INFINITY && now < atomic_load_explicit(&gVNWaterSlots[o].end, memory_order_acquire);
+            }
+            if (!wake) continue;
+            // Still at rest gravity: it goes back to full once the water is
+            // actually moving. Snapped to full here, the pool took its whole
+            // weight in one frame and jolted before anything had touched it.
+            sim->sleeping = false;
+            sim->calm_seconds = 0.0f;
+            VN_INFO("water: slot %d woken", i);
+        }
         due[i] = any = true;
     }
     if (!any) return;
@@ -4927,6 +4985,13 @@ static void vn_particles_step(void *context, void *destination) {
             // one's from the last. See vn_couple in Water.metal.
             void *partners[2] = { NULL, NULL };
             uint32_t npartners = 0;
+            VNWaterGroupCensus group = { 0, 0, 0, false };
+            if (atomic_load_explicit(&gVNSims[i].census_generation, memory_order_acquire) == water[i].generation) {
+                group.live     = atomic_load_explicit(&gVNSims[i].census_live, memory_order_relaxed);
+                group.moving   = atomic_load_explicit(&gVNSims[i].census_moving, memory_order_relaxed);
+                group.stirring = atomic_load_explicit(&gVNSims[i].census_stirring, memory_order_relaxed);
+                group.counted  = true;
+            }
             for (int o = 0; o < kVNWaterSlots && npartners < 2; o++) {
                 if (o == i || !water[o].valid || !(water[o].start < INFINITY)) continue;
                 if (now >= atomic_load_explicit(&gVNWaterSlots[o].end, memory_order_acquire)) continue;
@@ -4935,8 +5000,13 @@ static void vn_particles_step(void *context, void *destination) {
                 if (atomic_load_explicit(&other->origin_bits, memory_order_relaxed) != grid_origin ||
                     atomic_load_explicit(&other->domain_bits, memory_order_relaxed) != grid_domain) continue;
                 partners[npartners++] = other->field;
+                if (atomic_load_explicit(&other->census_generation, memory_order_acquire) == water[o].generation) {
+                    group.live     += atomic_load_explicit(&other->census_live, memory_order_relaxed);
+                    group.moving   += atomic_load_explicit(&other->census_moving, memory_order_relaxed);
+                    group.stirring += atomic_load_explicit(&other->census_stirring, memory_order_relaxed);
+                }
             }
-            vn_particles_encode_slot(enc, i, &water[i], partners, npartners, b, scale, frame_dt, now, destination);
+            vn_particles_encode_slot(enc, i, &water[i], partners, npartners, group, b, scale, frame_dt, now, destination);
         }
         vn_msg_v(enc, VN_SEL("endEncoding"));
 

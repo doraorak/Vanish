@@ -172,11 +172,6 @@ constant float kVNTintSeconds = 1.6;
 /// like water, in seconds from the fluid's birth.
 constant float kVNBecomeWaterSeconds = 0.35;
 
-/// The outline along the water's edge: how far inside the edge it sits, and
-/// how wide it is, in render-target pixels.
-constant float kVNOutlineInsetPx = 2.5;
-constant float kVNOutlineWidthPx = 1.5;
-
 static inline bool vn_inside_obstacle(float2 p, VNObstacle o, float margin) {
     return p.x > o.min_x - margin && p.x < o.max_x + margin &&
            p.y > o.min_y - margin && p.y < o.max_y + margin;
@@ -673,6 +668,11 @@ kernel void vn_pbf_vel_commit(device VNParticle *P     [[buffer(0)]],
 /// solve's own noise in a pool at rest is about 1 h/s.
 constant float kVNMovingSpeed = 4.0;
 
+/// Faster than this a particle is stirring, for the sleep (kVNSleepSeconds in
+/// WaterSim.h): a stricter test than moving, since a sleeping pool no longer
+/// levels itself.
+constant float kVNCalmSpeed = 1.0;
+
 /// How much of the fluid is still on screen. The CPU reads the count back when
 /// the frame's command buffer completes, and a close whose water has all
 /// drained ends there instead of running out its duration. The slot is zeroed
@@ -688,7 +688,9 @@ kernel void vn_pbf_census(const device VNParticle *P [[buffer(0)]],
     if (id >= sp.count) return;
     if ((P[id].ignore & VN_DRAINED) != 0u) return;
     atomic_fetch_add_explicit(&counts[0], 1u, memory_order_relaxed);
-    if (length(P[id].vel) > kVNMovingSpeed * sp.h) atomic_fetch_add_explicit(&counts[1], 1u, memory_order_relaxed);
+    const float v = length(P[id].vel);
+    if (v > kVNMovingSpeed * sp.h) atomic_fetch_add_explicit(&counts[1], 1u, memory_order_relaxed);
+    if (v > kVNCalmSpeed * sp.h)   atomic_fetch_add_explicit(&counts[2], 1u, memory_order_relaxed);
 }
 
 #pragma mark - Surface field
@@ -891,7 +893,7 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     // How steeply the surface tilts where the field falls away. Low, so the
     // edges and ripples turn far enough to catch the reflection and the light;
     // a flat-looking surface is what made the liquid read as tinted glass.
-    const float3 n = normalize(float3(-dx, -dy, 0.3 * sp.iso));
+    const float3 n = normalize(float3(-dx, -dy, 0.2 * sp.iso));
 
     // The window coordinate this parcel of liquid is carrying, refracted
     // through that normal.
@@ -902,11 +904,11 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     // shrunken copy of the window inside the liquid. Mapping it through the
     // window's sub-rect is the whole correction.
     //
-    // The refraction is small, and only ever changes the colour: the water's
-    // opacity is the carried pixel's own. Refracted by a large share of the
-    // window, a sample near a corner landed in the window's transparent
-    // rounded corner and took the water's opacity with it -- the corners of
-    // the window went missing as soon as it started to move.
+    // The refraction only ever changes the colour: the water's opacity is the
+    // carried pixel's own. Taking it from the refracted sample, a sample near a
+    // corner landed in the window's transparent rounded corner and took the
+    // water's opacity with it -- the corners of the window went missing as
+    // soon as it started to move.
     //
     // Clamped a texel inside the window, not to its edge: sampled right on the
     // edge, the filter takes half of the drop shadow's row beside it, and the
@@ -914,7 +916,7 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     const float2 carried = f.yz / max(d, 1e-4);
     const float2 inset = 1.0 / max(wsz * float2(tex2D.get_width(), tex2D.get_height()), float2(1.0));
     const float4 held = tex2D.sample(samp, w0 + clamp(carried, inset, 1.0 - inset) * wsz);
-    const float4 bent = tex2D.sample(samp, w0 + clamp(carried + n.xy * 0.04, inset, 1.0 - inset) * wsz);
+    const float4 bent = tex2D.sample(samp, w0 + clamp(carried + n.xy * 0.12, inset, 1.0 - inset) * wsz);
     const float4 src = bent.a > 0.5 * held.a ? bent : held;
 
     // Shaded in straight colour and premultiplied once, at the end; the window's
@@ -965,41 +967,46 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     const float3 filtered = window_rgb * mix(float3(1.0), through, 0.6 * (1.0 - young));
     float3 body = mix(filtered, water_rgb, settled * 0.9);
 
+    // Reflection, by Schlick's fresnel with F0 a little above water's 0.02: the face of
+    // a flat pool reflects almost nothing, its tilted edges almost everything.
+    // What it reflects is a room: bright above, dim below -- which is most of
+    // what makes water read as wet rather than as tinted glass.
+    const float3 V = float3(0.0, 0.0, 1.0);
+    const float  ndv = saturate(dot(n, V));
+    const float  F = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+    const float3 R = reflect(-V, n);
+    const float3 env = mix(float3(0.10, 0.16, 0.28), float3(0.78, 0.90, 1.0), smoothstep(-0.35, 0.55, -R.y));
+    // A sheet thinner than the light's way through it reflects less of the room
+    // than a body does; without this every thin sheet read as milk.
+    body = mix(body, env, F * saturate(T * 1.2));
+
+    // Two highlights from one light up and to the left: a sharp glint and a
+    // soft sheen around it.
+    const float3 L = normalize(float3(-0.4, -0.7, 0.6));
+    const float  ndh = saturate(dot(n, normalize(L + V)));
+    const float  spec = pow(ndh, 90.0) * 1.8 + pow(ndh, 28.0) * 0.16;
+
     // The meniscus: a thin bright line just inside the edge, where the surface
     // curves over and catches the light.
-    //
-    // A line a few pixels wide, measured from the edge in pixels -- how far
-    // inside it this pixel is, by how fast the field changes across a pixel.
-    // Drawn where the density reads a band of values instead, it covered the
-    // whole of any sheet of water spread thin enough to sit in that band: a
-    // pool piled against a wall went silver-white across its face. Drawn from
-    // the first frame, so the window has its outline as it becomes water.
-    const float inside_px = max((d - sp.iso) / edge_w, (f.w - kVNCoverLevel) / reach_w);
-    const float rim_at = (inside_px - kVNOutlineInsetPx) / kVNOutlineWidthPx;
-    const float rim = exp(-rim_at * rim_at) * 0.8;
+    const float  rim_at = (d - sp.iso * 1.25) / (sp.iso * 0.30);
+    const float  rim = exp(-rim_at * rim_at) * 0.8;
 
-    // No reflection and no highlights: on water being stirred they are across
-    // the whole of it, and read as white. The outline is the one light the
-    // surface keeps.
     // Foam where the water is thin and fast: the spray of a splash and the lip
-    // of a wave, not the body of a pool. Thin is what decides it -- a whole
-    // window falling is fast too, and it is a body: letting speed count for
-    // bodies washed every falling window white on its way down and again on
-    // impact. Speckled by the carried coordinate so it travels with the water
-    // rather than sitting on the screen.
+    // of a wave, not the body of a pool. Speckled by the carried coordinate so
+    // it travels with the water rather than sitting on the screen.
     const float2 mo = motionTex.sample(vn_field_sampler, fuv).xy;
     const float  speed = mo.y / max(mo.x, 1e-6);               // smoothing radii a second
-    const float  foam_amount = smoothstep(60.0, 160.0, speed) * (1.0 - smoothstep(0.15, 0.45, T));
+    const float  foam_amount = smoothstep(40.0, 140.0, speed) * (1.0 - smoothstep(0.6, 1.6, T));
     const float  speckle = vn_fast_noise(carried * 70.0);
     const float  foam = foam_amount * smoothstep(0.35, 0.75, speckle);
 
-    float3 rgb = body + rim;
+    float3 rgb = body + spec + rim;
     rgb = mix(rgb, float3(0.97, 0.99, 1.0), foam * 0.55);
     rgb = saturate(rgb);
 
     // Thin water is see-through and a body of it is not, by the same
-    // absorption.
-    const float opacity = mix(saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + foam * 0.6), 1.0, young);
+    // absorption; the reflection and the foam are opaque wherever they are.
+    const float opacity = mix(saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + F * 0.5 + foam * 0.6), 1.0, young);
     const float alpha = cover * opacity * saturate(held.a) * saturate(sp.fade);
     return float4(rgb * alpha, alpha);
 }
