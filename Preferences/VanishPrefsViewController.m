@@ -108,6 +108,10 @@ static const VNAnimationMeta kAnimations[] = {
     NSTextField *_drainLTitle, *_drainMTitle, *_drainRTitle;
     NSSwitch *_drainLSwitch, *_drainMSwitch, *_drainRSwitch;
     NSBox *_sepDrainM, *_sepDrainR;
+    NSBox *_sepKeep;
+    VNPFlippedView *_rowKeep;
+    NSTextField *_keepTitle;
+    NSSwitch *_keepSwitch;
     NSSlider *_durationSlider;
     NSBox *_sep4;
     
@@ -374,6 +378,15 @@ static const VNAnimationMeta kAnimations[] = {
     [_rowDrainR addSubview:_drainRSwitch];
     [_specificCard addSubview:_rowDrainR];
 
+    _sepKeep = [self createSeparator];   [_specificCard addSubview:_sepKeep];
+    _rowKeep = [[VNPFlippedView alloc] init];
+    _keepTitle = [self createLabel:@"Keep previous water"];
+    [_rowKeep addSubview:_keepTitle];
+    _keepSwitch = [self createSwitch];
+    _keepSwitch.target = self; _keepSwitch.action = @selector(keepPreviousToggled:);
+    [_rowKeep addSubview:_keepSwitch];
+    [_specificCard addSubview:_rowKeep];
+
     _refreshRateSlider = [self createSliderWithMin:0.0 max:144.0 defaultVal:120.0];
     _refreshRateSlider.target = self;
     _refreshRateSlider.action = @selector(refreshRateChanged:);
@@ -465,13 +478,14 @@ static const VNAnimationMeta kAnimations[] = {
     _rowWater.hidden       = !waterShown;
     _sepDrainL.hidden = _sepDrainM.hidden = _sepDrainR.hidden = !waterShown;
     _rowDrainL.hidden = _rowDrainM.hidden = _rowDrainR.hidden = !waterShown;
+    _sepKeep.hidden = _rowKeep.hidden = !waterShown;
 
     if (waterShown) {
         _specificHeader.frame = NSMakeRect(8, y, w - 16, 14);
         y += 18.0;
 
         const CGFloat rowH = 36.0, tintH = 52.0;
-        const CGFloat specificH = tintH + 3.0 * (1.0 + rowH);
+        const CGFloat specificH = tintH + 4.0 * (1.0 + rowH);
         _specificCard.frame = NSMakeRect(0, y, w, specificH);
 
         CGFloat wtLabelW = 42.0;
@@ -481,12 +495,12 @@ static const VNAnimationMeta kAnimations[] = {
         _waterSubtitle.frame = NSMakeRect(12, 20, w - 24, 12);
         _waterSlider.frame = NSMakeRect(12, 33, w - 24, 15);
 
-        VNPFlippedView *rows[3] = { _rowDrainL, _rowDrainM, _rowDrainR };
-        NSBox *seps[3] = { _sepDrainL, _sepDrainM, _sepDrainR };
-        NSTextField *titles[3] = { _drainLTitle, _drainMTitle, _drainRTitle };
-        NSSwitch *switches[3] = { _drainLSwitch, _drainMSwitch, _drainRSwitch };
+        VNPFlippedView *rows[4] = { _rowDrainL, _rowDrainM, _rowDrainR, _rowKeep };
+        NSBox *seps[4] = { _sepDrainL, _sepDrainM, _sepDrainR, _sepKeep };
+        NSTextField *titles[4] = { _drainLTitle, _drainMTitle, _drainRTitle, _keepTitle };
+        NSSwitch *switches[4] = { _drainLSwitch, _drainMSwitch, _drainRSwitch, _keepSwitch };
         CGFloat ry = tintH;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             seps[i].frame = NSMakeRect(12, ry, w - 24, 1);
             rows[i].frame = NSMakeRect(0, ry + 1, w, rowH);
             switches[i].frame = NSMakeRect(w - 12 - 38, (rowH - 22.0) / 2.0, 38, 22);
@@ -652,6 +666,13 @@ static const VNAnimationMeta kAnimations[] = {
     _drainLSwitch.state = [self readBool:@"water_drain_left"   defaultValue:YES] ? NSControlStateValueOn : NSControlStateValueOff;
     _drainMSwitch.state = [self readBool:@"water_drain_middle" defaultValue:YES] ? NSControlStateValueOn : NSControlStateValueOff;
     _drainRSwitch.state = [self readBool:@"water_drain_right"  defaultValue:YES] ? NSControlStateValueOn : NSControlStateValueOff;
+    _keepSwitch.state   = [self readBool:@"water_keep_previous" defaultValue:YES] ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)keepPreviousToggled:(NSSwitch *)sender {
+    // Through a BOOL local, as in drainToggled: -- `==` boxes as an integer.
+    BOOL val = (sender.state == NSControlStateValueOn);
+    [self writePrefValue:@(val) forKey:@"water_keep_previous"];
 }
 
 - (void)drainToggled:(NSSwitch *)sender {

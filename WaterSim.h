@@ -182,6 +182,9 @@ typedef struct {
     /// Obstacles that appeared this step, one bit per index. A particle inside
     /// one is let out of it rather than thrown to its edge.
     uint32_t fresh;
+    /// How many other closes' density fields are bound for this one to keep
+    /// out of, 0..2. See vn_couple in Water.metal.
+    uint32_t others;
 } VNSimParams;
 
 /// Must match VNObstacle in Water.metal.
@@ -194,7 +197,7 @@ typedef struct {
 #define kVNMaxObstacles 24
 
 _Static_assert(sizeof(VNParticle) == 48, "VNParticle must match Water.metal");
-_Static_assert(sizeof(VNSimParams) == 132, "VNSimParams must match Water.metal");
+_Static_assert(sizeof(VNSimParams) == 136, "VNSimParams must match Water.metal");
 _Static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match Water.metal");
 
 /// The 2D kernels, in the same form the shader uses them. 2D, not 3D: this

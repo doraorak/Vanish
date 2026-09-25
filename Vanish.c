@@ -317,6 +317,7 @@ typedef struct {
     bool  shadows;
     float waterTint;      // 0..1, water only; see VNSimParams::tint
     uint32_t waterDrains; // water only; see kVNDrain*
+    bool waterKeepPrevious; // water only: earlier closes' water stays for this one to land on
     float refreshRate;
     float duration;
     float animDurations[kVNAnimationKeyCount];
@@ -334,6 +335,7 @@ static void vn_reload_prefs_locked(void) {
     gPrefs.shadows = true;
     gPrefs.waterTint = kVNWaterTintDefault;
     gPrefs.waterDrains = kVNDrainAll;
+    gPrefs.waterKeepPrevious = true;
     gPrefs.refreshRate = 120.0f;
     gPrefs.duration = 0.25f;
     for (size_t i = 0; i < kVNAnimationKeyCount; i++) {
@@ -396,6 +398,17 @@ static void vn_reload_prefs_locked(void) {
                             if (got) {
                                 if (on) gPrefs.waterDrains |= kDrainKeys[di].bit;
                                 else    gPrefs.waterDrains &= ~kDrainKeys[di].bit;
+                            }
+                        }
+
+                        {
+                            // Boolean OR number, as the drain switches are.
+                            CFTypeRef v = CFDictionaryGetValue(dict, CFSTR("water_keep_previous"));
+                            if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
+                                gPrefs.waterKeepPrevious = CFBooleanGetValue((CFBooleanRef)v);
+                            } else if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+                                int n = 0;
+                                if (CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &n)) gPrefs.waterKeepPrevious = (n != 0);
                             }
                         }
 
@@ -861,6 +874,7 @@ typedef struct {
 
     // Close path and animation tick only, never read by the compositor.
     uint32_t         closing_wid;
+    bool             keep_previous;   // the preference, as it was when this close began
     uint32_t         overlapped[kVNMaxObstacles];   // skipped for overlapping it at the start; 0-terminated
     uint64_t         scene_hash;  // of the windows on screen when obstacles were last collected
     uint32_t         refreshes;   // how many times, and the slowest, reported when it retires
@@ -934,7 +948,8 @@ static VNWaterSlot *vn_water_slot_for_clone(CGXWindow *clone) {
 /// answers "none of them" -- our own clone covers the lot.
 static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_pt,
                              const CGRect *obstacles, const uint32_t *obstacle_wids, uint32_t obstacle_count,
-                             const uint32_t *overlapped, uint32_t closing_wid, float tint, float seed, uint32_t drains) {
+                             const uint32_t *overlapped, uint32_t closing_wid, float tint, float seed, uint32_t drains,
+                             bool keep_previous) {
     // A free slot, or else the oldest close's -- which by now has been told to
     // fade by every close since, and whose clone draws nothing once its slot
     // belongs to someone else.
@@ -969,6 +984,7 @@ static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_
     }
     vn_water_write_end(s);
     s->closing_wid = closing_wid;
+    s->keep_previous = keep_previous;
     memset(s->overlapped, 0, sizeof(s->overlapped));
     if (overlapped) memcpy(s->overlapped, overlapped, sizeof(s->overlapped));
     s->scene_hash  = 0;
@@ -985,9 +1001,13 @@ static void vn_water_publish(CGXWindow *clone, CGRect window_pt, CGRect display_
             display_pt.origin.x, display_pt.origin.y, display_pt.size.width, display_pt.size.height);
 }
 
-/// The close's animation has started. Every other water close still running
-/// fades out from here: one body of water at a time, rather than two fluids
-/// that cannot touch each other passing through one another.
+/// The close's animation has started.
+///
+/// With "Keep previous water" on, earlier closes' water stays for this one to
+/// land on and push against (see vn_couple in Water.metal) -- except that once
+/// this close has taken the last free slot, the oldest one fades, so the next
+/// close finds a slot instead of taking one over outright. With it off, every
+/// other water close fades out from here: one body of water at a time.
 static void vn_water_start(CGXWindow *clone, double start, double duration) {
     VNWaterSlot *s = vn_water_slot_for_clone(clone);
     if (!s) return;
@@ -996,11 +1016,22 @@ static void vn_water_start(CGXWindow *clone, double start, double duration) {
     vn_water_write_end(s);
     atomic_store_explicit(&s->end, start + (duration > 0.0 ? duration : 1.0), memory_order_release);
 
+    if (!s->keep_previous) {
+        for (int i = 0; i < kVNWaterSlots; i++) {
+            VNWaterSlot *o = &gVNWaterSlots[i];
+            if (o == s || o->generation == 0) continue;
+            vn_water_end_by(o, start + kVNWaterFadeSeconds);
+        }
+        return;
+    }
+
+    VNWaterSlot *oldest = NULL;
     for (int i = 0; i < kVNWaterSlots; i++) {
         VNWaterSlot *o = &gVNWaterSlots[i];
-        if (o == s || o->generation == 0) continue;
-        vn_water_end_by(o, start + kVNWaterFadeSeconds);
+        if (o->generation == 0) return;              // a slot is still free
+        if (o != s && (!oldest || o->generation < oldest->generation)) oldest = o;
     }
+    if (oldest) vn_water_end_by(oldest, start + kVNWaterFadeSeconds);
 }
 
 /// When a water clone's water has to be gone. The animation tick finishes a
@@ -1912,7 +1943,8 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             // were collected above, before this clone went on screen.
             vn_water_publish(clone, content.size.width >= 1.0 ? content : frame,
                              water_screen, water_obstacles, water_obstacle_wids, water_obstacle_count,
-                             water_overlapped, orig_wid, prefs.waterTint, params[0], prefs.waterDrains);
+                             water_overlapped, orig_wid, prefs.waterTint, params[0], prefs.waterDrains,
+                             prefs.waterKeepPrevious);
         }
         vn_shader_set_phase(clone, 0.0);
     } else if (vn_resolved_set_mesh_warp && anim->kind == VN_ANIM_MESH && anim->mesh.fill) {
@@ -4554,6 +4586,7 @@ static double   vn_d_bits(uint64_t b) { double v; memcpy(&v, &b, sizeof(v)); ret
 /// serial, so running simulations one after another is all the isolation
 /// they need.
 static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSnapshot *water,
+                                     void *const partners[2], uint32_t npartners,
                                      const int32_t *b, float scale, double frame_dt, double now,
                                      void *destination) {
     VNSimSlot *sim = &gVNSims[slot_index];
@@ -4638,6 +4671,13 @@ static void vn_particles_encode_slot(void *enc, int slot_index, const VNWaterSna
         sim->prev_wids[i] = wid;
     }
     sp.fresh = fresh;
+
+    // Other closes' fields for the predict kernel to keep out of. Both indices
+    // are bound whatever the count -- the kernel declares them -- and the
+    // field and blur dispatches below bind their own over them.
+    sp.others = npartners;
+    vn_msg_v_pu(enc, VN_SEL("setTexture:atIndex:"), npartners > 0 ? partners[0] : gVNSimScratch, 0);
+    vn_msg_v_pu(enc, VN_SEL("setTexture:atIndex:"), npartners > 1 ? partners[1] : gVNSimScratch, 1);
 
     // Algorithm 1, substepped.
     for (uint32_t sub = 0; sub < kVNSubSteps; sub++) {
@@ -4814,12 +4854,35 @@ static void vn_particles_step(void *context, void *destination) {
         vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), gVNSimBins, 0, kVNBinBufferIndex);
         vn_msg_v_puu(enc, VN_SEL("setBuffer:offset:atIndex:"), gVNSimNeighbours, 0, kVNNeighbourIndex);
 
+        // This destination's grid, packed as the slots record theirs.
+        const float gdx = (float)(w_pt * scale), gdy = (float)(h_pt * scale);
+        uint32_t gdxb, gdyb;
+        memcpy(&gdxb, &gdx, sizeof(gdxb));
+        memcpy(&gdyb, &gdy, sizeof(gdyb));
+        const uint64_t grid_domain = ((uint64_t)gdyb << 32) | gdxb;
+        const uint64_t grid_origin = ((uint64_t)(uint32_t)b[1] << 32) | (uint32_t)b[0];
+
         uint32_t rings[kVNWaterSlots], gens[kVNWaterSlots];
         for (int i = 0; i < kVNWaterSlots; i++) {
             if (!due[i]) continue;
             rings[i] = gVNSims[i].census_next % kVNCensusRing;
             gens[i]  = water[i].generation;
-            vn_particles_encode_slot(enc, i, &water[i], b, scale, frame_dt, now, destination);
+            // The other closes' water, for this one to keep out of: any other
+            // slot whose field holds its own current water, stepped in this
+            // same pixel grid -- an earlier slot's from this frame, a later
+            // one's from the last. See vn_couple in Water.metal.
+            void *partners[2] = { NULL, NULL };
+            uint32_t npartners = 0;
+            for (int o = 0; o < kVNWaterSlots && npartners < 2; o++) {
+                if (o == i || !water[o].valid || !(water[o].start < INFINITY)) continue;
+                if (now >= atomic_load_explicit(&gVNWaterSlots[o].end, memory_order_acquire)) continue;
+                VNSimSlot *other = &gVNSims[o];
+                if (atomic_load_explicit(&other->stepped_generation, memory_order_acquire) != water[o].generation) continue;
+                if (atomic_load_explicit(&other->origin_bits, memory_order_relaxed) != grid_origin ||
+                    atomic_load_explicit(&other->domain_bits, memory_order_relaxed) != grid_domain) continue;
+                partners[npartners++] = other->field;
+            }
+            vn_particles_encode_slot(enc, i, &water[i], partners, npartners, b, scale, frame_dt, now, destination);
         }
         vn_msg_v(enc, VN_SEL("endEncoding"));
 

@@ -550,6 +550,18 @@
 			<key>label</key>
 			<string>Drain: right corner</string>
 		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>key</key>
+			<string>water_keep_previous</string>
+			<key>label</key>
+			<string>Keep previous water</string>
+		</dict>
 	<dict>
 			<key>PostNotification</key>
 			<string>com.doraorak.vanish/prefsChanged</string>

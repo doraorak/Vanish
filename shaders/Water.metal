@@ -73,6 +73,7 @@ struct VNSimParams {
     uint  drains;                    // bit 0 left corner, 1 middle, 2 right corner
     float fade;                      // 1 while the water is shown, down to 0 as it goes
     uint  fresh;                     // obstacles that appeared this step, a bit per index
+    uint  others;                    // other closes' fields bound for coupling, 0..2
 };
 
 /// Must match VNParticle in Vanish.c. `uv0` is where in the window this parcel
@@ -94,7 +95,7 @@ struct VNObstacle {
     float _pad;
 };
 
-static_assert(sizeof(VNSimParams) == 132, "VNSimParams must match WaterSim.h");
+static_assert(sizeof(VNSimParams) == 136, "VNSimParams must match WaterSim.h");
 static_assert(sizeof(VNParticle) == 48, "VNParticle must match WaterSim.h");
 static_assert(sizeof(VNObstacle) == 24, "VNObstacle must match WaterSim.h");
 
@@ -250,11 +251,47 @@ static inline float2 vn_collide(float2 p, constant VNSimParams &sp,
     return vn_collide_walls(p, sp);
 }
 
+constexpr sampler vn_field_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
+
+/// Where another close's water is dense enough to count as water, relative to
+/// its own rest density, and how hard its surface pushes back.
+constant float kVNCoupleLevel    = 0.15;
+constant float kVNCoupleStrength = 2.0;
+
+/// Keeps a particle out of another close's water.
+///
+/// The closes are separate simulations -- separate particles, separate
+/// neighbour searches -- so they cannot feel each other as fluid. Each does
+/// have a density field, though, built every frame for drawing, and that is
+/// enough for the other to treat it as a soft, moving obstacle: where the
+/// other water is denser than kVNCoupleLevel, the particle is pushed down its
+/// density gradient, further the deeper it is, never more than half a
+/// smoothing radius per substep. Two bodies of water bump and pile against
+/// each other; they do not mix.
+static inline float2 vn_couple(float2 p, constant VNSimParams &sp, texture2d<float> other) {
+    const float2 domain = float2(sp.domain_x, sp.domain_y);
+    const float2 uv = p / domain;
+    const float  d = other.sample(vn_field_sampler, uv).x;
+    if (d <= kVNCoupleLevel) return p;
+
+    const float2 t = 1.0 / float2(float(sp.field_w), float(sp.field_h));
+    const float2 g = float2(other.sample(vn_field_sampler, uv + float2(t.x, 0.0)).x -
+                            other.sample(vn_field_sampler, uv - float2(t.x, 0.0)).x,
+                            other.sample(vn_field_sampler, uv + float2(0.0, t.y)).x -
+                            other.sample(vn_field_sampler, uv - float2(0.0, t.y)).x);
+    // Flat inside a body of water, where the gradient says nothing: straight up
+    // is the way out of a pool.
+    const float2 out = length(g) > 1e-4 ? -normalize(g) : float2(0.0, -1.0);
+    return p + out * min(kVNCoupleStrength * (d - kVNCoupleLevel) * sp.h, 0.5 * sp.h);
+}
+
 #pragma mark - Solver
 
 kernel void vn_pbf_predict(device VNParticle *P          [[buffer(0)]],
                            constant VNSimParams &sp      [[buffer(2)]],
                            const device VNObstacle *obs  [[buffer(3)]],
+                           texture2d<float> otherA       [[texture(0)]],
+                           texture2d<float> otherB       [[texture(1)]],
                            uint id [[thread_position_in_grid]]) {
     if (id >= sp.count) return;
     VNParticle p = P[id];
@@ -309,6 +346,11 @@ kernel void vn_pbf_predict(device VNParticle *P          [[buffer(0)]],
     if (speed > vmax) p.vel *= vmax / speed;
 
     p.ppos = vn_collide(p.pos + p.vel * sp.dt, sp, obs, p.ignore);
+    if (sp.others > 0u) {
+        p.ppos = vn_couple(p.ppos, sp, otherA);
+        if (sp.others > 1u) p.ppos = vn_couple(p.ppos, sp, otherB);
+        p.ppos = vn_collide_walls(p.ppos, sp);   // the walls still win
+    }
 
     // Once it is clear of an obstacle it started in, that obstacle is solid to
     // it again. The margin is generous so a particle grazing the edge does not
@@ -647,7 +689,6 @@ kernel void vn_field_blur_y(texture2d<float, access::read> src  [[texture(0)]],
 
 #pragma mark - Fragment
 
-constexpr sampler vn_field_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
 
 /// Shades the isosurface of the smoothed field.
 ///
