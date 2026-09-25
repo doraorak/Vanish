@@ -267,9 +267,7 @@ static VNUpdateCAVisibilityFn       vn_resolved_update_ca_visibility;
 static VNUnobscuredContentShapeFn        vn_resolved_unobscured_content_shape;
 static VNGetRegionBoundsFn               vn_resolved_get_region_bounds;
 static void                            **vn_resolved_session_control_ref;
-static VNCopyScreenShapeFn               vn_resolved_copy_screen_frame_shape;
 static VNCopyScreenShapeFn               vn_resolved_copy_screen_content_shape;
-static int (*vn_region_union)(void *, void *, void **);
 static int (*vn_region_diff)(void *, void *, void **);
 static VNClearShadowDensityFn            vn_resolved_clear_shadow_density;
 static VNWSWindowSetShadowEnableFn        vn_resolved_window_set_shadow_enable;
@@ -2955,9 +2953,9 @@ static bool vn_water_ignores_as_cover(CGXWindow *w, uint32_t closing_wid,
 }
 
 /// The bounds of the part of `w` you can see, counting only application
-/// windows as what covers it. The same computation as
-/// CGXCreateScreenUnobscuredContentShapeForWindow -- content shape minus the
-/// frame shapes of every window above -- over the same window stack, with
+/// windows as what covers it: its content shape minus the content shapes of
+/// the windows above it in the same window stack SkyLight's own
+/// CGXCreateScreenUnobscuredContentShapeForWindow walks, with
 /// vn_water_ignores_as_cover skipped. See kVNSymSessionControlRef. `tracked`
 /// is the tracking table's window ids.
 ///
@@ -2966,8 +2964,8 @@ static bool vn_water_ignores_as_cover(CGXWindow *w, uint32_t closing_wid,
 /// answer.
 static int vn_water_visible_bounds(CGXWindow *w, uint32_t closing_wid,
                                    const uint32_t *tracked, int ntracked, CGRect *out) {
-    if (!vn_resolved_session_control_ref || !vn_resolved_copy_screen_frame_shape ||
-        !vn_resolved_copy_screen_content_shape || !vn_region_union || !vn_region_diff ||
+    if (!vn_resolved_session_control_ref ||
+        !vn_resolved_copy_screen_content_shape || !vn_region_diff ||
         !vn_resolved_get_region_bounds) return -1;
 
     const char *session = *(const char **)vn_resolved_session_control_ref;
@@ -2992,11 +2990,16 @@ static int vn_water_visible_bounds(CGXWindow *w, uint32_t closing_wid,
     for (int32_t i = 0; i < index; i++) {
         CGXWindow *above = stack->items[i];
         if (!above || vn_water_ignores_as_cover(above, closing_wid, tracked, ntracked)) continue;
-        void *frame = vn_resolved_copy_screen_frame_shape(above, 0);
-        if (!frame) continue;
+        // By what it draws, not its frame. The frame carries the drop shadow,
+        // and a window's shadow does not hide the window beside it from the
+        // water: subtracted, it narrowed that window's visible part by the
+        // shadow's width on each side, leaving a gap between the two windows'
+        // collision boxes that water ran down.
+        void *cover = vn_resolved_copy_screen_content_shape(above, 0);
+        if (!cover) continue;
         void *rest = NULL;
-        vn_region_diff(visible, frame, &rest);
-        CFRelease(frame);
+        vn_region_diff(visible, cover, &rest);
+        CFRelease(cover);
         CFRelease(visible);
         visible = rest;
         if (!visible) return 0;
@@ -5347,13 +5350,11 @@ static void vanish_init_payload(void) {
     // A data symbol: strip the function-pointer signature vn_skylight_symbol puts on.
     vn_resolved_session_control_ref = (void **)ptrauth_strip(vn_skylight_symbol(kVNSymSessionControlRef),
                                                              ptrauth_key_function_pointer);
-    vn_resolved_copy_screen_frame_shape   = (VNCopyScreenShapeFn)vn_skylight_symbol(kVNSymCopyScreenFrameShape);
     vn_resolved_copy_screen_content_shape = (VNCopyScreenShapeFn)vn_skylight_symbol(kVNSymCopyScreenContentShape);
-    vn_region_union = (int (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "CGSUnionRegion");
     vn_region_diff  = (int (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "CGSDiffRegion");
-    VN_INFO("water: window stack %p, frame shape %p, content shape %p, union %p, diff %p",
-            (void *)vn_resolved_session_control_ref, (void *)vn_resolved_copy_screen_frame_shape,
-            (void *)vn_resolved_copy_screen_content_shape, (void *)vn_region_union, (void *)vn_region_diff);
+    VN_INFO("water: window stack %p, content shape %p, diff %p",
+            (void *)vn_resolved_session_control_ref,
+            (void *)vn_resolved_copy_screen_content_shape, (void *)vn_region_diff);
     vn_resolved_get_region_bounds = (VNGetRegionBoundsFn)dlsym(RTLD_DEFAULT, "CGSGetRegionBounds");
     VN_INFO("water: unobscured_content_shape=%p get_region_bounds=%p",
             (void *)vn_resolved_unobscured_content_shape, (void *)vn_resolved_get_region_bounds);

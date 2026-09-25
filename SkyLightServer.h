@@ -695,9 +695,11 @@ typedef void   (*VNFreezeContentFn)(CGXWindow *);
 ///     window_array_offset_relative_to(stack, NULL, 1) = 0,
 ///     window_array_offset_relative_to(stack, win, 1)  = its index.
 ///
-/// Both shape functions return a region the caller owns (CFRelease).
+/// Vanish subtracts the windows above by their CONTENT shape instead: a
+/// frame carries the drop shadow, and a shadow does not hide the window beside
+/// it from the water. CGXCopyScreenContentShapeForWindow returns a region the
+/// caller owns (CFRelease).
 #define kVNSymSessionControlRef       "___sessionControlRef"
-#define kVNSymCopyScreenFrameShape    "_CGXCopyScreenFrameShapeForWindow"
 #define kVNSymCopyScreenContentShape  "_CGXCopyScreenContentShapeForWindow"
 #define kVNSessionWindowsOuterOffset  0x20
 #define kVNSessionWindowsInnerOffset  0x90

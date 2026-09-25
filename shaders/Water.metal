@@ -167,6 +167,10 @@ constant float kVNCornerDrainFraction = 0.075;
 /// birth. The length of the close it used to be measured against.
 constant float kVNTintSeconds = 1.6;
 
+/// How long a window takes to stop looking like a window and start looking
+/// like water, in seconds from the fluid's birth.
+constant float kVNBecomeWaterSeconds = 0.35;
+
 static inline bool vn_inside_obstacle(float2 p, VNObstacle o, float margin) {
     return p.x > o.min_x - margin && p.x < o.max_x + margin &&
            p.y > o.min_y - margin && p.y < o.max_y + margin;
@@ -858,13 +862,32 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     // the other is what put a thick dark border of drop shadow around a
     // shrunken copy of the window inside the liquid. Mapping it through the
     // window's sub-rect is the whole correction.
+    //
+    // The refraction is small, and only ever changes the colour: the water's
+    // opacity is the carried pixel's own. Refracted by a large share of the
+    // window, a sample near a corner landed in the window's transparent
+    // rounded corner and took the water's opacity with it -- the corners of
+    // the window went missing as soon as it started to move.
+    //
+    // Clamped a texel inside the window, not to its edge: sampled right on the
+    // edge, the filter takes half of the drop shadow's row beside it, and the
+    // water along the window's border came out as a grey, half-transparent band.
     const float2 carried = f.yz / max(d, 1e-4);
-    const float2 refracted = w0 + clamp(carried + n.xy * 0.12, 0.0, 1.0) * wsz;
-    const float4 src = tex2D.sample(samp, refracted);
+    const float2 inset = 1.0 / max(wsz * float2(tex2D.get_width(), tex2D.get_height()), float2(1.0));
+    const float4 held = tex2D.sample(samp, w0 + clamp(carried, inset, 1.0 - inset) * wsz);
+    const float4 bent = tex2D.sample(samp, w0 + clamp(carried + n.xy * 0.04, inset, 1.0 - inset) * wsz);
+    const float4 src = bent.a > 0.5 * held.a ? bent : held;
 
     // Shaded in straight colour and premultiplied once, at the end; the window's
     // pixels arrive premultiplied, so they are divided out first.
     const float3 window_rgb = src.a > 1e-4 ? src.rgb / src.a : src.rgb;
+
+    // How far the window has become water. For its first moments it is still
+    // the window -- opaque, its own colours -- and the water's look comes in
+    // over kVNBecomeWaterSeconds. Treated as water from the first frame, the
+    // window's edges, where the field reads thin, went pale and see-through
+    // straight away: a window losing its corners and edges before it moved.
+    const float young = 1.0 - smoothstep(0.0, kVNBecomeWaterSeconds, sp.age);
 
     // How much water the light goes through. The field is density relative to
     // rest, so a body of liquid reads about 1 and its thin sheets and spray
@@ -900,46 +923,23 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     const float  begin  = mix(0.85, 0.02, amount);
     const float  finish = mix(1.00, 0.30, amount);
     const float  settled = smoothstep(begin, finish, wt) * amount;
-    const float3 filtered = window_rgb * mix(float3(1.0), through, 0.6);
+    const float3 filtered = window_rgb * mix(float3(1.0), through, 0.6 * (1.0 - young));
     float3 body = mix(filtered, water_rgb, settled * 0.9);
-
-    // Reflection, by Schlick's fresnel with F0 a little above water's 0.02: the face of
-    // a flat pool reflects almost nothing, its tilted edges almost everything.
-    // What it reflects is a room: bright above, dim below -- which is most of
-    // what makes water read as wet rather than as tinted glass.
-    const float3 V = float3(0.0, 0.0, 1.0);
-    const float  ndv = saturate(dot(n, V));
-    const float  F = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
-    const float3 R = reflect(-V, n);
-    const float3 env = mix(float3(0.10, 0.16, 0.28), float3(0.78, 0.90, 1.0), smoothstep(-0.35, 0.55, -R.y));
-    //
-    // Along the surface, not across the body. Near the edge -- the band where
-    // the field falls from a body's density to the surface level -- this is
-    // the bright outline along the top of a pool. Inside a body it is only
-    // ever a splash's bumps tilting the surface sideways, and there it turned
-    // the whole of the water silver on every impact.
-    const float surface_band = 1.0 - 0.9 * smoothstep(2.0 * sp.iso, 3.5 * sp.iso, d);
-    const float reflect_w = F * surface_band;
-    body = mix(body, env, reflect_w);
-
-    // Two highlights from one light up and to the left: a sharp glint and a
-    // soft sheen around it.
-    const float3 L = normalize(float3(-0.4, -0.7, 0.6));
-    const float  ndh = saturate(dot(n, normalize(L + V)));
-    const float  spec = pow(ndh, 90.0) * 1.8 + pow(ndh, 28.0) * 0.16;
 
     // The meniscus: a thin bright line just inside the edge, where the surface
     // curves over and catches the light.
     const float  rim_at = (d - sp.iso * 1.25) / (sp.iso * 0.30);
-    const float  rim = exp(-rim_at * rim_at) * 0.8;
+    const float  rim = exp(-rim_at * rim_at) * 0.8 * (1.0 - young);
 
-    float3 rgb = body + spec + rim;
-    rgb = saturate(rgb);
+    // No reflection and no highlights: on water being stirred they are across
+    // the whole of it, and read as white. The outline is the one light the
+    // surface keeps.
+    const float3 rgb = saturate(body + rim);
 
     // Thin water is see-through and a body of it is not, by the same
-    // absorption; the reflection is opaque wherever it is.
-    const float opacity = saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + reflect_w * 0.5);
-    const float alpha = cover * opacity * saturate(src.a) * saturate(sp.fade);
+    // absorption.
+    const float opacity = mix(saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T))), 1.0, young);
+    const float alpha = cover * opacity * saturate(held.a) * saturate(sp.fade);
     return float4(rgb * alpha, alpha);
 }
 
