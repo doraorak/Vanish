@@ -71,6 +71,7 @@
 #include <mach/mach_time.h>
 #include <sys/stat.h>
 #include <stdatomic.h>
+#include <dispatch/dispatch.h>
 
 #include "SkyLightServer.h"
 #include "WaterSim.h"
@@ -1579,6 +1580,15 @@ static void vn_anim_barrel(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_clock(VNPointWarp *mesh, CGRect bounds, double t);
 
 // The first entry is the fallback for a missing or unrecognised preference.
+/// Vanish.metallib's bytes, read when the tweak loads.
+///
+/// Read then and kept, never opened again: the tweak stays loaded in
+/// WindowServer until it restarts, but its bundle can move or go away under it
+/// while it runs -- disabling a tweak moves the bundle out of the loader's
+/// directory -- and a library looked up by path afterwards is not there. NULL
+/// if it could not be read, and then no shader animation is offered at all.
+static dispatch_data_t gVNShaderLibraryData;
+
 static const VNAnimationStyle gAnimationStyles[] = {
     { "shrink",   "Shrink",   VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_shrink } },
     { "squish",   "Squish",   VN_ANIM_MESH, .mesh = { 2, 3, vn_anim_squish } },
@@ -1827,6 +1837,11 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
     }
 
     const VNAnimationStyle *anim = vn_animation_style_for_key(prefs.animation);
+    if (anim->kind == VN_ANIM_SHADER && !gVNShaderLibraryData) {
+        // No shaders to substitute: the tag would draw the stock colour
+        // invert instead. The first style is a mesh one.
+        anim = &gAnimationStyles[0];
+    }
 
     // Diagnostic: the selected animation silently falling back to the first
     // registry entry is indistinguishable, on screen, from the shader path
@@ -4077,9 +4092,36 @@ static const char *vn_shader_fragment_name(void) {
 static void *gUberLibrary;
 static void *gUberVertexDescriptor;
 
-/// Our compiled shaders, loaded once, on the device of the library Apple is
-/// building from -- a pipeline state is bound to the device that made it, and
-/// taking the device from the library we were handed removes the question.
+static void vn_shader_library_read(void) {
+    Dl_info di;
+    char path[4096];
+    if (!dladdr((void *)vn_shader_library_read, &di) || !di.dli_fname) return;
+    if (strlcpy(path, di.dli_fname, sizeof(path)) >= sizeof(path)) return;
+    char *macos = strstr(path, "/Contents/MacOS/");
+    if (!macos) return;
+    *macos = '\0';
+    if (strlcat(path, "/Contents/Resources/Vanish.metallib", sizeof(path)) >= sizeof(path)) return;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { VN_ERROR("shader: cannot open %s", path); return; }
+    void *bytes = NULL;
+    long size = 0;
+    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) > 0 && fseek(f, 0, SEEK_SET) == 0 &&
+        (bytes = malloc((size_t)size)) != NULL && fread(bytes, 1, (size_t)size, f) == (size_t)size) {
+        gVNShaderLibraryData = dispatch_data_create(bytes, (size_t)size, NULL, DISPATCH_DATA_DESTRUCTOR_FREE);
+        bytes = NULL;   // owned by the dispatch data now
+        VN_INFO("shader: read %s (%ld bytes)", path, size);
+    } else {
+        VN_ERROR("shader: cannot read %s", path);
+    }
+    free(bytes);
+    fclose(f);
+}
+
+/// Our compiled shaders, made once from the bytes read at load, on the device
+/// of the library Apple is building from -- a pipeline state is bound to the
+/// device that made it, and taking the device from the library we were handed
+/// removes the question.
 static void *vn_shader_library(void *their_lib) {
     static void *s_library = NULL;
     static bool  s_tried   = false;
@@ -4089,31 +4131,17 @@ static void *vn_shader_library(void *their_lib) {
     void *(*msg)(void *, void *)                   = (void *(*)(void *, void *))dlsym(RTLD_DEFAULT, "objc_msgSend");
     void *(*msg2)(void *, void *, void *, void **) = (void *(*)(void *, void *, void *, void **))dlsym(RTLD_DEFAULT, "objc_msgSend");
     void *(*sel)(const char *)                     = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
-    if (!msg || !sel || !their_lib) return NULL;
+    if (!msg || !sel || !their_lib || !gVNShaderLibraryData) return NULL;
 
     void *device = msg(their_lib, sel("device"));
     if (!device) return NULL;
 
-    Dl_info di;
-    char path[4096];
-    if (!dladdr((void *)vn_shader_library, &di) || !di.dli_fname) return NULL;
-    if (strlcpy(path, di.dli_fname, sizeof(path)) >= sizeof(path)) return NULL;
-    char *macos = strstr(path, "/Contents/MacOS/");
-    if (!macos) return NULL;
-    *macos = '\0';
-    if (strlcat(path, "/Contents/Resources/Vanish.metallib", sizeof(path)) >= sizeof(path)) return NULL;
-
-    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path,
-                                                           (CFIndex)strlen(path), false);
-    if (!url) return NULL;
-
     double t0 = SLSCurrentRealTime();
     void *err = NULL;
-    s_library = msg2(device, sel("newLibraryWithURL:error:"), (void *)url, &err);
-    CFRelease(url);
+    s_library = msg2(device, sel("newLibraryWithData:error:"), (void *)gVNShaderLibraryData, &err);
 
-    if (!s_library) VN_ERROR("shader: failed to load %s on device %p", path, device);
-    else VN_INFO("shader: loaded %s on device %p in %.1fms", path, device,
+    if (!s_library) VN_ERROR("shader: failed to make the library on device %p", device);
+    else VN_INFO("shader: library made on device %p in %.1fms", device,
                  (SLSCurrentRealTime() - t0) * 1000.0);
     return s_library;
 }
@@ -5474,5 +5502,6 @@ static void vanish_init(void) {
         return;
     }
 
+    vn_shader_library_read();
     TIL_DISPATCH("com.doraorak.vanish", vanish_init_payload);
 }
