@@ -42,7 +42,13 @@ mkdir -p "$DIR/$BUNDLE/Contents/MacOS" "$DIR/$BUNDLE/Contents/Resources"
 # explicit -F; the SDK does not put it on the default search path.
 #
 # TI_Ellekit provides MSHookFunction. Its install name is /Library/TweakInject/TI_Ellekit.dylib.
-TWEAKINJECT_DIR="$DIR/../../XCode-projects/APP/My apps/TweakInject"
+if [ -d "$DIR/../../XCode-projects" ]; then
+    PROGRAMMING_ROOT="$(cd "$DIR/../.." && pwd)"
+else
+    PROGRAMMING_ROOT="/Users/doraorak/Desktop/programming"
+fi
+
+TWEAKINJECT_DIR="$PROGRAMMING_ROOT/XCode-projects/APP/My apps/TweakInject"
 ELLEKIT_LIB="/Library/TweakInject/TI_Ellekit.dylib"
 if [ ! -f "$ELLEKIT_LIB" ]; then
     if [ -f "$TWEAKINJECT_DIR/Payload/TI_Ellekit.dylib" ]; then
@@ -52,7 +58,7 @@ if [ ! -f "$ELLEKIT_LIB" ]; then
     fi
 fi
 
-SUPPORT_LIB="$DIR/../../XCode-projects/DYLIB/TI_Support/TI_Support.dylib"
+SUPPORT_LIB="$PROGRAMMING_ROOT/XCode-projects/DYLIB/TI_Support/TI_Support.dylib"
 if [ ! -f "$SUPPORT_LIB" ]; then
     SUPPORT_LIB="$TWEAKINJECT_DIR/Payload/TI_Support.dylib"
 fi
@@ -65,7 +71,7 @@ clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fblocks -std=c11 \
     -F"$SDK_PATH/System/Library/PrivateFrameworks" \
     -framework CoreFoundation -framework CoreGraphics -framework SkyLight \
     -framework IOKit -framework Security \
-    -I"$DIR/../../XCode-projects/DYLIB/TI_Support" \
+    -I"$PROGRAMMING_ROOT/XCode-projects/DYLIB/TI_Support" \
     "$ELLEKIT_LIB" \
     "$SUPPORT_LIB" \
     -install_name "/Library/TweakInject/Tweaks/Bundles/$BUNDLE/Contents/MacOS/$NAME" \
@@ -83,7 +89,7 @@ clang -bundle -arch arm64 -arch arm64e -isysroot "$SDK_PATH" -fobjc-arc \
     -framework Cocoa -framework IOKit -framework Security \
     "$SUPPORT_LIB" \
     -I"$DIR/Preferences" \
-    -I"$DIR/../../XCode-projects/DYLIB/TI_Support" \
+    -I"$PROGRAMMING_ROOT/XCode-projects/DYLIB/TI_Support" \
     -o "$PREFS_SRC/Contents/MacOS/VanishPrefs" \
     "$DIR/Preferences/VanishPrefsViewController.m"
 

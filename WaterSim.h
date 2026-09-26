@@ -30,7 +30,7 @@
 /// and has the side benefit that a small window is cheaper rather than merely
 /// slower.
 #ifndef kVNParticleSpacingPx
-#define kVNParticleSpacingPx 7.0
+#define kVNParticleSpacingPx 3.5
 #endif
 
 /// Bounds on the derived count: enough to read as a body of liquid, capped so a
