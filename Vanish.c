@@ -1803,12 +1803,32 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
     }
 
     VNPreferences prefs = vn_get_prefs();
+
+    // The frame bounds are the content with the shadow around it, so they contain the content and
+    // run past it by no more than a shadow's worth. Bounds that do not are not the window's: the
+    // server derives them from the window's clip shape, and a clip that was left behind by something
+    // else puts them somewhere else on the screen. The clone is sized and placed by this rect, so
+    // such bounds would play the animation on a rect that is not the window; the content is used
+    // instead, and the mismatch is logged.
+    bool bounds_usable = bounds.size.width >= 1.0 && bounds.size.height >= 1.0;
+    if (bounds_usable && content.size.width >= 1.0 && content.size.height >= 1.0) {
+        const double kShadowReach = 160.0;
+        const bool holds_content = CGRectContainsRect(CGRectInset(bounds, -3.0, -3.0), content);
+        const bool near_content = CGRectContainsRect(CGRectInset(content, -kShadowReach, -kShadowReach), bounds);
+        if (!holds_content || !near_content) {
+            VN_ERROR("clone: wid=%u frame bounds (%.0f,%.0f %.0fx%.0f) do not match its content (%.0f,%.0f %.0fx%.0f): using the content",
+                     orig_wid, bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height,
+                     content.origin.x, content.origin.y, content.size.width, content.size.height);
+            bounds_usable = false;
+        }
+    }
+
     CGRect frame = CGRectZero;
-    if (prefs.shadows && bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
+    if (prefs.shadows && bounds_usable) {
         frame = bounds;
     } else if (content.size.width >= 1.0 && content.size.height >= 1.0) {
         frame = content;
-    } else if (bounds.size.width >= 1.0 && bounds.size.height >= 1.0) {
+    } else if (bounds_usable) {
         frame = bounds;
     }
 
