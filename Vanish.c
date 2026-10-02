@@ -282,9 +282,8 @@ static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
 #pragma mark - Preferences
 
 static const char * const kVNAnimationKeys[] = {
-    "shrink", "squish", "fall", "swirl", "flip", "tilt", "slide", "genie",
-    "flag", "spin", "roll", "barrel", "clock", "dissolve", "crt", "shatter",
-    "burn", "water"
+    "shrink", "squish", "fall", "swirl", "tilt", "slide", "spin",
+    "dissolve", "crt", "shatter", "burn", "water"
 };
 #define kVNAnimationKeyCount (sizeof(kVNAnimationKeys) / sizeof(kVNAnimationKeys[0]))
 
@@ -293,15 +292,9 @@ static const float kVNAnimationDefaultDurations[] = {
     0.25f, /* squish */
     0.25f, /* fall */
     0.30f, /* swirl */
-    0.25f, /* flip */
     0.25f, /* tilt */
     0.25f, /* slide */
-    0.35f, /* genie */
-    0.30f, /* flag */
     0.25f, /* spin */
-    0.30f, /* roll */
-    0.35f, /* barrel */
-    0.35f, /* clock */
     0.30f, /* dissolve */
     0.30f, /* crt */
     0.35f, /* shatter */
@@ -1569,15 +1562,9 @@ static void vn_anim_shrink(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_squish(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_fall(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_swirl(VNPointWarp *mesh, CGRect bounds, double t);
-static void vn_anim_flip(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_tilt(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_slide(VNPointWarp *mesh, CGRect bounds, double t);
-static void vn_anim_genie(VNPointWarp *mesh, CGRect bounds, double t);
-static void vn_anim_flag(VNPointWarp *mesh, CGRect bounds, double t);
 static void vn_anim_spin(VNPointWarp *mesh, CGRect bounds, double t);
-static void vn_anim_roll(VNPointWarp *mesh, CGRect bounds, double t);
-static void vn_anim_barrel(VNPointWarp *mesh, CGRect bounds, double t);
-static void vn_anim_clock(VNPointWarp *mesh, CGRect bounds, double t);
 
 // The first entry is the fallback for a missing or unrecognised preference.
 /// Vanish.metallib's bytes, read when the tweak loads.
@@ -1594,15 +1581,9 @@ static const VNAnimationStyle gAnimationStyles[] = {
     { "squish",   "Squish",   VN_ANIM_MESH, .mesh = { 2, 3, vn_anim_squish } },
     { "fall",     "Fall",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_fall } },
     { "swirl",    "Swirl",    VN_ANIM_MESH, .mesh = { kVNMeshSwirlW, kVNMeshSwirlH, vn_anim_swirl } },
-    { "flip",     "Flip",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_flip } },
     { "tilt",     "Tilt",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_tilt } },
     { "slide",    "Slide",    VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_slide } },
-    { "genie",    "Genie",    VN_ANIM_MESH, .mesh = { 6, 10, vn_anim_genie } },
-    { "flag",     "Flag",     VN_ANIM_MESH, .mesh = { 8, 6, vn_anim_flag } },
     { "spin",     "Spin",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_spin } },
-    { "roll",     "Roll",     VN_ANIM_MESH, .mesh = { 6, 12, vn_anim_roll } },
-    { "barrel",   "Barrel",   VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_barrel } },
-    { "clock",    "Clock",    VN_ANIM_MESH, .mesh = { 8, 8, vn_anim_clock } },
     { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve", false, 0.50f, false, false, false } },
     { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt", false, 0.50f, false, false, false } },
     { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter", false, 0.50f, true, false, false } },
@@ -2165,32 +2146,6 @@ static void vn_anim_swirl(VNPointWarp *mesh, CGRect bounds, double t) {
     }
 }
 
-// Half-turn about the centre while shrinking. Rotation plus uniform scale
-// is affine, so 2x2 is exact.
-static void vn_anim_flip(VNPointWarp *mesh, CGRect bounds, double t) {
-    double s = 1.0 - t;
-    if (s < 0.005) s = 0.005;
-    double ang = t * M_PI;
-    double ca = cos(ang), sa = sin(ang);
-    double cx = bounds.origin.x + bounds.size.width  * 0.5;
-    double cy = bounds.origin.y + bounds.size.height * 0.5;
-
-    for (unsigned row = 0; row < 2; row++) {
-        for (unsigned col = 0; col < 2; col++) {
-            double lx = bounds.size.width  * (double)col;
-            double ly = bounds.size.height * (double)row;
-            double dx = bounds.origin.x + lx - cx;
-            double dy = bounds.origin.y + ly - cy;
-
-            VNPointWarp *pt = &mesh[row * 2 + col];
-            pt->local.x  = (float)lx;
-            pt->local.y  = (float)ly;
-            pt->global.x = (float)(cx + (dx * ca - dy * sa) * s);
-            pt->global.y = (float)(cy + (dx * sa + dy * ca) * s);
-        }
-    }
-}
-
 // Shear sideways with magnitude growing down the window, plus a shrink.
 // Shear plus scale is affine: 2x2 exact.
 static void vn_anim_tilt(VNPointWarp *mesh, CGRect bounds, double t) {
@@ -2242,71 +2197,8 @@ static void vn_anim_slide(VNPointWarp *mesh, CGRect bounds, double t) {
     }
 }
 
-// Suck into the red-button corner (top-left). The shrink is anchored there
-// with a radius-dependent lag, so far points travel most -- that radial
-// variation is non-affine and needs the 6x10 grid.
-static void vn_anim_genie(VNPointWarp *mesh, CGRect bounds, double t) {
-    double s = 1.0 - t;
-    if (s < 0.005) s = 0.005;
-    double ax = bounds.origin.x;
-    double ay = bounds.origin.y;
-    double half = hypot(bounds.size.width, bounds.size.height) * 0.5;
-    if (half < 1.0) half = 1.0;
-
-    for (unsigned row = 0; row < 10; row++) {
-        for (unsigned col = 0; col < 6; col++) {
-            double u  = (double)col / 5.0;
-            double v  = (double)row / 9.0;
-            double lx = bounds.size.width  * u;
-            double ly = bounds.size.height * v;
-            double gx = bounds.origin.x + lx;
-            double gy = bounds.origin.y + ly;
-
-            double r = hypot(gx - ax, gy - ay) / half;
-            double k = s * (1.0 - t * 0.5 * r);
-
-            VNPointWarp *pt = &mesh[row * 6 + col];
-            pt->local.x  = (float)lx;
-            pt->local.y  = (float)ly;
-            pt->global.x = (float)(ax + (gx - ax) * k);
-            pt->global.y = (float)(ay + (gy - ay) * k);
-        }
-    }
-}
-
-// Travelling wave across the width while shrinking. The phase varies column
-// to column, which is what needs the 8-wide grid; amplitude ramps with t so
-// t = 0 is identity.
-static void vn_anim_flag(VNPointWarp *mesh, CGRect bounds, double t) {
-    double s = 1.0 - t;
-    if (s < 0.005) s = 0.005;
-    double cx = bounds.origin.x + bounds.size.width  * 0.5;
-    double cy = bounds.origin.y + bounds.size.height * 0.5;
-
-    for (unsigned row = 0; row < 6; row++) {
-        for (unsigned col = 0; col < 8; col++) {
-            double u  = (double)col / 7.0;
-            double v  = (double)row / 5.0;
-            double lx = bounds.size.width  * u;
-            double ly = bounds.size.height * v;
-            double dx = bounds.origin.x + lx - cx;
-            double dy = bounds.origin.y + ly - cy;
-
-            double wob = sin(u * M_PI * 4.0 + t * M_PI * 4.0)
-                       * t * 0.08 * bounds.size.height;
-
-            VNPointWarp *pt = &mesh[row * 8 + col];
-            pt->local.x  = (float)lx;
-            pt->local.y  = (float)ly;
-            pt->global.x = (float)(cx + dx * s);
-            pt->global.y = (float)(cy + dy * s + wob * s);
-        }
-    }
-}
-
-// A turn and a half about the centre while shrinking. Same family as flip,
-// but the multi-turn version reads completely differently. Uniform rotation
-// plus scale is affine: 2x2 exact.
+// A turn and a half about the centre while shrinking. Uniform rotation plus
+// scale is affine: 2x2 exact.
 static void vn_anim_spin(VNPointWarp *mesh, CGRect bounds, double t) {
     double s = 1.0 - t;
     if (s < 0.005) s = 0.005;
@@ -2323,97 +2215,6 @@ static void vn_anim_spin(VNPointWarp *mesh, CGRect bounds, double t) {
             double dy = bounds.origin.y + ly - cy;
 
             VNPointWarp *pt = &mesh[row * 2 + col];
-            pt->local.x  = (float)lx;
-            pt->local.y  = (float)ly;
-            pt->global.x = (float)(cx + (dx * ca - dy * sa) * s);
-            pt->global.y = (float)(cy + (dx * sa + dy * ca) * s);
-        }
-    }
-}
-
-// Roll up like a scroll: each row's collapse runs on a delayed clock so the
-// fold travels from top to bottom. That per-row timing is the non-affine
-// part and wants the tall 6x12 grid.
-static void vn_anim_roll(VNPointWarp *mesh, CGRect bounds, double t) {
-    double hs = 1.0 - t * 0.1;
-    double cx = bounds.origin.x + bounds.size.width * 0.5;
-
-    for (unsigned row = 0; row < 12; row++) {
-        for (unsigned col = 0; col < 6; col++) {
-            double u  = (double)col / 5.0;
-            double v  = (double)row / 11.0;
-            double lx = bounds.size.width  * u;
-            double ly = bounds.size.height * v;
-            double gx = bounds.origin.x + lx;
-
-            double m = (t * 1.4 - v * 0.4);
-            if (m < 0.0) m = 0.0; if (m > 1.0) m = 1.0;
-            double fv = v * (1.0 - 0.995 * m);
-
-            VNPointWarp *pt = &mesh[row * 6 + col];
-            pt->local.x  = (float)lx;
-            pt->local.y  = (float)ly;
-            pt->global.x = (float)(cx + (gx - cx) * hs);
-            pt->global.y = (float)(bounds.origin.y + fv * bounds.size.height);
-        }
-    }
-}
-
-// Lens-style pincushion that swells mid-flight, then collapses with the
-// window. The r-squared radial factor is non-affine: 8x8.
-static void vn_anim_barrel(VNPointWarp *mesh, CGRect bounds, double t) {
-    double s = 1.0 - t;
-    if (s < 0.005) s = 0.005;
-    double cx = bounds.origin.x + bounds.size.width  * 0.5;
-    double cy = bounds.origin.y + bounds.size.height * 0.5;
-    double half = hypot(bounds.size.width, bounds.size.height) * 0.5;
-    if (half < 1.0) half = 1.0;
-
-    for (unsigned row = 0; row < 8; row++) {
-        for (unsigned col = 0; col < 8; col++) {
-            double u  = (double)col / 7.0;
-            double v  = (double)row / 7.0;
-            double lx = bounds.size.width  * u;
-            double ly = bounds.size.height * v;
-            double dx = bounds.origin.x + lx - cx;
-            double dy = bounds.origin.y + ly - cy;
-
-            double r = hypot(dx, dy) / half;
-            double k = 1.0 + t * 0.8 * r * r;
-
-            VNPointWarp *pt = &mesh[row * 8 + col];
-            pt->local.x  = (float)lx;
-            pt->local.y  = (float)ly;
-            pt->global.x = (float)(cx + dx * k * s);
-            pt->global.y = (float)(cy + dy * k * s);
-        }
-    }
-}
-
-// An asymmetric angular sweep: each point turns by an amount set by its
-// polar angle, so the window wrings itself out. The offset uses 1 - cos so
-// it is periodic -- no seam at the branch cut -- and zero at t = 0.
-// Non-affine: 8x8.
-static void vn_anim_clock(VNPointWarp *mesh, CGRect bounds, double t) {
-    double s = 1.0 - t;
-    if (s < 0.005) s = 0.005;
-    double cx = bounds.origin.x + bounds.size.width  * 0.5;
-    double cy = bounds.origin.y + bounds.size.height * 0.5;
-
-    for (unsigned row = 0; row < 8; row++) {
-        for (unsigned col = 0; col < 8; col++) {
-            double u  = (double)col / 7.0;
-            double v  = (double)row / 7.0;
-            double lx = bounds.size.width  * u;
-            double ly = bounds.size.height * v;
-            double dx = bounds.origin.x + lx - cx;
-            double dy = bounds.origin.y + ly - cy;
-
-            double theta = atan2(dy, dx);
-            double extra = t * (1.0 - cos(theta)) * 1.2;
-            double ca = cos(extra), sa = sin(extra);
-
-            VNPointWarp *pt = &mesh[row * 8 + col];
             pt->local.x  = (float)lx;
             pt->local.y  = (float)ly;
             pt->global.x = (float)(cx + (dx * ca - dy * sa) * s);
