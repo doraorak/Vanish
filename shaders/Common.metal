@@ -64,7 +64,6 @@ struct VNShaderExtra {
     float params[5];
     float bound;
     float phase;    // the animation's phase when this frame is drawn; -1 = none
-    float offset[2];// the window's offset inside the quad, in window sizes; -1 = default
 };
 
 // The animation's progress, 0..1, for the frame being drawn. Vanish computes it
@@ -124,26 +123,49 @@ vertex VNUberStage vn_uber_vertex(VNUberIn in [[stage_in]],
     return out;
 }
 
-// Vanish gives the clone a shape larger than the window so what the shader
-// draws is not cut off at the window's edge -- by a margin each animation picks,
-// and for some the display's full height. The texture coordinates that arrive
-// here are normalised to the TEXTURE, not to the quad -- so across a quad
-// (1 + 2m) times wider they run 0 .. (1 + 2m), and the window's own pixels are
-// exactly the [0,1] part. Nothing needs rescaling; texel-to-pixel is already
-// 1:1.
-//
-// What does need correcting is the origin: coordinate 0 sits at the quad's
-// top-left corner, which the widened shape moved up and left. Subtracting the
-// window's offset inside the quad -- VNShaderExtra::offset, set per close --
-// puts it back at [0,1] and makes anything outside that the margin. Unbound,
-// the offset is the half-size margin every animation had before choosing its
-// own.
-constant float kVNShaderMargin = 0.50;
-
+// The window's own coordinate: 0..1 over the clone's frame (the window, plus its shadow when shadows
+// are on). The clone is exactly its frame, so the compositor's quad gives it directly -- the texture
+// coordinates that arrive are normalised to the texture, and texel-to-pixel is 1:1. What an animation
+// draws beyond the frame is drawn by the pass below, whose vertices give the same coordinate, so a
+// point outside the frame is simply one outside [0,1].
 static inline float2 vn_window_uv(float2 tex, constant VNShaderExtra &extra) {
-    const float2 offset = float2(extra.offset[0] >= 0.0 ? extra.offset[0] : kVNShaderMargin,
-                                 extra.offset[1] >= 0.0 ? extra.offset[1] : kVNShaderMargin);
-    return tex - offset;
+    (void)extra;
+    return tex;
+}
+
+// The pass that draws outside the frame. The clone is exactly its frame; what an animation draws
+// beyond it is drawn by a pass of our own, over rectangles round the frame, with this vertex function
+// and the animation's vn_post_ fragment. Each vertex carries its place in the render target and the
+// window's own coordinate there (0..1 over the frame), computed on the CPU, so the fragments read
+// the same `tex` the compositor's quad gives them.
+struct VNPostVertex {
+    float2 ndc;
+    float2 tex;
+};
+
+vertex VNUberStage vn_post_vertex(constant VNPostVertex *verts [[buffer(0)]],
+                                  uint vid [[vertex_id]]) {
+    VNUberStage out;
+    out.pos = float4(verts[vid].ndc, 0.0, 1.0);
+    out.tex = float4(verts[vid].tex, 0.0, 1.0);
+    return out;
+}
+
+// What the compositor's pipeline does in fixed function: a premultiplied colour over what is there.
+// The post pass reads the pixel ([[color(0)]]) and does it itself.
+static inline float4 vn_post_blend(float4 dst, float4 s) {
+    return float4(s.rgb + dst.rgb * (1.0 - s.a), s.a + dst.a * (1.0 - s.a));
+}
+
+// The post entry of an animation whose shading is `SHADE(in, tex2D, args, extra, samp)`.
+#define VN_POST_ENTRY(NAME, SHADE)                                                                 \
+fragment float4 vn_post_##NAME(VNUberStage in [[stage_in]],                                        \
+                               float4 dst [[color(0)]],                                           \
+                               texture2d<float> tex2D [[texture(0)]],                              \
+                               constant VNUberArgs &args [[buffer(0)]],                            \
+                               constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],      \
+                               sampler samp [[sampler(0)]]) {                                      \
+    return vn_post_blend(dst, SHADE(in, tex2D, args, extra, samp));                                \
 }
 
 // Dave Hoskins' hash. Multiply-add based.

@@ -236,7 +236,6 @@ static VNUpdateWindowFn             vn_resolved_update_window;
 static VNCreateShaderFn             vn_resolved_create_shader;
 static VNCreateSpecializedShaderFn  vn_orig_create_specialized_shader;
 static VNUberCompositeFn            vn_orig_uber_composite;
-static VNShapeWindowWithRectFn      vn_resolved_shape_window_with_rect;
 static VNMetalCompositeLayerFn      vn_orig_metal_composite_layer;
 static VNSetPipelineStateFn         vn_orig_set_pipeline_state;
 static VNRenderEncoderFn            vn_resolved_render_encoder;
@@ -283,7 +282,7 @@ static VNDynWindowIsOrderedInFn     vn_resolved_window_is_ordered_in = NULL;
 
 static const char * const kVNAnimationKeys[] = {
     "shrink", "squish", "fall", "swirl", "tilt", "slide", "spin",
-    "dissolve", "crt", "shatter", "burn", "water"
+    "dissolve", "crt", "shatter", "burn", "water", "curl"
 };
 #define kVNAnimationKeyCount (sizeof(kVNAnimationKeys) / sizeof(kVNAnimationKeys[0]))
 
@@ -299,7 +298,8 @@ static const float kVNAnimationDefaultDurations[] = {
     0.30f, /* crt */
     0.35f, /* shatter */
     0.35f, /* burn */
-    1.60f  /* water */
+    1.60f, /* water */
+    0.60f  /* curl */
 };
 _Static_assert(sizeof(kVNAnimationDefaultDurations) / sizeof(kVNAnimationDefaultDurations[0]) == kVNAnimationKeyCount,
                "kVNAnimationDefaultDurations count mismatch");
@@ -741,9 +741,9 @@ static os_unfair_lock gCloneAnimationsLock = OS_UNFAIR_LOCK_INIT;
 /// render thread without gCloneAnimationsLock: the hook runs inside the
 /// compositor, and nothing that holds that lock may wait on the compositor.
 ///
-/// Where the window sits inside the clone's quad, from the moment the clone is
-/// built -- its very first frame is drawn with it -- and, once the animation
-/// starts, when that was and how long it runs. Each composited frame takes its
+/// The clone's frame and footprint, from the moment the clone is built -- its
+/// very first frame is drawn with them -- and, once the animation starts, when
+/// that was and how long it runs. Each composited frame takes its
 /// phase from the clock at the moment it is drawn, rather than whatever the last
 /// tick left on the window: the tick is a timer not locked to the display's
 /// refresh, so a phase it sets can be drawn twice while the next is skipped.
@@ -755,8 +755,10 @@ typedef struct {
     _Atomic uint64_t key;       // (1 << 32) | seed bits; 0 while being written
     _Atomic double   start;     // INFINITY until the animation starts
     double           duration;
-    float            offset_x;
-    float            offset_y;
+    float            frame[4];      // the clone's frame in points: x, y, width, height
+    float            footprint[4];  // what the pass beyond the frame may draw, in points
+    const char      *post;          // the animation's vn_post_ fragment; NULL: nothing is drawn beyond the frame
+    bool             particles;     // that fragment reads the simulation
 } VNCloneEntry;
 
 static VNCloneEntry     gVNCloneEntries[MAX_CLONE_ANIMATIONS];
@@ -777,14 +779,18 @@ static VNCloneEntry *vn_clone_entry(float seed) {
 }
 
 /// Called when a shader clone is built.
-static void vn_clone_publish(float seed, CGPoint offset) {
+static void vn_clone_publish(float seed, CGRect frame, CGRect footprint, const char *post, bool particles) {
     VNCloneEntry *e = &gVNCloneEntries[atomic_fetch_add_explicit(&gVNCloneEntryNext, 1, memory_order_relaxed)
                                        % MAX_CLONE_ANIMATIONS];
     atomic_store_explicit(&e->key, 0, memory_order_relaxed);
     atomic_store_explicit(&e->start, INFINITY, memory_order_relaxed);
     e->duration = 0.25;
-    e->offset_x = (float)offset.x;
-    e->offset_y = (float)offset.y;
+    e->frame[0] = (float)frame.origin.x;     e->frame[1] = (float)frame.origin.y;
+    e->frame[2] = (float)frame.size.width;   e->frame[3] = (float)frame.size.height;
+    e->footprint[0] = (float)footprint.origin.x;   e->footprint[1] = (float)footprint.origin.y;
+    e->footprint[2] = (float)footprint.size.width; e->footprint[3] = (float)footprint.size.height;
+    e->post = post;
+    e->particles = particles;
     atomic_store_explicit(&e->key, vn_clone_key(seed), memory_order_release);
 }
 
@@ -796,20 +802,15 @@ static void vn_clone_start(float seed, double start, double duration) {
     atomic_store_explicit(&e->start, start, memory_order_release);
 }
 
-/// The draw-time state of the clone carrying `seed`: its phase at `now`, 0..1,
-/// or -1 before it starts (the shader then uses the tick's), and the window's
-/// offset in the quad, or -1s when the clone is unknown.
-static void vn_clone_lookup(float seed, double now, float *phase, float *offset_x, float *offset_y) {
-    *phase = -1.0f;
-    *offset_x = *offset_y = -1.0f;
+/// The draw-time state of the clone carrying `seed`: its phase at `now`, 0..1, or -1 before it
+/// starts (the shader then uses the tick's), or when the clone is unknown.
+static float vn_clone_phase(float seed, double now) {
     VNCloneEntry *e = vn_clone_entry(seed);
-    if (!e) return;
-    *offset_x = e->offset_x;
-    *offset_y = e->offset_y;
+    if (!e) return -1.0f;
     const double start = atomic_load_explicit(&e->start, memory_order_acquire);
-    if (!(start < INFINITY)) return;
+    if (!(start < INFINITY)) return -1.0f;
     const double p = (now - start) / e->duration;
-    *phase = (float)(p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
+    return (float)(p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
 }
 
 #pragma mark - Water simulation state
@@ -1210,6 +1211,7 @@ static bool vn_is_window_animating(uint32_t wid, CGXWindow *win) {
 }
 
 static void vn_filter_detach(CGXWindow *clone);
+static void vn_overlay_release(CGXWindow *clone);
 
 #pragma mark - EDR headroom
 
@@ -1296,6 +1298,7 @@ static void vn_release_clone(CGXWindow *clone) {
         vn_window_request_headroom(clone, 1.0f);
     }
     vn_water_retire(clone);
+    vn_overlay_release(clone);
     vn_filter_detach(clone);
     if (vn_resolved_system_window_release) vn_resolved_system_window_release(clone);
 }
@@ -1488,26 +1491,11 @@ static void vn_pending_clone_cleanup_timer(void *ctx, double when) {
 //   different parts of the window move on different curves, needs a denser
 //   grid, and every extra vertex is per-frame work for the compositor.
 
-// How far past the window a shader animation may draw, as a fraction of the
-// window's size on each side.
-//
-// MUST match kVNShaderMargin in shaders/Vanish.metal. The shader subtracts it
-// to put the window back at [0,1] after the widened shape moved the origin up
-// and left; disagree here and every shader animation samples off by the
-// difference.
-//
-// Each shader animation declares its own margin (VNAnimationStyle::shader.
-// margin), and Shatter additionally spans the display's full height so its
-// pieces can fall all the way off the screen. Where the window sits inside the
-// quad reaches the shader per close (VNShaderExtra::offset).
-//
-// Mind the floor: a small margin exposes a one-or-two-frame artifact at the
-// start of the close that has resisted five attempts to fix (a displaced copy
-// of the window peeking out from behind the original). At half the window's
-// size on each side the displaced frame lands entirely behind the original and
-// is never seen. That is a workaround, not a fix: the mismatch is still there,
-// it is merely covered -- so shrink an animation's margin only after watching
-// its first frames.
+// How far past its frame a shader animation may draw. The clone is exactly its frame; an animation that
+// draws further out (flecks past the edge, shards falling to the bottom of the display, water across the
+// whole display) has a footprint -- the frame widened by `margin` of its size on each side, to the
+// display's full height, or to the whole display -- and draws the part of it outside the frame in the
+// pass beyond the frame (see Overlay pass). An animation with no `post` fragment stays inside its frame.
 
 #define kVNMeshMaxDim   16
 #define kVNMeshMaxCount (kVNMeshMaxDim * kVNMeshMaxDim)
@@ -1550,10 +1538,11 @@ struct VNAnimationStyle {
             uint32_t    type;   // kVNFilterType*, the tag that routes the clone
             const char *frag;   // fragment function in Vanish.metallib
             bool        hdr;    // asks the display for EDR headroom while it runs
-            float       margin; // quad widened by this fraction of the frame on each side
-            bool        full_height; // quad spans the display's full height as well
-            bool        full_screen; // quad IS the display: the animation may draw anywhere
+            float       margin; // footprint: the frame widened by this fraction of its size on each side
+            bool        full_height; // ... and spanning the display's full height
+            bool        full_screen; // ... or the whole display: the animation may draw anywhere
             bool        particles;   // stepped by the compute pass before each frame is drawn
+            const char *post;        // fragment of the pass beyond the frame (vn_post_*); NULL: the animation stays inside it
         } shader;
     };
 };
@@ -1584,11 +1573,12 @@ static const VNAnimationStyle gAnimationStyles[] = {
     { "tilt",     "Tilt",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_tilt } },
     { "slide",    "Slide",    VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_slide } },
     { "spin",     "Spin",     VN_ANIM_MESH, .mesh = { 2, 2, vn_anim_spin } },
-    { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve", false, 0.50f, false, false, false } },
-    { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt", false, 0.50f, false, false, false } },
-    { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter", false, 0.50f, true, false, false } },
-    { "burn",      "Burn",      VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_burn", true, 0.50f, false, false, false } },
-    { "water",     "Water",     VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_water", false, 0.50f, false, true, true } },
+    { "dissolve",  "Dissolve",  VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_dissolve", false, 0.50f, false, false, false, "vn_post_dissolve" } },
+    { "crt",       "CRT Off",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_crt", false, 0.0f, false, false, false, NULL } },
+    { "shatter",   "Shatter",   VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_shatter", false, 0.50f, true, false, false, "vn_post_shatter" } },
+    { "burn",      "Burn",      VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_burn", true, 0.0f, false, false, false, NULL } },
+    { "water",     "Water",     VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_water", false, 0.0f, false, true, true, "vn_post_water" } },
+    { "curl",      "Page Curl", VN_ANIM_SHADER, .shader = { kVNFilterTypeShaderTag, "vn_uber_curl", false, 0.0f, false, false, false, NULL } },
 };
 #define kVNAnimationStyleCount (sizeof(gAnimationStyles) / sizeof(gAnimationStyles[0]))
 
@@ -1603,6 +1593,141 @@ static const VNAnimationStyle *vn_animation_style_for_key(const char *key) {
 
 static float vn_duration_for_anim(const VNAnimationStyle *anim) {
     return vn_duration_for_key(anim ? anim->key : NULL);
+}
+
+#pragma mark - Overlay pass
+
+// What an animation draws beyond the clone's frame.
+//
+// A fragment shader can only write inside the layer's draw shape, which is the clone window's own
+// region, so the clone is exactly its frame and an animation that has to draw further out (flecks
+// past the edge, the roll of a page and its shadow, shards falling to the bottom of the display,
+// water across the whole display) draws that part in a pass of its own, straight after the clone's
+// layer:
+//
+//   * the part inside the frame is the compositor's own draw, through our substituted ubershader
+//     (`vn_uber_<anim>`), as always;
+//   * the footprint -- the frame, widened by the animation's margin, to the display's full height,
+//     or to the whole display -- minus the frame is drawn here, with `vn_post_vertex` and the
+//     animation's `vn_post_<anim>`, which blends over the pixel itself. The texture is the clone's
+//     content, caught as the compositor binds it; the window's own coordinate at each vertex is
+//     computed here, so the fragments see the `tex` the compositor's quad gives them;
+//   * the footprint is invalidated every tick (and once more when the clone goes), so the
+//     compositor repaints what is behind it first: what the pass draws is a pixel over the repainted
+//     picture and is gone the next frame unless it is drawn again.
+//
+// If the pass cannot draw (a pass of a shape it does not know, no texture caught), only what lies
+// beyond the frame is missing: the frame itself is still drawn.
+
+typedef struct { float ndc[2]; float tex[2]; } VNPostVertex;
+
+/// The footprints on screen, by clone: invalidated each tick and when the clone is released.
+static struct { CGXWindow *clone; CGRect footprint; } gVNFootprints[MAX_CLONE_ANIMATIONS * 2];
+static os_unfair_lock gVNFootprintLock = OS_UNFAIR_LOCK_INIT;
+
+static VNInvalidateDisplayShapeFn vn_resolved_invalidate_display_shape;
+static int  (*vn_cgs_new_region_with_rect)(const CGRect *, void **);
+static void (*vn_cgs_release_region)(void *);
+static VNSetRenderFragmentTextureFn vn_orig_set_render_fragment_texture;
+
+/// The footprint of an animation drawn in this pass, in points: the frame inflated by the animation's
+/// margin; to the display's full height for one that falls (Shatter); the display itself, with the
+/// frame in case it hangs off the edge, for one that fills it (Water).
+static CGRect vn_overlay_footprint(CGRect frame, const VNAnimationStyle *anim, CGRect screen) {
+    CGRect r = CGRectInset(frame, -frame.size.width * anim->shader.margin, -frame.size.height * anim->shader.margin);
+    if (screen.size.width < 1.0 || screen.size.height < 1.0) return r;
+    if (anim->shader.full_screen) {
+        r = CGRectUnion(screen, frame);
+    } else if (anim->shader.full_height) {
+        const double top = fmin(CGRectGetMinY(screen), CGRectGetMinY(r));
+        const double bottom = fmax(CGRectGetMaxY(screen), CGRectGetMaxY(r));
+        r.origin.y = top;
+        r.size.height = bottom - top;
+    }
+    return r;
+}
+
+static void vn_overlay_track(CGXWindow *clone, CGRect footprint) {
+    os_unfair_lock_lock(&gVNFootprintLock);
+    const size_t n = sizeof(gVNFootprints) / sizeof(gVNFootprints[0]);
+    size_t slot = n;
+    for (size_t i = 0; i < n; i++) {
+        if (gVNFootprints[i].clone == clone) { slot = i; break; }
+        if (!gVNFootprints[i].clone && slot == n) slot = i;
+    }
+    if (slot < n) {
+        gVNFootprints[slot].clone = clone;
+        gVNFootprints[slot].footprint = footprint;
+    } else {
+        VN_ERROR("overlay: no room to track the footprint of clone %p", (void *)clone);
+    }
+    os_unfair_lock_unlock(&gVNFootprintLock);
+}
+
+/// Asks the display to repaint a rectangle of the screen (points) with its next update.
+static void vn_overlay_invalidate_rect(CGXWindow *clone, CGRect rect) {
+    if (!clone || CGRectIsEmpty(rect) || CGRectIsNull(rect) || !vn_resolved_invalidate_display_shape ||
+        !vn_cgs_new_region_with_rect || !vn_cgs_release_region) {
+        return;
+    }
+    rect = CGRectIntegral(rect);
+    void *region = NULL;
+    if (vn_cgs_new_region_with_rect(&rect, &region) != 0 || !region) return;
+    vn_resolved_invalidate_display_shape(NULL, clone, region);
+    vn_cgs_release_region(region);
+}
+
+static CGRect vn_overlay_footprint_of(CGXWindow *clone) {
+    CGRect r = CGRectNull;
+    os_unfair_lock_lock(&gVNFootprintLock);
+    for (size_t i = 0; i < sizeof(gVNFootprints) / sizeof(gVNFootprints[0]); i++) {
+        if (gVNFootprints[i].clone == clone) { r = gVNFootprints[i].footprint; break; }
+    }
+    os_unfair_lock_unlock(&gVNFootprintLock);
+    return r;
+}
+
+/// Every tick of a running clone, before the phase is written: what the animation may draw this
+/// frame is repainted first.
+static void vn_overlay_invalidate(CGXWindow *clone) {
+    vn_overlay_invalidate_rect(clone, vn_overlay_footprint_of(clone));
+}
+
+static _Atomic uint32_t gVNOverlayLayers, gVNOverlayDrawn;
+enum { kVNOvSkipNoEntry, kVNOvSkipNoTexture, kVNOvSkipNoTarget, kVNOvSkipOddPass, kVNOvSkipDimensions,
+       kVNOvSkipNoPipeline, kVNOvSkipNoEncoder, kVNOvSkipOutside, kVNOvSkipCount };
+static const char * const kVNOvSkipName[kVNOvSkipCount] = {
+    "no clone entry", "no texture caught", "no target", "odd pass", "target size", "no pipeline", "no encoder", "footprint off this display",
+};
+static _Atomic uint32_t gVNOverlaySkips[kVNOvSkipCount];
+
+static bool vn_ov_skip(int why) {
+    atomic_fetch_add_explicit(&gVNOverlaySkips[why], 1, memory_order_relaxed);
+    return false;
+}
+
+/// Once a clone is released: its footprint is repainted one last time (so nothing of what was drawn
+/// beyond its frame stays on the screen) and no longer tracked, and what the pass did is logged.
+static void vn_overlay_release(CGXWindow *clone) {
+    const CGRect r = vn_overlay_footprint_of(clone);
+    if (CGRectIsNull(r)) return;
+    vn_overlay_invalidate_rect(clone, r);
+    os_unfair_lock_lock(&gVNFootprintLock);
+    for (size_t i = 0; i < sizeof(gVNFootprints) / sizeof(gVNFootprints[0]); i++) {
+        if (gVNFootprints[i].clone == clone) gVNFootprints[i].clone = NULL;
+    }
+    os_unfair_lock_unlock(&gVNFootprintLock);
+
+    char skips[256];
+    size_t n = 0;
+    skips[0] = '\0';
+    for (int i = 0; i < kVNOvSkipCount; i++) {
+        const uint32_t c = atomic_exchange_explicit(&gVNOverlaySkips[i], 0, memory_order_relaxed);
+        if (c && n < sizeof skips) n += (size_t)snprintf(skips + n, sizeof skips - n, "%s%s=%u", n ? ", " : "", kVNOvSkipName[i], c);
+    }
+    VN_INFO("overlay: clone %p released; the pass drew %u of %u clone layers (skipped: %s)", (void *)clone,
+            atomic_exchange_explicit(&gVNOverlayDrawn, 0, memory_order_relaxed),
+            atomic_exchange_explicit(&gVNOverlayLayers, 0, memory_order_relaxed), n ? skips : "none");
 }
 
 #pragma mark - Window filters
@@ -1637,104 +1762,6 @@ static bool vn_filter_attach(CGXWindow *clone, uint32_t type, bool is_shader, co
 
     vn_resolved_window_set_filter(clone, f);
     return true;
-}
-
-// Widening where a shader animation may draw: an open problem.
-//
-// A fragment shader can only write inside the layer's draw shape, and
-// generate_layers_for_window builds that from the WINDOW's own region -- so
-// flecks that drift past the window's edge are cut off. Two things have been
-// tried:
-//
-//   Inflating the clone's frame in CreateCloneOfWindow. No effect on the
-//   bound (the region does not follow the frame) and it misplaced the content.
-//
-//   A mesh warp mapping local -m..size+m onto a correspondingly larger screen
-//   rect. The destination shape IS built by running the region through the
-//   mesh -- that is how a warped clone draws outside its rect today -- but
-//   setting any mesh stopped the substituted shader from running: the close
-//   rendered through the stock colour-invert instead. generate_layers_for_window
-//   fills a layer down more than one branch, and the one a warped window takes
-//   appears not to carry the filter tag.
-//
-// Next test, cheapest first: an IDENTITY mesh (local 0..size onto the frame
-// unchanged). If that also breaks the shader, mesh and shader cannot coexist
-// and the room must come from somewhere else. If it survives, the mesh is fine
-// and the fault was in the margin mapping.
-
-/// Widens where a shader animation may draw, by giving the clone a shape larger
-/// than the window it copied. The draw shape the compositor clips us to is
-/// built from this region, so growing it is what buys room for flecks that
-/// drift past the window's edge.
-///
-/// The rect sizes and positions the clone, so its texture ends up stretched
-/// across a quad larger than the window. The shader puts the content back at
-/// 1:1 in the middle -- see vn_window_uv there, which has to agree with
-/// kVNShaderMargin.
-static CGPoint vn_shader_widen_bounds(CGXWindow *clone, CGRect frame, const VNAnimationStyle *anim,
-                                      const void *display) {
-    const float margin = anim ? anim->shader.margin : 0.5f;
-    CGPoint offset = CGPointMake(margin, margin);
-    if (!clone || !vn_resolved_shape_window_with_rect) return offset;
-
-    const double mx = frame.size.width  * margin;
-    const double my = frame.size.height * margin;
-
-    // Screen coordinates, not window-local: the rect positions the window as
-    // well as sizing it, so a (-mx, -my) origin does not widen the shape in
-    // place, it teleports the clone to the top-left of the display.
-    CGRect shape = CGRectMake(frame.origin.x - mx, frame.origin.y - my,
-                              frame.size.width  + mx * 2.0,
-                              frame.size.height + my * 2.0);
-
-    // Water's particles fall to the bottom of the screen and bounce off its
-    // sides, so its quad is the display: a shader may only write inside the
-    // layer's draw shape, and anything narrower would clip the simulation at
-    // the window's own margin.
-    if (anim && anim->shader.full_screen && display && vn_resolved_display_get_bounds) {
-        const CGRect screen = vn_resolved_display_get_bounds(display);
-        // Union, not replacement: a window hanging off the edge of the display
-        // still has to be inside the shape, or its own pixels are clipped
-        // before the animation even starts.
-        if (screen.size.width >= 1.0 && screen.size.height >= 1.0) shape = CGRectUnion(screen, frame);
-    } else if (anim && anim->shader.full_height && display && vn_resolved_display_get_bounds) {
-        const CGRect screen = vn_resolved_display_get_bounds(display);
-        if (screen.size.height >= 1.0) {
-            const double top    = fmin(CGRectGetMinY(screen), CGRectGetMinY(frame));
-            const double bottom = fmax(CGRectGetMaxY(screen), CGRectGetMaxY(frame));
-            shape.origin.y    = top;
-            shape.size.height = bottom - top;
-        }
-    }
-
-    // What the shader subtracts from its texture coordinates to put the window
-    // at [0,1]: the window's offset inside the quad, in units of its own size.
-    offset.x = (CGFloat)((frame.origin.x - shape.origin.x) / frame.size.width);
-    offset.y = (CGFloat)((frame.origin.y - shape.origin.y) / frame.size.height);
-
-    // Measure, rather than assume. Two attempts at this rect have moved the
-    // clone instead of widening it in place, so log what the window actually
-    // becomes: asked-for rect, and the screen rect and frame bounds the server
-    // reports afterwards.
-    CGRect before_screen = vn_resolved_screen_rect ? vn_resolved_screen_rect(clone) : CGRectZero;
-    CGRect before_bounds = vn_resolved_clipped_frame_bounds ? vn_resolved_clipped_frame_bounds(clone) : CGRectZero;
-
-    vn_resolved_shape_window_with_rect(clone, shape, 0);
-
-    CGRect after_screen = vn_resolved_screen_rect ? vn_resolved_screen_rect(clone) : CGRectZero;
-    CGRect after_bounds = vn_resolved_clipped_frame_bounds ? vn_resolved_clipped_frame_bounds(clone) : CGRectZero;
-
-    VN_INFO("shader bounds: frame=(%.0f,%.0f %.0fx%.0f) asked=(%.0f,%.0f %.0fx%.0f) offset=(%.3f, %.3f)",
-            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-            shape.origin.x, shape.origin.y, shape.size.width, shape.size.height,
-            offset.x, offset.y);
-    VN_INFO("shader bounds: screen %.0f,%.0f %.0fx%.0f -> %.0f,%.0f %.0fx%.0f",
-            before_screen.origin.x, before_screen.origin.y, before_screen.size.width, before_screen.size.height,
-            after_screen.origin.x,  after_screen.origin.y,  after_screen.size.width,  after_screen.size.height);
-    VN_INFO("shader bounds: bounds %.0f,%.0f %.0fx%.0f -> %.0f,%.0f %.0fx%.0f",
-            before_bounds.origin.x, before_bounds.origin.y, before_bounds.size.width, before_bounds.size.height,
-            after_bounds.origin.x,  after_bounds.origin.y,  after_bounds.size.width,  after_bounds.size.height);
-    return offset;
 }
 
 /// The animation's progress, handed to the shader through the one per-window
@@ -1955,7 +1982,14 @@ static CGXWindow *vn_make_clone(CGXWindow *win, CGXConnection *conn, CGSOrderOp 
             if (atomic_fetch_add_explicit(&gVNHDRClones, 1, memory_order_acq_rel) == 0) vn_edr_ramp_override(true);
             vn_window_request_headroom(clone, kVNBurnHeadroom);
         }
-        vn_clone_publish(params[0], vn_shader_widen_bounds(clone, frame, anim, display));
+        // The clone stays exactly its frame; what lies beyond it is drawn by the pass beyond the frame.
+        CGRect footprint = CGRectZero;
+        if (anim->shader.post) {
+            const CGRect screen = vn_resolved_display_get_bounds ? vn_resolved_display_get_bounds(display) : CGRectZero;
+            footprint = vn_overlay_footprint(frame, anim, screen);
+            vn_overlay_track(clone, footprint);
+        }
+        vn_clone_publish(params[0], frame, footprint, anim->shader.post, anim->shader.particles);
         if (anim->shader.particles) {
             // The particles need the window and the display in points; the
             // compute pass converts both into the render target's pixels once
@@ -2329,6 +2363,7 @@ static void vn_anim_tick(void *ctx, double when) {
         case VN_ANIM_SHADER:
             // The tag routes the clone to our substituted ubershader; all that
             // changes per frame is the progress it reads.
+            vn_overlay_invalidate(jobs[i].clone_win);
             vn_shader_set_phase(jobs[i].clone_win, jobs[i].p);
             break;
         }
@@ -4079,6 +4114,7 @@ static bool   (*vn_msg_b_u)(void *, void *, unsigned long);
 static void  *(*vn_msg_id_uuub)(void *, void *, unsigned long, unsigned long, unsigned long, bool);
 static void   (*vn_msg_v_pu)(void *, void *, void *, unsigned long);
 static void   (*vn_msg_v_size2)(void *, void *, VNMTLSize, VNMTLSize);
+static void   (*vn_msg_v_uuu)(void *, void *, unsigned long, unsigned long, unsigned long);
 static void   (*vn_msg_v)(void *, void *);
 static double (*vn_msg_d)(void *, void *);
 static unsigned long (*vn_msg_u)(void *, void *);
@@ -4114,6 +4150,7 @@ static bool vn_objc_ready(void) {
     vn_msg_id_uuub  = (void *(*)(void *, void *, unsigned long, unsigned long, unsigned long, bool))send;
     vn_msg_v_pu     = (void (*)(void *, void *, void *, unsigned long))send;
     vn_msg_v_size2  = (void (*)(void *, void *, VNMTLSize, VNMTLSize))send;
+    vn_msg_v_uuu    = (void (*)(void *, void *, unsigned long, unsigned long, unsigned long))send;
     vn_msg_v        = (void (*)(void *, void *))send;
     vn_msg_d        = (double (*)(void *, void *))send;
     vn_msg_u        = (unsigned long (*)(void *, void *))send;
@@ -4964,7 +5001,6 @@ typedef struct {
     float params[5];   // the layer's filter params, set per close in vn_make_clone
     float bound;       // 1 when params came from a layer; 0 leaves the shader on its defaults
     float phase;       // the animation's phase when this frame is drawn; -1 = use the tick's
-    float offset[2];   // the window's offset inside the quad, in window sizes; -1 = default
 } VNShaderExtra;
 
 /// True once every hook the argument buffer needs is in place. Our fragment
@@ -5001,14 +5037,299 @@ static bool vn_is_our_pipeline(void *pipeline) {
     return false;
 }
 
+#pragma mark Overlay pass: the render pass being encoded
+
+// The compositor's pass is MetalContext's newest RenderState (see kVNContextBlockMapOffset).
+
+static void *vn_ov_render_state(void *context) {
+    const uint64_t start = *(const uint64_t *)((const char *)context + kVNContextStartOffset);
+    const uint64_t count = *(const uint64_t *)((const char *)context + kVNContextCountOffset);
+    char **map = *(char ***)((const char *)context + kVNContextBlockMapOffset);
+    if (!count || !map) return NULL;
+    const uint64_t idx = start + count - 1;
+    char *block = map[idx / kVNRenderStatesPerBlock];
+    return block ? block + (idx % kVNRenderStatesPerBlock) * kVNRenderStateSize : NULL;
+}
+
+#define kVNOvMaxColour 8
+typedef struct { unsigned long colour[kVNOvMaxColour]; unsigned long depth, stencil; } VNOverlayShape;
+
+/// The pixel formats of what the pass draws into: its render pass descriptor's colour attachments,
+/// depth and stencil, or when the descriptor cannot be read the textures the pass was made from. A
+/// pipeline that does not match the pass it runs in does not draw badly, it faults the GPU.
+static bool vn_ov_pass_shape(void *context, void *target, VNOverlayShape *shape) {
+    memset(shape, 0, sizeof *shape);
+    if (vn_msg_u(target, VN_SEL("textureType")) != 2 /* 2D */ || vn_msg_u(target, VN_SEL("sampleCount")) != 1) return false;
+
+    char *state = vn_ov_render_state(context);
+    void *desc = state ? *(void **)(state + 0x18) : NULL;
+    void *colours = desc ? vn_msg_id(desc, VN_SEL("colorAttachments")) : NULL;
+    bool ok = colours != NULL;
+    for (unsigned long i = 0; ok && i < kVNOvMaxColour; i++) {
+        void *attachment = vn_msg_id_u(colours, VN_SEL("objectAtIndexedSubscript:"), i);
+        void *texture = attachment ? vn_msg_id(attachment, VN_SEL("texture")) : NULL;
+        if (!texture) continue;
+        if (vn_msg_u(texture, VN_SEL("sampleCount")) != 1) { ok = false; break; }
+        shape->colour[i] = vn_msg_u(texture, VN_SEL("pixelFormat"));
+    }
+    if (ok && shape->colour[0]) {
+        void *depth = vn_msg_id(desc, VN_SEL("depthAttachment"));
+        void *depth_texture = depth ? vn_msg_id(depth, VN_SEL("texture")) : NULL;
+        if (depth_texture) shape->depth = vn_msg_u(depth_texture, VN_SEL("pixelFormat"));
+        void *stencil = vn_msg_id(desc, VN_SEL("stencilAttachment"));
+        void *stencil_texture = stencil ? vn_msg_id(stencil, VN_SEL("texture")) : NULL;
+        if (stencil_texture) shape->stencil = vn_msg_u(stencil_texture, VN_SEL("pixelFormat"));
+        return true;
+    }
+
+    // StartComposite gives the pass one colour attachment, the render target, and a second only for
+    // a display stream's pass; no depth, no stencil, one sample.
+    memset(shape, 0, sizeof *shape);
+    void *first = state ? *(void **)(state + 8) : NULL, *second = state ? *(void **)(state + 0x10) : NULL;
+    if (first != target || vn_msg_u(first, VN_SEL("sampleCount")) != 1) return false;
+    shape->colour[0] = vn_msg_u(first, VN_SEL("pixelFormat"));
+    if (second) {
+        if (vn_msg_u(second, VN_SEL("sampleCount")) != 1) return false;
+        shape->colour[1] = vn_msg_u(second, VN_SEL("pixelFormat"));
+    }
+    return true;
+}
+
+static void vn_ov_shape_text(const VNOverlayShape *shape, char *out, size_t size) {
+    size_t n = 0;
+    out[0] = '\0';
+    for (int i = 0; i < kVNOvMaxColour; i++) {
+        if (shape->colour[i] && n < size) n += (size_t)snprintf(out + n, size - n, "%scolour%d=%lu", n ? " " : "", i, shape->colour[i]);
+    }
+    if (shape->depth && n < size) n += (size_t)snprintf(out + n, size - n, " depth=%lu", shape->depth);
+    if (shape->stencil && n < size) n += (size_t)snprintf(out + n, size - n, " stencil=%lu", shape->stencil);
+}
+
+/// One pipeline for each animation and shape of pass: our vertex and the animation's post fragment,
+/// the pass's attachments (the first is written, the others are left as they are), no blending (the
+/// fragment blends itself).
+static struct { const char *post; VNOverlayShape shape; void *pipeline; } gVNOverlayPipes[32];
+static os_unfair_lock gVNOverlayPipeLock = OS_UNFAIR_LOCK_INIT;
+
+static void *vn_ov_function(void *library, const char *name) {
+    CFStringRef s = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+    void *fn = s ? vn_msg_id_p(library, VN_SEL("newFunctionWithName:"), (void *)s) : NULL;
+    if (s) CFRelease(s);
+    return fn;
+}
+
+static void *vn_ov_pipeline(void *target, const char *post, const VNOverlayShape *shape) {
+    os_unfair_lock_lock(&gVNOverlayPipeLock);
+    const size_t slots = sizeof(gVNOverlayPipes) / sizeof(gVNOverlayPipes[0]);
+    size_t free_slot = slots;
+    void *found = NULL;
+    for (size_t i = 0; i < slots && !found; i++) {
+        if (gVNOverlayPipes[i].pipeline && gVNOverlayPipes[i].post == post && !memcmp(&gVNOverlayPipes[i].shape, shape, sizeof *shape)) {
+            found = gVNOverlayPipes[i].pipeline;
+        }
+        if (!gVNOverlayPipes[i].pipeline && free_slot == slots) free_slot = i;
+    }
+    if (found || free_slot == slots) {
+        os_unfair_lock_unlock(&gVNOverlayPipeLock);
+        if (!found) VN_ERROR("overlay: no room for another pipeline");
+        return found;
+    }
+
+    void *library = vn_shader_library(gUberLibrary);
+    void *device = vn_msg_id(target, VN_SEL("device"));
+    void *vfn = library ? vn_ov_function(library, "vn_post_vertex") : NULL;
+    void *ffn = library ? vn_ov_function(library, post) : NULL;
+    void *pipeline = NULL;
+    char text[160];
+    vn_ov_shape_text(shape, text, sizeof text);
+    if (device && vfn && ffn) {
+        void *desc = vn_msg_id(vn_msg_id(vn_get_class("MTLRenderPipelineDescriptor"), VN_SEL("alloc")), VN_SEL("init"));
+        vn_msg_v_p(desc, VN_SEL("setVertexFunction:"), vfn);
+        vn_msg_v_p(desc, VN_SEL("setFragmentFunction:"), ffn);
+        void *attachments = vn_msg_id(desc, VN_SEL("colorAttachments"));
+        for (unsigned long i = 0; i < kVNOvMaxColour; i++) {
+            if (!shape->colour[i]) continue;
+            void *attachment = vn_msg_id_u(attachments, VN_SEL("objectAtIndexedSubscript:"), i);
+            vn_msg_v_u(attachment, VN_SEL("setPixelFormat:"), shape->colour[i]);
+            if (i > 0) vn_msg_v_u(attachment, VN_SEL("setWriteMask:"), 0 /* none: only the first is the animation's */);
+        }
+        if (shape->depth) vn_msg_v_u(desc, VN_SEL("setDepthAttachmentPixelFormat:"), shape->depth);
+        if (shape->stencil) vn_msg_v_u(desc, VN_SEL("setStencilAttachmentPixelFormat:"), shape->stencil);
+        void *err = NULL;
+        pipeline = vn_msg_id_pp(device, VN_SEL("newRenderPipelineStateWithDescriptor:error:"), desc, &err);
+        vn_msg_v(desc, VN_SEL("release"));
+    }
+    if (vfn) vn_msg_v(vfn, VN_SEL("release"));
+    if (ffn) vn_msg_v(ffn, VN_SEL("release"));
+    if (pipeline) {
+        gVNOverlayPipes[free_slot].post = post;
+        gVNOverlayPipes[free_slot].shape = *shape;
+        gVNOverlayPipes[free_slot].pipeline = pipeline;
+        VN_INFO("overlay: pipeline built for '%s', pass of (%s) -> %p", post, text, pipeline);
+    } else {
+        VN_ERROR("overlay: pipeline '%s' for a pass of (%s) refused", post, text);
+    }
+    os_unfair_lock_unlock(&gVNOverlayPipeLock);
+    return pipeline;
+}
+
+/// The sampler the post fragments read the clone's content with: linear, clamped.
+static void *vn_ov_sampler(void *device) {
+    static void *s_sampler, *s_device;
+    if (s_sampler && s_device == device) return s_sampler;
+    void *desc = vn_msg_id(vn_msg_id(vn_get_class("MTLSamplerDescriptor"), VN_SEL("alloc")), VN_SEL("init"));
+    vn_msg_v_u(desc, VN_SEL("setMinFilter:"), 1 /* linear */);
+    vn_msg_v_u(desc, VN_SEL("setMagFilter:"), 1);
+    s_sampler = vn_msg_id_p(device, VN_SEL("newSamplerStateWithDescriptor:"), desc);
+    s_device = device;
+    vn_msg_v(desc, VN_SEL("release"));
+    return s_sampler;
+}
+
+#pragma mark Overlay pass: the draw
+
+/// Where the clone is, for the pass: what the draw hook may read without a lock (the same ring the
+/// phase comes from).
+static int vn_ov_rect(VNPostVertex *out, double x0, double y0, double x1, double y1,
+                      double tw, double th, double fx, double fy, double fw, double fh) {
+    if (x1 - x0 < 0.5 || y1 - y0 < 0.5) return 0;
+    const double xs[4] = {x0, x1, x0, x1}, ys[4] = {y0, y0, y1, y1};
+    VNPostVertex v[4];
+    for (int i = 0; i < 4; i++) {
+        v[i] = (VNPostVertex){{(float)(xs[i] / tw * 2.0 - 1.0), (float)(1.0 - ys[i] / th * 2.0)},
+                              {(float)((xs[i] - fx) / fw), (float)((ys[i] - fy) / fh)}};
+    }
+    static const int order[6] = {0, 1, 2, 1, 3, 2};
+    for (int i = 0; i < 6; i++) out[i] = v[order[i]];
+    return 6;
+}
+
+static bool vn_overlay_draw(void *context, void *layer, void *destination, const VNCloneEntry *entry, void *texture) {
+    if (!texture) return vn_ov_skip(kVNOvSkipNoTexture);
+
+    char *state = vn_ov_render_state(context);
+    void *target = state ? *(void **)(state + 8) : NULL;
+    if (!target) return vn_ov_skip(kVNOvSkipNoTarget);
+    VNOverlayShape shape;
+    if (!vn_ov_pass_shape(context, target, &shape)) return vn_ov_skip(kVNOvSkipOddPass);
+
+    const int32_t *db = (const int32_t *)((const char *)destination + kVNDestinationBoundsOffset);
+    float scale = *(const float *)((const char *)destination + kVNDestinationScaleOffset);
+    if (!(scale > 0.0f)) scale = 1.0f;
+    const double tw = (double)vn_msg_u(target, VN_SEL("width")), th = (double)vn_msg_u(target, VN_SEL("height"));
+    // The mapping from points to pixels below assumes the destination is the whole texture.
+    if (tw < 1.0 || th < 1.0 || fabs(tw - (double)(db[2] - db[0]) * scale) > 2.0 || fabs(th - (double)(db[3] - db[1]) * scale) > 2.0) {
+        return vn_ov_skip(kVNOvSkipDimensions);
+    }
+
+    // The frame and the footprint in the target's pixels; the footprint is kept inside the target.
+    const double fx = ((double)entry->frame[0] - db[0]) * scale, fy = ((double)entry->frame[1] - db[1]) * scale;
+    const double fw = (double)entry->frame[2] * scale, fh = (double)entry->frame[3] * scale;
+    const double px0 = fmax(0.0, ((double)entry->footprint[0] - db[0]) * scale);
+    const double py0 = fmax(0.0, ((double)entry->footprint[1] - db[1]) * scale);
+    const double px1 = fmin(tw, ((double)entry->footprint[0] + entry->footprint[2] - db[0]) * scale);
+    const double py1 = fmin(th, ((double)entry->footprint[1] + entry->footprint[3] - db[1]) * scale);
+    if (px1 - px0 < 1.0 || py1 - py0 < 1.0 || fw < 1.0 || fh < 1.0) return vn_ov_skip(kVNOvSkipOutside);
+
+    // The footprint minus the frame: above it, below it, and either side of it between those.
+    const double cx0 = fmin(fmax(fx, px0), px1), cx1 = fmin(fmax(fx + fw, px0), px1);
+    const double cy0 = fmin(fmax(fy, py0), py1), cy1 = fmin(fmax(fy + fh, py0), py1);
+    VNPostVertex verts[24];
+    int n = 0;
+    n += vn_ov_rect(verts + n, px0, py0, px1, cy0, tw, th, fx, fy, fw, fh);
+    n += vn_ov_rect(verts + n, px0, cy1, px1, py1, tw, th, fx, fy, fw, fh);
+    n += vn_ov_rect(verts + n, px0, cy0, cx0, cy1, tw, th, fx, fy, fw, fh);
+    n += vn_ov_rect(verts + n, cx1, cy0, px1, cy1, tw, th, fx, fy, fw, fh);
+    if (n == 0) return true;   // nothing outside the frame this frame
+
+    void *pipeline = vn_ov_pipeline(target, entry->post, &shape);
+    if (!pipeline) return vn_ov_skip(kVNOvSkipNoPipeline);
+    void *sampler = vn_ov_sampler(vn_msg_id(target, VN_SEL("device")));
+
+    // What the compositor hands the ubershader's fragment: the layer's brightness (the phase) and fade.
+    float args[3] = {*(const float *)((const char *)layer + kVNLayerBrightnessOffset),
+                     *(const float *)((const char *)layer + kVNLayerFadeOffset), 1.0f};
+    VNShaderExtra extra = { .bound = 1.0f };
+    memcpy(extra.params, (const char *)layer + kVNLayerFilterParamsOffset, sizeof(extra.params));
+    extra.phase = vn_clone_phase(extra.params[0], SLSCurrentRealTime());
+
+    // A new encoder for the pass, and a clean one after it, so nothing bound here reaches the layers
+    // that follow (what the compositor remembers of what it bound lives with the encoder).
+    vn_resolved_end_encoders(context);
+    void *encoder = vn_resolved_render_encoder(context);
+    if (!encoder) return vn_ov_skip(kVNOvSkipNoEncoder);
+
+    vn_orig_set_pipeline_state(context, pipeline);
+    vn_msg_v_cuu(encoder, VN_SEL("setVertexBytes:length:atIndex:"), verts, (unsigned long)n * sizeof(VNPostVertex), 0);
+    vn_msg_v_cuu(encoder, VN_SEL("setFragmentBytes:length:atIndex:"), args, sizeof args, 0);
+    vn_msg_v_cuu(encoder, VN_SEL("setFragmentBytes:length:atIndex:"), &extra, sizeof extra, kVNShaderExtraIndex);
+    vn_msg_v_pu(encoder, VN_SEL("setFragmentTexture:atIndex:"), texture, 0);
+    if (sampler) vn_msg_v_pu(encoder, VN_SEL("setFragmentSamplerState:atIndex:"), sampler, 0);
+    if (entry->particles) vn_particles_bind_fragment(encoder, destination, extra.params[0], true);
+
+    static _Atomic int s_logged;
+    if (atomic_fetch_add_explicit(&s_logged, 1, memory_order_relaxed) < 8) {
+        char text[160];
+        vn_ov_shape_text(&shape, text, sizeof text);
+        VN_INFO("overlay: '%s' over a %.0fx%.0f target (%s): frame (%.0f,%.0f %.0fx%.0f), footprint (%.0f,%.0f)-(%.0f,%.0f) pixels, "
+                "%d vertices, texture %lux%lu, phase %.3f", entry->post, tw, th, text, fx, fy, fw, fh, px0, py0, px1, py1, n,
+                vn_msg_u(texture, VN_SEL("width")), vn_msg_u(texture, VN_SEL("height")), (double)extra.phase);
+    }
+
+    vn_msg_v_uuu(encoder, VN_SEL("drawPrimitives:vertexStart:vertexCount:"), 3 /* triangles */, 0, (unsigned long)n);
+    vn_resolved_end_encoders(context);
+    return true;
+}
+
+/// The texture a clone layer's draw binds at index 0: the content the pass beyond the frame draws
+/// from. `armed` is the one bound after one of our pipelines was set; failing that, the last one bound.
+static __thread bool  tl_vn_capturing;
+static __thread bool  tl_vn_armed;
+static __thread void *tl_vn_layer_texture;
+static __thread void *tl_vn_armed_texture;
+
+static void vn_hook_set_render_fragment_texture(void *context, void *texture, unsigned long index) {
+    if (tl_vn_capturing && index == 0 && texture) {
+        tl_vn_layer_texture = texture;
+        if (tl_vn_armed) tl_vn_armed_texture = texture;
+    }
+    vn_orig_set_render_fragment_texture(context, texture, index);
+}
+
 static uint64_t vn_hook_metal_composite_layer(void *context, void *layer, void *destination, uint64_t flags) {
     void *outer = tl_vn_layer;
     void *outer_dest = tl_vn_destination;
+    const bool outer_capturing = tl_vn_capturing, outer_armed = tl_vn_armed;
+    void *outer_texture = tl_vn_layer_texture, *outer_armed_texture = tl_vn_armed_texture;
     tl_vn_layer = layer;
     tl_vn_destination = destination;
+    tl_vn_capturing = layer && atomic_load_explicit(&gShaderFilterCount, memory_order_acquire) > 0 &&
+                      *(const uint32_t *)((const char *)layer + kVNLayerFilterTypeOffset) == kVNFilterTypeShaderTag;
+    tl_vn_armed = false;
+    tl_vn_layer_texture = tl_vn_armed_texture = NULL;
+
     uint64_t result = vn_orig_metal_composite_layer(context, layer, destination, flags);
+
+    if (tl_vn_capturing && vn_orig_set_render_fragment_texture) {
+        float seed;
+        memcpy(&seed, (const char *)layer + kVNLayerFilterParamsOffset, sizeof seed);
+        const VNCloneEntry *entry = vn_clone_entry(seed);
+        if (entry && entry->post) {
+            atomic_fetch_add_explicit(&gVNOverlayLayers, 1, memory_order_relaxed);
+            if (vn_overlay_draw(context, layer, destination, entry, tl_vn_armed_texture ? tl_vn_armed_texture : tl_vn_layer_texture)) {
+                atomic_fetch_add_explicit(&gVNOverlayDrawn, 1, memory_order_relaxed);
+            }
+        } else if (!entry) {
+            vn_ov_skip(kVNOvSkipNoEntry);
+        }
+    }
+
     tl_vn_layer = outer;
     tl_vn_destination = outer_dest;
+    tl_vn_capturing = outer_capturing;
+    tl_vn_armed = outer_armed;
+    tl_vn_layer_texture = outer_texture;
+    tl_vn_armed_texture = outer_armed_texture;
     return result;
 }
 
@@ -5036,6 +5357,7 @@ static void vn_hook_set_pipeline_state(void *context, void *pipeline) {
     // a shader clone exists can one of our pipelines be among them.
     if (atomic_load_explicit(&gShaderFilterCount, memory_order_acquire) <= 0) return;
     if (!pipeline || !vn_is_our_pipeline(pipeline)) return;
+    tl_vn_armed = true;
 
     static void (*msg)(void *, void *, const void *, unsigned long, unsigned long);
     static void *sel_set_bytes;
@@ -5044,15 +5366,14 @@ static void vn_hook_set_pipeline_state(void *context, void *pipeline) {
         msg = (void (*)(void *, void *, const void *, unsigned long, unsigned long))dlsym(RTLD_DEFAULT, "objc_msgSend");
     }
 
-    VNShaderExtra extra = { .phase = -1.0f, .offset = { -1.0f, -1.0f } };
+    VNShaderExtra extra = { .phase = -1.0f };
     void *layer = tl_vn_layer;
     if (layer && *(uint32_t *)((char *)layer + kVNLayerFilterTypeOffset) == kVNFilterTypeShaderTag) {
         memcpy(extra.params, (char *)layer + kVNLayerFilterParamsOffset, sizeof(extra.params));
         extra.bound = 1.0f;
         const double now = SLSCurrentRealTime();
-        vn_clone_lookup(extra.params[0], now, &extra.phase, &extra.offset[0], &extra.offset[1]);
-        VN_TRACE("draw: layer %p phase %.4f offset (%.3f, %.3f) at %.4f", layer, (double)extra.phase,
-                 (double)extra.offset[0], (double)extra.offset[1], now);
+        extra.phase = vn_clone_phase(extra.params[0], now);
+        VN_TRACE("draw: layer %p phase %.4f at %.4f", layer, (double)extra.phase, now);
     }
 
     void *encoder = vn_resolved_render_encoder(context);
@@ -5159,7 +5480,6 @@ static void vanish_init_payload(void) {
     vn_resolved_window_set_filter            = (VNWindowSetFilterFn)vn_skylight_symbol(kVNSymWindowSetFilter);
     vn_resolved_update_window                = (VNUpdateWindowFn)vn_skylight_symbol(kVNSymUpdateWindow);
     vn_resolved_create_shader                = (VNCreateShaderFn)vn_skylight_symbol(kVNSymCreateShader);
-    vn_resolved_shape_window_with_rect       = (VNShapeWindowWithRectFn)vn_skylight_symbol(kVNSymShapeWindowWithRect);
     vn_resolved_create_clone                 = (VNCreateCloneFn)vn_skylight_symbol(kVNSymCreateCloneOfWindow);
     vn_resolved_system_window_release        = (VNSystemWindowReleaseFn)vn_skylight_symbol(kVNSymSystemWindowRelease);
     vn_resolved_window_get_display           = (VNWindowGetDisplayFn)vn_skylight_symbol(kVNSymWindowGetDisplay);
@@ -5242,6 +5562,24 @@ static void vanish_init_payload(void) {
             (void *)vn_resolved_render_encoder, gVNShaderArgsReady);
     if (!gVNShaderArgsReady) {
         VN_ERROR("WARNING: shader argument hooks missing -- shader animations fall back to the stock invert");
+    }
+
+    // The pass beyond the frame (see Overlay pass): the texture the clone's layer binds, and what
+    // repaints the display's rectangle behind what the pass draws.
+    vn_resolved_invalidate_display_shape = (VNInvalidateDisplayShapeFn)vn_skylight_symbol(kVNSymInvalidateDisplayShape);
+    vn_cgs_new_region_with_rect = (int (*)(const CGRect *, void **))dlsym(RTLD_DEFAULT, "CGSNewRegionWithRect");
+    vn_cgs_release_region       = (void (*)(void *))dlsym(RTLD_DEFAULT, "CGSReleaseRegion");
+    void *targetSetTexture = vn_skylight_symbol(kVNSymMetalContextSetRenderFragmentTexture);
+    if (targetSetTexture) {
+        TIL_HOOK("com.doraorak.vanish", ptrauth_strip(targetSetTexture, ptrauth_key_function_pointer),
+                 vn_hook_set_render_fragment_texture, &vn_orig_set_render_fragment_texture);
+    }
+    VN_INFO("overlay: set_render_fragment_texture=%p (hooked=%d) invalidate_display_shape=%p new_region=%p release_region=%p",
+            targetSetTexture, vn_orig_set_render_fragment_texture != NULL, (void *)vn_resolved_invalidate_display_shape,
+            (void *)vn_cgs_new_region_with_rect, (void *)vn_cgs_release_region);
+    if (!vn_orig_set_render_fragment_texture || !vn_resolved_invalidate_display_shape || !vn_cgs_new_region_with_rect ||
+        !vn_cgs_release_region) {
+        VN_ERROR("WARNING: the pass beyond the frame could not be installed -- animations draw only inside the window");
     }
 
     // The compute pass. StartComposite is the point in the frame where the

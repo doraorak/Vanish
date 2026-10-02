@@ -828,14 +828,9 @@ kernel void vn_field_blur_y(texture2d<float, access::read> src  [[texture(0)]],
 /// fragment one texture, the clone's content, and no way to sample the desktop
 /// behind it -- so the liquid is made of the window that is closing, carried
 /// along by the particles as `uv0` and distorted by the surface it now has.
-fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
-                              texture2d<float> tex2D        [[texture(0)]],
-                              texture2d<float> fieldTex     [[texture(1)]],
-                              texture2d<float> motionTex    [[texture(2)]],
-                              constant VNUberArgs &args     [[buffer(0)]],
-                              constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
-                              constant VNSimParams &sp      [[buffer(11)]],
-                              sampler samp [[sampler(0)]]) {
+static inline float4 vn_water_shade(VNUberStage in, texture2d<float> tex2D, texture2d<float> fieldTex,
+                                    texture2d<float> motionTex, constant VNUberArgs &args,
+                                    constant VNShaderExtra &extra, constant VNSimParams &sp, sampler samp) {
     const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6), extra);
     const float  t  = vn_phase(args, extra);
     const bool   inside_window = all(uv >= 0.0) && all(uv <= 1.0);
@@ -1015,6 +1010,29 @@ fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
     const float opacity = mix(saturate(mix(0.7, 0.97, 1.0 - exp(-1.6 * T)) + F * 0.5 + foam * 0.6), 1.0, young);
     const float alpha = cover * opacity * saturate(held.a) * saturate(sp.fade);
     return float4(rgb * alpha, alpha);
+}
+
+fragment float4 vn_uber_water(VNUberStage in [[stage_in]],
+                              texture2d<float> tex2D        [[texture(0)]],
+                              texture2d<float> fieldTex     [[texture(1)]],
+                              texture2d<float> motionTex    [[texture(2)]],
+                              constant VNUberArgs &args     [[buffer(0)]],
+                              constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
+                              constant VNSimParams &sp      [[buffer(11)]],
+                              sampler samp [[sampler(0)]]) {
+    return vn_water_shade(in, tex2D, fieldTex, motionTex, args, extra, sp, samp);
+}
+
+fragment float4 vn_post_water(VNUberStage in [[stage_in]],
+                              float4 dst                    [[color(0)]],
+                              texture2d<float> tex2D        [[texture(0)]],
+                              texture2d<float> fieldTex     [[texture(1)]],
+                              texture2d<float> motionTex    [[texture(2)]],
+                              constant VNUberArgs &args     [[buffer(0)]],
+                              constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
+                              constant VNSimParams &sp      [[buffer(11)]],
+                              sampler samp [[sampler(0)]]) {
+    return vn_post_blend(dst, vn_water_shade(in, tex2D, fieldTex, motionTex, args, extra, sp, samp));
 }
 
 #endif // VN_WATER_METAL

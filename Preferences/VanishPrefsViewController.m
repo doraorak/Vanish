@@ -47,6 +47,7 @@ static const VNAnimationMeta kAnimations[] = {
     { "shatter",   "Shatter",   0.40 },
     { "burn", "Burn", 0.35 },
     { "water",     "Water",     1.60 },
+    { "curl",      "Page Curl", 0.60 },
 };
 #define kAnimationCount (sizeof(kAnimations) / sizeof(kAnimations[0]))
 

@@ -136,31 +136,6 @@ _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.param
 
 #define kVNSymCreateSpecializedShader \
     "__ZN14ShaderComposer25create_specialized_shaderEPU21objcproto10MTLLibrary11objc_objectP8NSStringS3_PFP25MTLFunctionConstantValuesyEyP19MTLVertexDescriptor"
-/// `CGXWindow::shape_window_with_rect(CGRect, CGSWindowSaveWeighting)`
-///
-/// Sets a window's shape from a plain rect -- it builds the region itself, so
-/// no CGSRegionObject has to be constructed. x0 is `this`, the rect arrives in
-/// d0-d3 and the weighting in x1.
-///
-/// This is the only lever we have on where a shader animation may draw. A
-/// fragment shader can only write inside the layer's draw shape, and
-/// generate_layers_for_window builds that from the window's own region, so
-/// flecks drifting past the window's edge are cut off. Inflating the clone's
-/// frame does not move that bound, and a mesh warp cannot: the compositor
-/// treats mesh and filter as mutually exclusive --
-///
-///     +8192: ldr  x9, [win, #0x8a8]   ; the filter
-///     +8196: cbz  x9, skip            ; none -> nothing to apply
-///     +8200: tbnz x8, #0x26, apply    ; flag bit 38 -> ignore the mesh
-///     +8204: ldr  x10, [win, #0x8b0]  ; the mesh
-///     +8208: cbnz x10, skip           ; mesh present -> skip the filter
-///
-/// and bit 38 is not an escape hatch: every site that tests it treats it as
-/// "behave as though there were no mesh", so setting it would buy the filter
-/// back by discarding the warp.
-#define kVNSymShapeWindowWithRect \
-    "__ZN9CGXWindow22shape_window_with_rectE6CGRect22CGSWindowSaveWeighting"
-
 #define kVNSymUberComposite \
     "__ZN14ShaderComposer13UberCompositeE14MTLPixelFormaty"
 #define kVNSymCreateShader \
@@ -243,6 +218,36 @@ _Static_assert(offsetof(VNWindowFilter, params)   == 0x18, "VNWindowFilter.param
 
 #define kVNLayerFilterTypeOffset  0x228
 #define kVNLayerFilterParamsOffset 0x230
+
+/// What MetalCompositeLayer reads out of a layer for UberComposite_FragmentArgs, which the pass of
+/// our own (see the Overlay pass) hands its fragments from the same place: the brightness
+/// (CGXWindow::brightness, the animation's phase) and the fade.
+#define kVNLayerBrightnessOffset  0x224
+#define kVNLayerFadeOffset        0x18c
+
+/// `MetalContext::SetRenderFragmentTexture(texture, index)`: how a layer's draw binds its texture.
+/// A clone layer's content is the texture bound at index 0 after one of our pipelines is set, which
+/// is the one the pass of our own draws from. (The function also records the texture in the pass's
+/// RenderState; it returns nothing.)
+#define kVNSymMetalContextSetRenderFragmentTexture \
+    "__ZN12MetalContext24SetRenderFragmentTextureEPU21objcproto10MTLTexture11objc_objectm"
+
+/// `CGXInvalidateDisplayShape(connection, window, region)`: adds the region (screen points) to what
+/// the next display update repaints. It does not clip it to the window: with a NULL connection the
+/// region goes to the global accumulator wherever it lies. set_mesh_warp calls it with the old and
+/// the new frame shape of the window; anything an animation draws outside the clone's frame needs
+/// it called too.
+#define kVNSymInvalidateDisplayShape "_CGXInvalidateDisplayShape"
+
+/// Where a render pass's state is, for the pass of our own: MetalContext holds a deque of RenderState
+/// entries (0xb0 bytes, 23 to a block), and the newest is the pass being encoded. At +8 is the
+/// texture the pass draws into, +0x10 a second (a display stream's pass), +0x18 the render pass
+/// descriptor.
+#define kVNContextBlockMapOffset  0x08
+#define kVNContextStartOffset     0x20
+#define kVNContextCountOffset     0x28
+#define kVNRenderStateSize        0xb0
+#define kVNRenderStatesPerBlock   23
 
 /// `CGXWindow::reevaluate_hdr_request()`: turns the window's desired EDR
 /// headroom into a request on the display. It reads the headroom as a float at
@@ -733,13 +738,14 @@ typedef void  *(*VNCreateShaderFn)(void *library, void *vtx, void *frag, void *v
 
 /// NON-static -- x0 is the ShaderComposer, unlike its create_* siblings.
 typedef void  *(*VNUberCompositeFn)(void *composer, unsigned fmt, uint64_t options);
-typedef void   (*VNShapeWindowWithRectFn)(CGXWindow *, CGRect, uint32_t);
 
 /// All four are ordinary member functions: x0 is `this`, confirmed from each
 /// prologue. CopyPipelineState's `this` is the MetalShader and its first
 /// argument the MetalContext.
 typedef uint64_t (*VNMetalCompositeLayerFn)(void *context, void *layer, void *destination, uint64_t flags);
 typedef void     (*VNSetPipelineStateFn)(void *context, void *pipeline);
+typedef void     (*VNSetRenderFragmentTextureFn)(void *context, void *texture, unsigned long index);
+typedef void     (*VNInvalidateDisplayShapeFn)(CGXConnection *, CGXWindow *, void *region);
 typedef void     (*VNStartCompositeFn)(void *context, void *destination, uint64_t load, uint64_t store);
 typedef void     (*VNEndEncodersFn)(void *context);
 typedef void    *(*VNRenderCommandBufferFn)(void *context, const void *empty_vector);

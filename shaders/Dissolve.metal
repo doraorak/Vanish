@@ -22,11 +22,8 @@
 /// cell mask covers whole cells, so the frame is byte-identical to the
 /// untouched window -- the registry's identity rule, which matters because the
 /// clone composites once with the tag attached before the animation starts.
-fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
-                                 texture2d<float> tex2D [[texture(0)]],
-                                 constant VNUberArgs &args [[buffer(0)]],
-                                 constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
-                                 sampler samp [[sampler(0)]]) {
+static inline float4 vn_dissolve_shade(VNUberStage in, texture2d<float> tex2D, constant VNUberArgs &args,
+                                       constant VNShaderExtra &extra, sampler samp) {
     const float2 uv = vn_window_uv(in.tex.xy / max(in.tex.w, 1e-6), extra);
     const float  t  = vn_phase(args, extra);
 
@@ -100,5 +97,15 @@ fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
     colour *= clamp(1.2 - age, 0.0, 1.0);
     return colour;
 }
+
+fragment float4 vn_uber_dissolve(VNUberStage in [[stage_in]],
+                                 texture2d<float> tex2D [[texture(0)]],
+                                 constant VNUberArgs &args [[buffer(0)]],
+                                 constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
+                                 sampler samp [[sampler(0)]]) {
+    return vn_dissolve_shade(in, tex2D, args, extra, samp);
+}
+
+VN_POST_ENTRY(dissolve, vn_dissolve_shade)
 
 #endif // VN_DISSOLVE_METAL

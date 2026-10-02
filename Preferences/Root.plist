@@ -59,6 +59,7 @@
 				<string>Shatter</string>
 				<string>Burn</string>
 				<string>Water</string>
+				<string>Page Curl</string>
 			</array>
 			<key>validValues</key>
 			<array>
@@ -74,6 +75,7 @@
 				<string>shatter</string>
 				<string>burn</string>
 				<string>water</string>
+				<string>curl</string>
 			</array>
 		</dict>
 		<dict>
@@ -561,6 +563,24 @@
 			<string>duration_water</string>
 			<key>label</key>
 			<string>Water</string>
+			<key>max</key>
+			<real>5.0</real>
+			<key>min</key>
+			<real>0.05</real>
+			<key>showValue</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.doraorak.vanish/prefsChanged</string>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>default</key>
+			<real>0.6</real>
+			<key>key</key>
+			<string>duration_curl</string>
+			<key>label</key>
+			<string>Page Curl</string>
 			<key>max</key>
 			<real>5.0</real>
 			<key>min</key>

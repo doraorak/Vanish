@@ -82,11 +82,8 @@ static inline void vn_shard_at(float2 c, float2 seed, thread float2 &id, thread 
 /// `brightness` is the phase, 1 -> 0. At 1 every shard's age is 0, so every
 /// transform -- global and local -- is the identity: the frame is the untouched
 /// window, to the texel.
-fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
-                                texture2d<float> tex2D [[texture(0)]],
-                                constant VNUberArgs &args [[buffer(0)]],
-                                constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
-                                sampler samp [[sampler(0)]]) {
+static inline float4 vn_shatter_shade(VNUberStage in, texture2d<float> tex2D, constant VNUberArgs &args,
+                                      constant VNShaderExtra &extra, sampler samp) {
     // `fuv` spans the clone's frame -- the window plus its shadow when shadows
     // are on. The glass is the window alone: `uv` spans just the window's rect,
     // the shards are cut from it, and each shard is masked to the window's
@@ -194,5 +191,15 @@ fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
                        * clamp(1.3 - age, 0.0, 1.0);
     return shard + shadow * (1.0 - shard.a);
 }
+
+fragment float4 vn_uber_shatter(VNUberStage in [[stage_in]],
+                                texture2d<float> tex2D [[texture(0)]],
+                                constant VNUberArgs &args [[buffer(0)]],
+                                constant VNShaderExtra &extra [[buffer(kVNShaderExtraIndex)]],
+                                sampler samp [[sampler(0)]]) {
+    return vn_shatter_shade(in, tex2D, args, extra, samp);
+}
+
+VN_POST_ENTRY(shatter, vn_shatter_shade)
 
 #endif // VN_SHATTER_METAL
