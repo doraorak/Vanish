@@ -41,9 +41,9 @@ mkdir -p "$DIR/$BUNDLE/Contents/MacOS" "$DIR/$BUNDLE/Contents/Resources"
 # SkyLight is linked for the SLS* symbols. It is a private framework, hence the
 # explicit -F; the SDK does not put it on the default search path.
 #
-# TI_Ellekit provides MSHookFunction. Its install name is /Library/TweakInject/TI_Ellekit.dylib.
+# TI_Ellekit provides MSHookFunction. Its install name is /Library/TweakInject/Internal/TI_Ellekit.dylib.
 TWEAKINJECT_DIR="$DIR/../../XCode-projects/APP/My apps/TweakInject"
-ELLEKIT_LIB="/Library/TweakInject/TI_Ellekit.dylib"
+ELLEKIT_LIB="/Library/TweakInject/Internal/TI_Ellekit.dylib"
 if [ ! -f "$ELLEKIT_LIB" ]; then
     if [ -f "$TWEAKINJECT_DIR/Payload/TI_Ellekit.dylib" ]; then
         ELLEKIT_LIB="$TWEAKINJECT_DIR/Payload/TI_Ellekit.dylib"
@@ -57,7 +57,7 @@ if [ ! -f "$SUPPORT_LIB" ]; then
     SUPPORT_LIB="$TWEAKINJECT_DIR/Payload/TI_Support.dylib"
 fi
 if [ ! -f "$SUPPORT_LIB" ]; then
-    SUPPORT_LIB="/Library/TweakInject/TI_Support.dylib"
+    SUPPORT_LIB="/Library/TweakInject/Internal/TI_Support.dylib"
 fi
 
 clang -dynamiclib -arch arm64e -isysroot "$SDK_PATH" -fblocks -std=c11 \
