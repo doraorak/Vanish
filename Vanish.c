@@ -3482,10 +3482,13 @@ static inline bool vn_is_in_yellow_or_green_hitbox(double lx, double ly) {
     return false;
 }
 
-static uint64_t gLastMouseDownTimeMs = 0;
-static CGPoint  gLastMouseDownPt     = {0};
+// The previous press, for telling a repeated press on the red button (an impatient second click while the
+// close the first one started is still on its way) from a new one.
 static uint32_t gLastMouseDownWid    = 0;
-static uint64_t gDoubleClickSuppressUntilMs = 0;
+static bool     gLastMouseDownWasRed = false;
+// The press being held is a repeat of the red press (see above): the pointer's small moves while it is held are
+// not a window drag, so they do not take the waiting clone away.
+static bool     gRepeatPressHeld     = false;
 
 static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
     if (!event) {
@@ -3505,40 +3508,26 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
                 double lx = local_pt->x;
                 double ly = local_pt->y;
 
-                uint64_t now_ms = vn_now_ms();
-
-                bool is_double_click = false;
-                if (wid == gLastMouseDownWid && (now_ms - gLastMouseDownTimeMs) < 450) {
-                    double dist = hypot(screen_pt->x - gLastMouseDownPt.x, screen_pt->y - gLastMouseDownPt.y);
-                    if (dist < 8.0) {
-                        is_double_click = true;
-                    }
-                }
-
-                bool suppressed_by_double_click = (now_ms < gDoubleClickSuppressUntilMs);
-
-                gLastMouseDownTimeMs = now_ms;
-                gLastMouseDownPt = *screen_pt;
-                gLastMouseDownWid = wid;
-
-                if (is_double_click) {
-                    VN_DEBUG("hit-test: double-click detected on wid=%u (pt=%.1f,%.1f) -- discarding pre-clone and suppressing for 600ms",
-                           wid, lx, ly);
-                    vn_pending_red_clear();
-                    vn_pending_clone_discard_wid(wid);
-                    gDoubleClickSuppressUntilMs = now_ms + 600;
-                    goto dispatch;
-                }
-
-                if (suppressed_by_double_click) {
-                    VN_DEBUG("hit-test: click on wid=%u suppressed due to active double-click window", wid);
-                    vn_pending_red_clear();
-                    vn_pending_clone_discard_wid(wid);
-                    goto dispatch;
-                }
-
                 bool is_red = vn_is_in_red_hitbox(lx, ly);
                 bool is_yellow_or_green = vn_is_in_yellow_or_green_hitbox(lx, ly);
+
+                // A second press on the red button while the first one's pre-clone is waiting for its close is
+                // the same close asked for again: the clone stays as it is. Every other press stands on what it
+                // hit, however soon after another and however near it: a click that missed the button and the
+                // click that meant it are two presses, and only the second is a close.
+                bool repeat_press = false;
+                if (is_red && wid == gLastMouseDownWid && gLastMouseDownWasRed) {
+                    os_unfair_lock_lock(&gPendingClonesLock);
+                    repeat_press = vn_pending_clone_find_slot_locked(wid) >= 0;
+                    os_unfair_lock_unlock(&gPendingClonesLock);
+                }
+                gLastMouseDownWid = wid;
+                gLastMouseDownWasRed = is_red;
+                gRepeatPressHeld = repeat_press;
+                if (repeat_press) {
+                    VN_DEBUG("hit-test: press on wid=%u (pt=%.1f,%.1f) repeats the red press whose clone is waiting -- ignored, the clone stays", wid, lx, ly);
+                    goto dispatch;
+                }
 
                 if (lx <= 150.0 && ly <= 60.0) {
                     char hit_app[256] = {0};
@@ -3584,6 +3573,7 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
     }
     else if (type == 2) {
         uint32_t wid = event->window_id;
+        gRepeatPressHeld = false;
         // The release is what commits a red-button press: consume the pending
         // record (always -- a gesture ends here whatever its outcome) and, if
         // it survived, build the clone now.
@@ -3669,7 +3659,7 @@ static void vn_hook_post_event(CGXConnection *conn, VNEvent *event) {
         os_unfair_lock_lock(&gPendingClonesLock);
         if (wid != 0) slot = vn_pending_clone_find_slot_locked(wid);
         os_unfair_lock_unlock(&gPendingClonesLock);
-        if (slot >= 0) {
+        if (slot >= 0 && !gRepeatPressHeld) {
             VN_DEBUG("pre-clone: drag on wid=%u while a clone exists -- discarding it", wid);
             vn_pending_clone_discard_wid(wid);
         }
